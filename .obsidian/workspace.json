@@ -1,0 +1,217 @@
+{
+  "main": {
+    "id": "ef46459fbe59e388",
+    "type": "split",
+    "children": [
+      {
+        "id": "2e499784d7d6f8b9",
+        "type": "tabs",
+        "children": [
+          {
+            "id": "5d88630db453b5c5",
+            "type": "leaf",
+            "state": {
+              "type": "markdown",
+              "state": {
+                "file": "01 Designing Data-Intensive Applications/chapter-13-a-philosophy-of-streaming-systems.md",
+                "mode": "preview",
+                "source": false
+              },
+              "icon": "lucide-file",
+              "title": "chapter-13-a-philosophy-of-streaming-systems"
+            }
+          }
+        ]
+      }
+    ],
+    "direction": "vertical"
+  },
+  "left": {
+    "id": "ee7a9c809026579d",
+    "type": "split",
+    "children": [
+      {
+        "id": "f9a04e1005affe6b",
+        "type": "tabs",
+        "children": [
+          {
+            "id": "e053b95ec912dc46",
+            "type": "leaf",
+            "state": {
+              "type": "file-explorer",
+              "state": {
+                "sortOrder": "alphabetical",
+                "autoReveal": false,
+                "showSearch": false,
+                "searchQuery": ""
+              },
+              "icon": "lucide-folder-closed",
+              "title": "Files"
+            }
+          },
+          {
+            "id": "2b8f790be31b6dd4",
+            "type": "leaf",
+            "state": {
+              "type": "search",
+              "state": {
+                "query": "",
+                "matchingCase": false,
+                "explainSearch": false,
+                "collapseAll": false,
+                "extraContext": false,
+                "sortOrder": "alphabetical"
+              },
+              "icon": "lucide-search",
+              "title": "Search"
+            }
+          },
+          {
+            "id": "411589cac46c8989",
+            "type": "leaf",
+            "state": {
+              "type": "bookmarks",
+              "state": {
+                "showSearch": false,
+                "searchQuery": ""
+              },
+              "icon": "lucide-bookmark",
+              "title": "Bookmarks"
+            }
+          }
+        ]
+      }
+    ],
+    "direction": "horizontal",
+    "width": 300
+  },
+  "right": {
+    "id": "0ac4cf5296a566f7",
+    "type": "split",
+    "children": [
+      {
+        "id": "54231189c8cb65bd",
+        "type": "tabs",
+        "children": [
+          {
+            "id": "056585c5091acb3b",
+            "type": "leaf",
+            "state": {
+              "type": "backlink",
+              "state": {
+                "file": "01 Designing Data-Intensive Applications/chapter-13-a-philosophy-of-streaming-systems.md",
+                "collapseAll": false,
+                "extraContext": false,
+                "sortOrder": "alphabetical",
+                "showSearch": false,
+                "searchQuery": "",
+                "backlinkCollapsed": false,
+                "unlinkedCollapsed": true
+              },
+              "icon": "links-coming-in",
+              "title": "Backlinks"
+            }
+          },
+          {
+            "id": "3f3b6aad60afb1e0",
+            "type": "leaf",
+            "state": {
+              "type": "outgoing-link",
+              "state": {
+                "file": "01 Designing Data-Intensive Applications/chapter-13-a-philosophy-of-streaming-systems.md",
+                "linksCollapsed": false,
+                "unlinkedCollapsed": true
+              },
+              "icon": "links-going-out",
+              "title": "Outgoing links"
+            }
+          },
+          {
+            "id": "7ac2229a3765eebb",
+            "type": "leaf",
+            "state": {
+              "type": "tag",
+              "state": {
+                "sortOrder": "frequency",
+                "useHierarchy": true,
+                "showSearch": false,
+                "searchQuery": ""
+              },
+              "icon": "lucide-tags",
+              "title": "Tags"
+            }
+          },
+          {
+            "id": "4326dcf4a9a5b32a",
+            "type": "leaf",
+            "state": {
+              "type": "all-properties",
+              "state": {
+                "sortOrder": "frequency",
+                "showSearch": false,
+                "searchQuery": ""
+              },
+              "icon": "lucide-archive",
+              "title": "All properties"
+            }
+          },
+          {
+            "id": "8dbae0ff6dc0ceb8",
+            "type": "leaf",
+            "state": {
+              "type": "outline",
+              "state": {
+                "file": "01 Designing Data-Intensive Applications/chapter-13-a-philosophy-of-streaming-systems.md",
+                "followCursor": false,
+                "showSearch": false,
+                "searchQuery": ""
+              },
+              "icon": "lucide-list",
+              "title": "Outline"
+            }
+          }
+        ]
+      }
+    ],
+    "direction": "horizontal",
+    "width": 300,
+    "collapsed": true
+  },
+  "left-ribbon": {
+    "hiddenItems": {
+      "switcher:Open quick switcher": false,
+      "graph:Open graph view": false,
+      "canvas:Create new canvas": false,
+      "daily-notes:Open today's daily note": false,
+      "templates:Insert template": false,
+      "command-palette:Open command palette": false,
+      "bases:Create new base": false
+    }
+  },
+  "active": "5d88630db453b5c5",
+  "lastOpenFiles": [
+    "01 Designing Data-Intensive Applications/00-Master-Reading-Dashboard.md",
+    "01 Designing Data-Intensive Applications/chapter-14-doing-the-right-thing.md",
+    "01 Designing Data-Intensive Applications/chapter-02-defining-nonfunctional-requirements.md",
+    "01 Designing Data-Intensive Applications/chapter-01-trade-offs-in-data-systems-architecture.md",
+    "inject_nav.py",
+    "01 Designing Data-Intensive Applications/Designing Data-Intensive Applications The Big Ideas Behind Reliable, Scalable, and Maintainable Systems (Martin Kleppmann, Chris Riccomini) (z-library.sk, 1lib.sk, z-lib.sk)_2.pdf",
+    "01 Designing Data-Intensive Applications/test_ch14_runner.py",
+    "01 Designing Data-Intensive Applications/scratch_ch14_text.txt",
+    "01 Designing Data-Intensive Applications/test_ch13_runner.py",
+    "01 Designing Data-Intensive Applications/__pycache__/debug_script.cpython-313.pyc",
+    "01 Designing Data-Intensive Applications/__pycache__",
+    "01 Designing Data-Intensive Applications/debug_script.py",
+    "01 Designing Data-Intensive Applications/chapter-13-a-philosophy-of-streaming-systems.md",
+    "01 Designing Data-Intensive Applications/scratch_ch13_text.txt",
+    "01 Designing Data-Intensive Applications/chapter-12-stream-processing.md",
+    "01 Designing Data-Intensive Applications/chapter-11-batch-processing.md",
+    "01 Designing Data-Intensive Applications/chapter-10-consistency-and-consensus.md",
+    "01 Designing Data-Intensive Applications/chapter-09-the-trouble-with-distributed-systems.md",
+    "01 Designing Data-Intensive Applications/chapter-08-transactions.md",
+    "01 Designing Data-Intensive Applications/chapter-07-sharding.md",
+    "01 Designing Data-Intensive Applications/chapter-06-replication.md",
+    "01 Designing Data-Intensive Applications/chapter-05-encoding-and-evolution.md",
+    "01 Designing Data-Intensive Applications/chapter-04-storage-and-retrieval.md"
+  ]
+}

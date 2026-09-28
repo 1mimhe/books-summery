@@ -1,0 +1,32 @@
+# ==========================================
+# Gitignore Configuration
+# ==========================================
+
+# Prompts & Generation Templates (tracked — needed for future books + PDF figure rule)
+# CHAPTER_SUMMARY_PROMPT.md
+# *prompt*.md
+# *PROMPT*.md
+
+# Software Engineering Book PDFs & E-Books (User requested ignore)
+*.pdf
+**/*.pdf
+*.epub
+*.mobi
+*.azw3
+
+# OS Metadata & Cache
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# IDE & Editor Settings
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# Temporary & Log files
+*.log
+*.tmp
+*.bak

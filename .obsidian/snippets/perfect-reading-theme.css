@@ -1,0 +1,554 @@
+/* ==========================================================================
+   PERFECT READING THEME FOR OBSIDIAN (DDIA & TECHNICAL ARCHITECTURE SUITE)
+   v2 - Calm Minimal: easy-to-read, eye-friendly, tidy, no clutter.
+   Goals (FA): چشم‌ها را اذیت نکند، مرتب و بدون شلوغ‌کاری، خسته‌کننده نباشد.
+   - No webfont @import (offline-first, uses appearance.json fonts + system fallback)
+   - Solid headings (no gradient text), minimal H2, quiet H3/H4
+   - Soft tables, calm blockquotes, reduced motion + print + RTL support
+   ========================================================================== */
+
+/* --------------------------------------------------------------------------
+   1. ROOT DESIGN TOKENS: EYE-FRIENDLY COLOR PALETTES (softened)
+   -------------------------------------------------------------------------- */
+
+/* DARK MODE: Deep midnight slate, soft ivory text, only 2 main accents */
+.theme-dark {
+  --reading-bg-primary: #1a1b26;
+  --reading-bg-secondary: #1f2130;
+  --reading-bg-tertiary: #24273a;
+  --reading-bg-code: #16171f;
+
+  --reading-text-primary: #cdd3ea;
+  --reading-text-secondary: #a5adcb;
+  --reading-text-muted: #848aa3;
+  --reading-text-faint: #5b6078;
+
+  --reading-accent-blue: #8aadf4;
+  --reading-accent-lavender: #b7bdf8;
+  --reading-accent-teal: #8bd5ca;
+  --reading-accent-green: #a6da95;
+  --reading-accent-peach: #e8b48a;
+  --reading-accent-red: #e49aa5;
+  --reading-accent-yellow: #d9c48f;
+  --reading-accent-mauve: #b49ae0;
+
+  --reading-border-subtle: rgba(205, 211, 234, 0.09);
+  --reading-border-highlight: rgba(138, 173, 244, 0.16);
+  --reading-shadow-subtle: none;
+  --reading-shadow-hover: none;
+
+  --background-primary: var(--reading-bg-primary);
+  --background-secondary: var(--reading-bg-secondary);
+  --text-normal: var(--reading-text-primary);
+  --text-muted: var(--reading-text-secondary);
+  --text-faint: var(--reading-text-muted);
+  --text-accent: var(--reading-accent-blue);
+  --text-accent-hover: var(--reading-accent-lavender);
+  --interactive-accent: var(--reading-accent-blue);
+  --hr-color: var(--reading-border-subtle);
+}
+
+/* LIGHT MODE: Warm paper, soft charcoal, muted accents */
+.theme-light {
+  --reading-bg-primary: #faf8f3;
+  --reading-bg-secondary: #f1ede3;
+  --reading-bg-tertiary: #e9e3d6;
+  --reading-bg-code: #efe9dc;
+
+  --reading-text-primary: #33373f;
+  --reading-text-secondary: #5a6070;
+  --reading-text-muted: #767c8c;
+  --reading-text-faint: #9aa0b0;
+
+  --reading-accent-blue: #2f5fd0;
+  --reading-accent-lavender: #5b5fc7;
+  --reading-accent-teal: #0f766e;
+  --reading-accent-green: #15803d;
+  --reading-accent-peach: #9a5a1e;
+  --reading-accent-red: #b4232a;
+  --reading-accent-yellow: #8a5e00;
+  --reading-accent-mauve: #6d28d9;
+
+  --reading-border-subtle: rgba(51, 55, 63, 0.09);
+  --reading-border-highlight: rgba(47, 95, 208, 0.12);
+  --reading-shadow-subtle: none;
+  --reading-shadow-hover: none;
+
+  --background-primary: var(--reading-bg-primary);
+  --background-secondary: var(--reading-bg-secondary);
+  --text-normal: var(--reading-text-primary);
+  --text-muted: var(--reading-text-secondary);
+  --text-faint: var(--reading-text-muted);
+  --text-accent: var(--reading-accent-blue);
+  --text-accent-hover: var(--reading-accent-lavender);
+  --interactive-accent: var(--reading-accent-blue);
+  --hr-color: var(--reading-border-subtle);
+}
+
+/* --------------------------------------------------------------------------
+   2. READING CANVAS & ERGONOMIC GEOMETRY (kept: 860px / 1.8 / 16.5px)
+   -------------------------------------------------------------------------- */
+
+.markdown-rendered,
+.markdown-source-view.mod-cm6 .cm-scroller,
+.markdown-live-preview .cm-scroller {
+  font-family: 'Plus Jakarta Sans', 'Vazirmatn', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif !important;
+  font-size: 16.5px !important;
+  line-height: 1.8 !important;
+  letter-spacing: 0.01em !important;
+  -webkit-font-smoothing: antialiased !important;
+  -moz-osx-font-smoothing: grayscale !important;
+  text-rendering: optimizeLegibility !important;
+}
+
+.markdown-rendered.markdown-rendered {
+  max-width: 860px !important;
+  margin-left: auto !important;
+  margin-right: auto !important;
+  padding: 2rem 2rem 5rem 2rem !important;
+}
+
+.markdown-rendered p {
+  margin-top: 0 !important;
+  margin-bottom: 1.25rem !important;
+  color: var(--reading-text-primary);
+  line-height: 1.8 !important;
+}
+
+/* Lists: calm spacing, readable markers (was missing) */
+.markdown-rendered ul,
+.markdown-rendered ol {
+  margin: 0 0 1.25rem 0 !important;
+  padding-inline-start: 1.6rem !important;
+  line-height: 1.75 !important;
+}
+.markdown-rendered li {
+  margin-bottom: 0.4rem !important;
+}
+.markdown-rendered li::marker {
+  color: var(--reading-text-muted) !important;
+}
+.markdown-rendered input[type="checkbox"] {
+  width: 1rem !important;
+  height: 1rem !important;
+  accent-color: var(--reading-accent-blue) !important;
+}
+
+/* Images: constrained, calm */
+.markdown-rendered img {
+  max-width: 100% !important;
+  height: auto !important;
+  border-radius: 8px !important;
+  display: block;
+  margin: 1.5rem auto !important;
+}
+
+/* Selection: soft, not glaring */
+.markdown-rendered ::selection,
+.cm-scroller ::selection {
+  background: var(--reading-border-highlight) !important;
+}
+
+/* Focus: visible but calm (was missing) */
+.markdown-rendered a:focus-visible,
+.markdown-rendered summary:focus-visible {
+  outline: 2px solid var(--reading-accent-blue) !important;
+  outline-offset: 2px !important;
+  border-radius: 4px !important;
+}
+
+/* --------------------------------------------------------------------------
+   3. TYPOGRAPHIC HIERARCHY: CALM, SOLID HEADINGS (no gradient/glow)
+   -------------------------------------------------------------------------- */
+
+.markdown-rendered h1,
+.markdown-rendered h2,
+.markdown-rendered h3,
+.markdown-rendered h4,
+.markdown-rendered h5,
+.markdown-rendered h6 {
+  font-family: 'Plus Jakarta Sans', 'Vazirmatn', sans-serif !important;
+  font-weight: 700 !important;
+  letter-spacing: -0.01em !important;
+  line-height: 1.35 !important;
+  position: relative;
+}
+
+/* H1: solid, modest size, printable */
+.markdown-rendered h1 {
+  font-size: 1.9rem !important;
+  font-weight: 700 !important;
+  margin-top: 1.5rem !important;
+  margin-bottom: 1.2rem !important;
+  color: var(--reading-text-primary) !important;
+  background: none !important;
+  -webkit-background-clip: unset !important;
+  -webkit-text-fill-color: unset !important;
+  display: block;
+  border-bottom: 1px solid var(--reading-border-subtle) !important;
+  padding-bottom: 0.5rem !important;
+  width: 100%;
+}
+
+/* H2: minimal — thin left rule, no gradient bg, no shadow */
+.markdown-rendered h2 {
+  font-size: 1.4rem !important;
+  margin-top: 2.5rem !important;
+  margin-bottom: 1rem !important;
+  color: var(--reading-text-primary) !important;
+  padding: 0.15rem 0 0.15rem 0.8rem !important;
+  border-left: 3px solid var(--reading-accent-blue) !important;
+  background: none !important;
+  border-radius: 0 !important;
+  box-shadow: none !important;
+}
+
+/* H3/H4: quiet — same text color, no decorative glyph, no uppercase */
+.markdown-rendered h3 {
+  font-size: 1.18rem !important;
+  font-weight: 650 !important;
+  margin-top: 2rem !important;
+  margin-bottom: 0.7rem !important;
+  color: var(--reading-text-primary) !important;
+  display: block;
+}
+.markdown-rendered h3::before {
+  content: none !important;
+}
+.markdown-rendered h4 {
+  font-size: 1.02rem !important;
+  font-weight: 650 !important;
+  margin-top: 1.5rem !important;
+  margin-bottom: 0.5rem !important;
+  color: var(--reading-text-secondary) !important;
+  text-transform: none !important;
+  letter-spacing: 0 !important;
+}
+
+/* --------------------------------------------------------------------------
+   4. BLOCKQUOTE: CALM, SANS, NO CARD (eye-friendly for long quotes)
+   -------------------------------------------------------------------------- */
+
+.markdown-rendered blockquote {
+  font-family: 'Plus Jakarta Sans', 'Vazirmatn', sans-serif !important;
+  font-style: normal !important;
+  font-size: 1rem !important;
+  line-height: 1.75 !important;
+  color: var(--reading-text-secondary) !important;
+  background: transparent !important;
+  border-left: 2px solid var(--reading-border-highlight) !important;
+  border-radius: 0 !important;
+  margin: 1.5rem 0 !important;
+  padding: 0.4rem 0 0.4rem 1.1rem !important;
+  box-shadow: none !important;
+}
+.markdown-rendered blockquote p {
+  margin-bottom: 0.5rem !important;
+}
+.markdown-rendered blockquote em,
+.markdown-rendered blockquote strong {
+  font-family: inherit !important;
+  font-style: normal !important;
+  font-size: 0.92rem !important;
+  color: var(--reading-text-muted) !important;
+}
+
+/* --------------------------------------------------------------------------
+   5. TABLES: SOFT, MINIMAL (no sticky jump, no heavy card)
+   -------------------------------------------------------------------------- */
+
+.markdown-rendered table {
+  width: 100% !important;
+  border-collapse: collapse !important;
+  margin: 1.6rem 0 !important;
+  font-size: 0.93rem !important;
+  border-radius: 8px !important;
+  overflow: hidden !important;
+  border: 1px solid var(--reading-border-subtle) !important;
+  box-shadow: none !important;
+  background: transparent !important;
+  display: block !important;
+  overflow-x: auto !important;
+}
+.markdown-rendered thead th {
+  background: var(--reading-bg-secondary) !important;
+  color: var(--reading-text-primary) !important;
+  font-weight: 650 !important;
+  text-align: start !important;
+  padding: 0.7rem 0.9rem !important;
+  border-bottom: 1px solid var(--reading-border-subtle) !important;
+  letter-spacing: 0.01em !important;
+  white-space: nowrap;
+}
+.markdown-rendered tbody td {
+  padding: 0.65rem 0.9rem !important;
+  border-bottom: 1px solid var(--reading-border-subtle) !important;
+  color: var(--reading-text-primary) !important;
+  vertical-align: top !important;
+  line-height: 1.6 !important;
+}
+.markdown-rendered tbody tr:nth-child(even) td {
+  background: rgba(127, 140, 170, 0.06) !important;
+}
+.theme-dark .markdown-rendered tbody tr:nth-child(even) td {
+  background: rgba(255, 255, 255, 0.02) !important;
+}
+.markdown-rendered tbody tr:hover td {
+  background: var(--reading-border-highlight) !important;
+}
+.markdown-rendered tbody tr:last-child td {
+  border-bottom: none !important;
+}
+
+/* --------------------------------------------------------------------------
+   6. CODE: SOFT CONTRAST
+   -------------------------------------------------------------------------- */
+
+.markdown-rendered :not(pre) > code {
+  font-family: 'JetBrains Mono', 'Fira Code', 'Cascadia Code', Consolas, monospace !important;
+  font-size: 0.85em !important;
+  font-weight: 500 !important;
+  color: var(--reading-text-primary) !important;
+  background: var(--reading-border-highlight) !important;
+  padding: 0.15rem 0.4rem !important;
+  border-radius: 5px !important;
+  border: 1px solid var(--reading-border-subtle) !important;
+  white-space: break-spaces;
+}
+.markdown-rendered pre {
+  background: var(--reading-bg-code) !important;
+  border: 1px solid var(--reading-border-subtle) !important;
+  border-radius: 10px !important;
+  padding: 1.1rem 1.25rem !important;
+  margin: 1.5rem 0 !important;
+  box-shadow: none !important;
+  overflow-x: auto !important;
+}
+.markdown-rendered pre code {
+  font-family: 'JetBrains Mono', 'Fira Code', 'Cascadia Code', monospace !important;
+  font-size: 0.86rem !important;
+  line-height: 1.65 !important;
+  color: var(--reading-text-primary) !important;
+  background: transparent !important;
+  border: none !important;
+  padding: 0 !important;
+}
+
+/* --------------------------------------------------------------------------
+   7. MERMAID: CALM BLOCK (no flex-center clip, no hover glow)
+   -------------------------------------------------------------------------- */
+
+.mermaid {
+  background: var(--reading-bg-secondary) !important;
+  border: 1px solid var(--reading-border-subtle) !important;
+  border-radius: 10px !important;
+  padding: 1.4rem 1rem !important;
+  margin: 1.8rem 0 !important;
+  box-shadow: none !important;
+  display: block !important;
+  overflow-x: auto !important;
+  text-align: center !important;
+}
+.mermaid svg {
+  max-width: 100% !important;
+  height: auto !important;
+}
+
+/* Figure caption line under diagrams */
+.markdown-rendered em:has(> strong:first-child) {
+  display: block;
+  font-size: 0.9rem !important;
+  line-height: 1.6 !important;
+  color: var(--reading-text-muted) !important;
+  background: transparent !important;
+  border-left: 2px solid var(--reading-border-subtle) !important;
+  padding: 0.5rem 0.9rem !important;
+  border-radius: 0 !important;
+  margin-top: 0.6rem !important;
+  margin-bottom: 1.8rem !important;
+}
+
+/* PDF figure pointer callout: calm, single accent */
+.markdown-rendered blockquote.pdf-fig {
+  border-left-color: var(--reading-accent-blue) !important;
+  color: var(--reading-text-muted) !important;
+  font-size: 0.92rem !important;
+}
+
+/* --------------------------------------------------------------------------
+   8. CALLOUTS: FLAT, SINGLE BORDER
+   -------------------------------------------------------------------------- */
+
+.callout {
+  border-radius: 8px !important;
+  border: 1px solid var(--reading-border-subtle) !important;
+  border-left: 3px solid var(--reading-accent-blue) !important;
+  margin: 1.5rem 0 !important;
+  padding: 0.85rem 1.1rem !important;
+  background: var(--reading-bg-secondary) !important;
+  box-shadow: none !important;
+}
+.callout-title {
+  font-weight: 650 !important;
+  font-size: 0.95rem !important;
+}
+
+/* --------------------------------------------------------------------------
+   9. MATH: MINIMAL
+   -------------------------------------------------------------------------- */
+
+.math-block {
+  background: var(--reading-bg-secondary) !important;
+  border: 1px solid var(--reading-border-subtle) !important;
+  border-radius: 8px !important;
+  padding: 0.9rem 1.2rem !important;
+  margin: 1.4rem 0 !important;
+  overflow-x: auto !important;
+  box-shadow: none !important;
+  text-align: center !important;
+}
+.math-inline {
+  color: inherit !important;
+  font-size: 1em !important;
+  padding: 0 0.1rem !important;
+}
+
+/* --------------------------------------------------------------------------
+   10. LINKS, MARKS, RULES, DETAILS
+   -------------------------------------------------------------------------- */
+
+.markdown-rendered a {
+  color: var(--reading-accent-blue) !important;
+  text-decoration: underline !important;
+  text-decoration-thickness: 1px !important;
+  text-underline-offset: 3px !important;
+  text-decoration-color: var(--reading-border-highlight) !important;
+  border-bottom: none !important;
+}
+.markdown-rendered a:hover {
+  text-decoration-color: var(--reading-accent-blue) !important;
+  background: transparent !important;
+}
+.markdown-rendered mark {
+  background: rgba(217, 196, 143, 0.28) !important;
+  color: inherit !important;
+  padding: 0.1rem 0.3rem !important;
+  border-radius: 4px !important;
+  border-bottom: none !important;
+}
+.theme-dark .markdown-rendered mark {
+  background: rgba(217, 196, 143, 0.18) !important;
+}
+.markdown-rendered hr {
+  border: none !important;
+  border-top: 1px solid var(--reading-border-subtle) !important;
+  background: none !important;
+  opacity: 1 !important;
+  margin: 2.5rem 0 !important;
+}
+.markdown-rendered details {
+  border: 1px solid var(--reading-border-subtle) !important;
+  border-radius: 8px !important;
+  padding: 0.7rem 1rem !important;
+  margin: 1.2rem 0 !important;
+  background: transparent !important;
+}
+.markdown-rendered summary {
+  cursor: pointer !important;
+  font-weight: 600 !important;
+  color: var(--reading-text-primary) !important;
+}
+
+/* Scrollbars: slightly larger, calmer */
+::-webkit-scrollbar {
+  width: 10px !important;
+  height: 10px !important;
+}
+::-webkit-scrollbar-track {
+  background: transparent !important;
+}
+::-webkit-scrollbar-thumb {
+  background: rgba(132, 138, 163, 0.35) !important;
+  border-radius: 8px !important;
+  border: 2px solid transparent !important;
+  background-clip: content-box !important;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: rgba(132, 138, 163, 0.55) !important;
+  background-clip: content-box !important;
+}
+* {
+  scrollbar-width: thin !important;
+  scrollbar-color: rgba(132, 138, 163, 0.45) transparent !important;
+}
+
+/* --------------------------------------------------------------------------
+   11. RTL / PERSIAN (Vazirmatn) SUPPORT — calm for mixed FA/EN notes
+   -------------------------------------------------------------------------- */
+
+[dir="rtl"] .markdown-rendered,
+[dir="rtl"] .markdown-rendered p,
+[dir="rtl"] .markdown-rendered li {
+  letter-spacing: 0 !important;
+  line-height: 1.9 !important;
+}
+[dir="rtl"] .markdown-rendered th,
+[dir="rtl"] .markdown-rendered td {
+  text-align: right !important;
+}
+[dir="rtl"] .markdown-rendered h1,
+[dir="rtl"] .markdown-rendered h2,
+[dir="rtl"] .markdown-rendered h3 {
+  letter-spacing: 0 !important;
+}
+[dir="rtl"] .markdown-rendered blockquote {
+  border-left: none !important;
+  border-right: 2px solid var(--reading-border-highlight) !important;
+  padding: 0.4rem 1.1rem 0.4rem 0 !important;
+}
+
+/* --------------------------------------------------------------------------
+   12. REDUCED MOTION + PRINT (no animation fatigue, ink-friendly)
+   -------------------------------------------------------------------------- */
+
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after {
+    transition: none !important;
+    animation: none !important;
+    scroll-behavior: auto !important;
+  }
+}
+
+@media print {
+  .markdown-rendered {
+    max-width: 100% !important;
+    padding: 0 !important;
+    font-size: 11pt !important;
+    line-height: 1.6 !important;
+  }
+  .markdown-rendered h1,
+  .markdown-rendered h2,
+  .markdown-rendered h3 {
+    color: #000 !important;
+    -webkit-text-fill-color: #000 !important;
+    background: none !important;
+    border-color: #ccc !important;
+  }
+  .markdown-rendered table,
+  .markdown-rendered pre,
+  .mermaid,
+  .callout,
+  .math-block {
+    box-shadow: none !important;
+    background: #fff !important;
+    border: 1px solid #ccc !important;
+    break-inside: avoid !important;
+  }
+  .markdown-rendered a {
+    color: #000 !important;
+    text-decoration: underline !important;
+  }
+  .markdown-rendered a::after {
+    content: none !important;
+  }
+}

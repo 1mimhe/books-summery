@@ -1,0 +1,10 @@
+{
+  "alwaysUpdateLinks": true,
+  "defaultViewMode": "preview",
+  "foldHeading": true,
+  "foldIndent": true,
+  "livePreview": true,
+  "readableLineLength": true,
+  "showLineNumber": false,
+  "tabSize": 2
+}

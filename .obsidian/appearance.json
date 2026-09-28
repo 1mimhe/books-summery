@@ -1,0 +1,15 @@
+{
+  "accentColor": "#8aadf4",
+  "baseFontSize": 16,
+  "baseFontSizeAction": true,
+  "cssTheme": "",
+  "enabledCssSnippets": [
+    "perfect-reading-theme"
+  ],
+  "interfaceFontFamily": "Plus Jakarta Sans, Vazirmatn, Segoe UI, sans-serif",
+  "monospaceFontFamily": "JetBrains Mono, Fira Code, Cascadia Code, Consolas, monospace",
+  "nativeMenus": false,
+  "showLineNumber": false,
+  "textFontFamily": "Plus Jakarta Sans, Vazirmatn, Segoe UI, sans-serif",
+  "theme": "obsidian"
+}
