@@ -418,125 +418,194 @@
   margin: 0 auto !important;
 }
 
-/* --- DARK: match midnight surfaces, lift text contrast ------------------ */
-.theme-dark .mermaid svg .flowchart-link,
-.theme-dark .mermaid svg .edgePaths path,
-.theme-dark .mermaid svg .messageLine {
-  stroke: #9aa3c0 !important;
+/* --- DARK: every label light, every surface midnight-matched -------------
+   Rule 1 (hard guarantee): ALL text inside any diagram is light.
+   Rule 2: shapes get distinguishable slate fills (beats inline `style=`
+   statements and Mermaid's own black/yellow defaults via !important). */
+.theme-dark .mermaid svg text,
+.theme-dark .mermaid svg tspan,
+.theme-dark .mermaid svg foreignObject,
+.theme-dark .mermaid svg foreignObject div,
+.theme-dark .mermaid svg foreignObject span,
+.theme-dark .mermaid svg foreignObject p {
+  fill: #e8ebf7 !important;
+  color: #e8ebf7 !important;
 }
-.theme-dark .mermaid svg .marker path,
-.theme-dark .mermaid svg marker path {
-  fill: #9aa3c0 !important;
+/* muted-but-readable for small edge/cluster captions */
+.theme-dark .mermaid svg .edgeLabel div,
+.theme-dark .mermaid svg .edgeLabel span,
+.theme-dark .mermaid svg .cluster-label div,
+.theme-dark .mermaid svg .cluster-label span {
+  fill: #c6cde6 !important;
+  color: #c6cde6 !important;
 }
-.theme-dark .mermaid svg .node rect,
-.theme-dark .mermaid svg .node polygon,
-.theme-dark .mermaid svg .node circle,
-.theme-dark .mermaid svg .node ellipse,
-.theme-dark .mermaid svg .state rect,
-.theme-dark .mermaid svg .actor {
-  fill: #24273a !important;
+/* generic fallback: any shape not matched below still gets slate fill */
+.theme-dark .mermaid svg g rect,
+.theme-dark .mermaid svg g polygon,
+.theme-dark .mermaid svg g circle,
+.theme-dark .mermaid svg g ellipse,
+.theme-dark .mermaid svg g path.label-container {
+  fill: #262a3d !important;
   stroke: #8aadf4 !important;
   stroke-width: 1.3px !important;
 }
-.theme-dark .mermaid svg .node text,
-.theme-dark .mermaid svg .node span,
-.theme-dark .mermaid svg .node div,
-.theme-dark .mermaid svg .nodeLabel,
-.theme-dark .mermaid svg .actor text {
-  fill: #dfe4f7 !important;
-  color: #dfe4f7 !important;
+/* flowchart nodes (incl. cylinder/db/stadium paths) */
+.theme-dark .mermaid svg g.node rect,
+.theme-dark .mermaid svg g.node polygon,
+.theme-dark .mermaid svg g.node circle,
+.theme-dark .mermaid svg g.node ellipse,
+.theme-dark .mermaid svg g.node path {
+  fill: #2a2f45 !important;
+  stroke: #8aadf4 !important;
 }
-.theme-dark .mermaid svg .cluster rect {
-  fill: rgba(138, 173, 244, 0.06) !important;
-  stroke: rgba(138, 173, 244, 0.45) !important;
+/* subgraph clusters: translucent tint, soft blue border (never black/yellow) */
+.theme-dark .mermaid svg g.cluster rect {
+  fill: rgba(138, 173, 244, 0.07) !important;
+  stroke: rgba(138, 173, 244, 0.5) !important;
   stroke-width: 1.2px !important;
-  rx: 8px !important;
-  ry: 8px !important;
+  stroke-dasharray: none !important;
 }
-.theme-dark .mermaid svg .cluster span,
-.theme-dark .mermaid svg .cluster div {
-  fill: #a5adcb !important;
-  color: #a5adcb !important;
-  background: transparent !important;
+/* edge-label chips: solid chip so text never sits on bare background */
+.theme-dark .mermaid svg g.edgeLabel rect {
+  fill: #20233a !important;
+  stroke: rgba(205, 211, 234, 0.25) !important;
+  stroke-width: 1px !important;
 }
-.theme-dark .mermaid svg .edgeLabel rect,
-.theme-dark .mermaid svg .edgeLabel foreignObject div {
-  fill: #1f2130 !important;
-  background: #1f2130 !important;
-  stroke: rgba(205, 211, 234, 0.18) !important;
+/* sequence diagrams: actors, lifelines, messages, notes, activations */
+.theme-dark .mermaid svg g.actor rect,
+.theme-dark .mermaid svg rect.actor-box {
+  fill: #2a2f45 !important;
+  stroke: #8aadf4 !important;
 }
-.theme-dark .mermaid svg .edgeLabel span,
-.theme-dark .mermaid svg .edgeLabel text,
-.theme-dark .mermaid svg .messageText,
-.theme-dark .mermaid svg text {
-  fill: #cdd3ea !important;
-  color: #cdd3ea !important;
+.theme-dark .mermaid svg g.actor line,
+.theme-dark .mermaid svg line.actor-line {
+  stroke: #7c86a8 !important;
 }
-.theme-dark .mermaid svg .note rect,
-.theme-dark .mermaid svg .noteText {
-  fill: #24273a !important;
+.theme-dark .mermaid svg .flowchart-link,
+.theme-dark .mermaid svg .edgePaths path,
+.theme-dark .mermaid svg .messageLine,
+.theme-dark .mermaid svg line,
+.theme-dark .mermaid svg path.edge {
+  stroke: #9aa6c8 !important;
+  stroke-width: 1.6px !important;
 }
-.theme-dark .mermaid svg .note span {
-  color: #cdd3ea !important;
+.theme-dark .mermaid svg .marker path,
+.theme-dark .mermaid svg marker path,
+.theme-dark .mermaid svg defs marker path {
+  fill: #9aa6c8 !important;
+  stroke: none !important;
 }
-/* database cylinder + special shapes keep tint, not black */
-.theme-dark .mermaid svg g.db rect,
-.theme-dark .mermaid svg g.stadium rect {
-  fill: #24273a !important;
+.theme-dark .mermaid svg rect.activation {
+  fill: #3a4060 !important;
+  stroke: #8aadf4 !important;
+}
+.theme-dark .mermaid svg g.note rect,
+.theme-dark .mermaid svg rect.note {
+  fill: #2a2f45 !important;
+  stroke: #d9c48f !important;
+}
+.theme-dark .mermaid svg rect.labelBox,
+.theme-dark .mermaid svg rect.loopBox {
+  fill: rgba(138, 173, 244, 0.07) !important;
+  stroke: rgba(138, 173, 244, 0.5) !important;
+}
+/* state / class / ER diagrams */
+.theme-dark .mermaid svg g.state rect,
+.theme-dark .mermaid svg g.state circle,
+.theme-dark .mermaid svg rect.classBox,
+.theme-dark .mermaid svg rect.entityBox {
+  fill: #2a2f45 !important;
+  stroke: #8aadf4 !important;
 }
 
-/* --- LIGHT: warm paper surfaces, dark ink -------------------------------- */
-.theme-light .mermaid svg .flowchart-link,
-.theme-light .mermaid svg .edgePaths path,
-.theme-light .mermaid svg .messageLine {
-  stroke: #6b7280 !important;
+/* --- LIGHT: every label dark ink, every surface paper-matched ------------- */
+.theme-light .mermaid svg text,
+.theme-light .mermaid svg tspan,
+.theme-light .mermaid svg foreignObject,
+.theme-light .mermaid svg foreignObject div,
+.theme-light .mermaid svg foreignObject span,
+.theme-light .mermaid svg foreignObject p {
+  fill: #2b2f38 !important;
+  color: #2b2f38 !important;
 }
-.theme-light .mermaid svg .marker path,
-.theme-light .mermaid svg marker path {
-  fill: #6b7280 !important;
+.theme-light .mermaid svg .edgeLabel div,
+.theme-light .mermaid svg .edgeLabel span,
+.theme-light .mermaid svg .cluster-label div,
+.theme-light .mermaid svg .cluster-label span {
+  fill: #4a4f5c !important;
+  color: #4a4f5c !important;
 }
-.theme-light .mermaid svg .node rect,
-.theme-light .mermaid svg .node polygon,
-.theme-light .mermaid svg .node circle,
-.theme-light .mermaid svg .node ellipse,
-.theme-light .mermaid svg .state rect,
-.theme-light .mermaid svg .actor {
+.theme-light .mermaid svg g rect,
+.theme-light .mermaid svg g polygon,
+.theme-light .mermaid svg g circle,
+.theme-light .mermaid svg g ellipse,
+.theme-light .mermaid svg g path.label-container {
   fill: #ffffff !important;
   stroke: #2f5fd0 !important;
   stroke-width: 1.3px !important;
 }
-.theme-light .mermaid svg .node text,
-.theme-light .mermaid svg .node span,
-.theme-light .mermaid svg .node div,
-.theme-light .mermaid svg .nodeLabel {
-  fill: #33373f !important;
-  color: #33373f !important;
+.theme-light .mermaid svg g.node rect,
+.theme-light .mermaid svg g.node polygon,
+.theme-light .mermaid svg g.node circle,
+.theme-light .mermaid svg g.node ellipse,
+.theme-light .mermaid svg g.node path {
+  fill: #ffffff !important;
+  stroke: #2f5fd0 !important;
 }
-.theme-light .mermaid svg .cluster rect {
+.theme-light .mermaid svg g.cluster rect {
   fill: rgba(47, 95, 208, 0.05) !important;
-  stroke: rgba(47, 95, 208, 0.35) !important;
+  stroke: rgba(47, 95, 208, 0.4) !important;
   stroke-width: 1.2px !important;
-  rx: 8px !important;
-  ry: 8px !important;
+  stroke-dasharray: none !important;
 }
-.theme-light .mermaid svg .cluster span,
-.theme-light .mermaid svg .cluster div {
-  fill: #5a6070 !important;
-  color: #5a6070 !important;
-  background: transparent !important;
-}
-.theme-light .mermaid svg .edgeLabel rect,
-.theme-light .mermaid svg .edgeLabel foreignObject div {
+.theme-light .mermaid svg g.edgeLabel rect {
   fill: #f1ede3 !important;
-  background: #f1ede3 !important;
-  stroke: rgba(51, 55, 63, 0.16) !important;
+  stroke: rgba(51, 55, 63, 0.2) !important;
+  stroke-width: 1px !important;
 }
-.theme-light .mermaid svg .edgeLabel span,
-.theme-light .mermaid svg .edgeLabel text,
-.theme-light .mermaid svg .messageText,
-.theme-light .mermaid svg text {
-  fill: #33373f !important;
-  color: #33373f !important;
+.theme-light .mermaid svg g.actor rect,
+.theme-light .mermaid svg rect.actor-box {
+  fill: #ffffff !important;
+  stroke: #2f5fd0 !important;
+}
+.theme-light .mermaid svg g.actor line,
+.theme-light .mermaid svg line.actor-line {
+  stroke: #9aa0b0 !important;
+}
+.theme-light .mermaid svg .flowchart-link,
+.theme-light .mermaid svg .edgePaths path,
+.theme-light .mermaid svg .messageLine,
+.theme-light .mermaid svg line,
+.theme-light .mermaid svg path.edge {
+  stroke: #6b7280 !important;
+  stroke-width: 1.6px !important;
+}
+.theme-light .mermaid svg .marker path,
+.theme-light .mermaid svg marker path,
+.theme-light .mermaid svg defs marker path {
+  fill: #6b7280 !important;
+  stroke: none !important;
+}
+.theme-light .mermaid svg rect.activation {
+  fill: #e3e7f2 !important;
+  stroke: #2f5fd0 !important;
+}
+.theme-light .mermaid svg g.note rect,
+.theme-light .mermaid svg rect.note {
+  fill: #fff8e6 !important;
+  stroke: #8a5e00 !important;
+}
+.theme-light .mermaid svg rect.labelBox,
+.theme-light .mermaid svg rect.loopBox {
+  fill: rgba(47, 95, 208, 0.05) !important;
+  stroke: rgba(47, 95, 208, 0.4) !important;
+}
+.theme-light .mermaid svg g.state rect,
+.theme-light .mermaid svg g.state circle,
+.theme-light .mermaid svg rect.classBox,
+.theme-light .mermaid svg rect.entityBox {
+  fill: #ffffff !important;
+  stroke: #2f5fd0 !important;
 }
 
 /* Figure caption line under diagrams */
