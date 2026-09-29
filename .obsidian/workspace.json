@@ -4,21 +4,21 @@
     "type": "split",
     "children": [
       {
-        "id": "2e499784d7d6f8b9",
+        "id": "e7afbb95bff44150",
         "type": "tabs",
         "children": [
           {
-            "id": "5d88630db453b5c5",
+            "id": "a2ce555ce6ee8052",
             "type": "leaf",
             "state": {
               "type": "markdown",
               "state": {
-                "file": "01 Designing Data-Intensive Applications/chapter-13-a-philosophy-of-streaming-systems.md",
+                "file": "01 Designing Data-Intensive Applications/chapter-01-trade-offs-in-data-systems-architecture.md",
                 "mode": "preview",
                 "source": false
               },
               "icon": "lucide-file",
-              "title": "chapter-13-a-philosophy-of-streaming-systems"
+              "title": "chapter-01-trade-offs-in-data-systems-architecture"
             }
           }
         ]
@@ -99,7 +99,7 @@
             "state": {
               "type": "backlink",
               "state": {
-                "file": "01 Designing Data-Intensive Applications/chapter-13-a-philosophy-of-streaming-systems.md",
+                "file": "01 Designing Data-Intensive Applications/chapter-01-trade-offs-in-data-systems-architecture.md",
                 "collapseAll": false,
                 "extraContext": false,
                 "sortOrder": "alphabetical",
@@ -118,7 +118,7 @@
             "state": {
               "type": "outgoing-link",
               "state": {
-                "file": "01 Designing Data-Intensive Applications/chapter-13-a-philosophy-of-streaming-systems.md",
+                "file": "01 Designing Data-Intensive Applications/chapter-01-trade-offs-in-data-systems-architecture.md",
                 "linksCollapsed": false,
                 "unlinkedCollapsed": true
               },
@@ -161,7 +161,7 @@
             "state": {
               "type": "outline",
               "state": {
-                "file": "01 Designing Data-Intensive Applications/chapter-13-a-philosophy-of-streaming-systems.md",
+                "file": "01 Designing Data-Intensive Applications/chapter-01-trade-offs-in-data-systems-architecture.md",
                 "followCursor": false,
                 "showSearch": false,
                 "searchQuery": ""
@@ -188,12 +188,13 @@
       "bases:Create new base": false
     }
   },
-  "active": "5d88630db453b5c5",
+  "active": "a2ce555ce6ee8052",
   "lastOpenFiles": [
+    "01 Designing Data-Intensive Applications/chapter-01-trade-offs-in-data-systems-architecture.md",
+    "01 Designing Data-Intensive Applications/chapter-13-a-philosophy-of-streaming-systems.md",
     "01 Designing Data-Intensive Applications/00-Master-Reading-Dashboard.md",
     "01 Designing Data-Intensive Applications/chapter-14-doing-the-right-thing.md",
     "01 Designing Data-Intensive Applications/chapter-02-defining-nonfunctional-requirements.md",
-    "01 Designing Data-Intensive Applications/chapter-01-trade-offs-in-data-systems-architecture.md",
     "inject_nav.py",
     "01 Designing Data-Intensive Applications/Designing Data-Intensive Applications The Big Ideas Behind Reliable, Scalable, and Maintainable Systems (Martin Kleppmann, Chris Riccomini) (z-library.sk, 1lib.sk, z-lib.sk)_2.pdf",
     "01 Designing Data-Intensive Applications/test_ch14_runner.py",
@@ -202,7 +203,6 @@
     "01 Designing Data-Intensive Applications/__pycache__/debug_script.cpython-313.pyc",
     "01 Designing Data-Intensive Applications/__pycache__",
     "01 Designing Data-Intensive Applications/debug_script.py",
-    "01 Designing Data-Intensive Applications/chapter-13-a-philosophy-of-streaming-systems.md",
     "01 Designing Data-Intensive Applications/scratch_ch13_text.txt",
     "01 Designing Data-Intensive Applications/chapter-12-stream-processing.md",
     "01 Designing Data-Intensive Applications/chapter-11-batch-processing.md",

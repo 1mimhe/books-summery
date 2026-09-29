@@ -9,7 +9,6 @@
   "interfaceFontFamily": "Plus Jakarta Sans, Vazirmatn, Segoe UI, sans-serif",
   "monospaceFontFamily": "JetBrains Mono, Fira Code, Cascadia Code, Consolas, monospace",
   "nativeMenus": false,
-  "showLineNumber": false,
   "textFontFamily": "Plus Jakarta Sans, Vazirmatn, Segoe UI, sans-serif",
   "theme": "obsidian"
 }

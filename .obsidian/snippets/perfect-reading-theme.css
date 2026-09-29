@@ -158,7 +158,7 @@
 }
 
 /* --------------------------------------------------------------------------
-   3. TYPOGRAPHIC HIERARCHY: CALM, SOLID HEADINGS (no gradient/glow)
+   3. TYPOGRAPHIC HIERARCHY: STYLED BUT CALM (eye-friendly, no glare)
    -------------------------------------------------------------------------- */
 
 .markdown-rendered h1,
@@ -169,60 +169,92 @@
 .markdown-rendered h6 {
   font-family: 'Plus Jakarta Sans', 'Vazirmatn', sans-serif !important;
   font-weight: 700 !important;
-  letter-spacing: -0.01em !important;
+  letter-spacing: -0.015em !important;
   line-height: 1.35 !important;
   position: relative;
+  scroll-margin-top: 1rem;
 }
 
-/* H1: solid, modest size, printable */
+/* H1: book-chapter title — solid ink, soft tint band, accent underline bar */
 .markdown-rendered h1 {
-  font-size: 1.9rem !important;
-  font-weight: 700 !important;
+  font-size: 2rem !important;
+  font-weight: 800 !important;
   margin-top: 1.5rem !important;
   margin-bottom: 1.2rem !important;
   color: var(--reading-text-primary) !important;
-  background: none !important;
+  background: var(--reading-border-highlight) !important;
   -webkit-background-clip: unset !important;
   -webkit-text-fill-color: unset !important;
   display: block;
-  border-bottom: 1px solid var(--reading-border-subtle) !important;
-  padding-bottom: 0.5rem !important;
+  border: 1px solid var(--reading-border-subtle) !important;
+  border-radius: 12px !important;
+  padding: 0.9rem 1.2rem 1.05rem 1.2rem !important;
   width: 100%;
+  box-shadow: none !important;
+}
+.markdown-rendered h1::after {
+  content: "" !important;
+  display: block !important;
+  width: 64px !important;
+  height: 3px !important;
+  border-radius: 3px !important;
+  background: var(--reading-accent-blue) !important;
+  margin-top: 0.6rem !important;
+  opacity: 0.85;
 }
 
-/* H2: minimal — thin left rule, no gradient bg, no shadow */
+/* H2: section band — soft tint + accent spine (styled, still calm) */
 .markdown-rendered h2 {
-  font-size: 1.4rem !important;
-  margin-top: 2.5rem !important;
-  margin-bottom: 1rem !important;
+  font-size: 1.42rem !important;
+  font-weight: 750 !important;
+  margin-top: 2.6rem !important;
+  margin-bottom: 1.1rem !important;
   color: var(--reading-text-primary) !important;
-  padding: 0.15rem 0 0.15rem 0.8rem !important;
-  border-left: 3px solid var(--reading-accent-blue) !important;
-  background: none !important;
-  border-radius: 0 !important;
+  padding: 0.6rem 1rem 0.6rem 0.95rem !important;
+  border-left: 4px solid var(--reading-accent-blue) !important;
+  background: linear-gradient(90deg, var(--reading-border-highlight) 0%, transparent 65%) !important;
+  border-radius: 0 10px 10px 0 !important;
   box-shadow: none !important;
 }
 
-/* H3/H4: quiet — same text color, no decorative glyph, no uppercase */
+/* H3: subsection — accent dot drawn with CSS (no font glyph, RTL-safe) */
 .markdown-rendered h3 {
   font-size: 1.18rem !important;
-  font-weight: 650 !important;
+  font-weight: 700 !important;
   margin-top: 2rem !important;
   margin-bottom: 0.7rem !important;
   color: var(--reading-text-primary) !important;
-  display: block;
+  display: flex !important;
+  align-items: baseline !important;
+  gap: 0.55rem !important;
 }
 .markdown-rendered h3::before {
-  content: none !important;
+  content: "" !important;
+  flex: 0 0 auto !important;
+  width: 8px !important;
+  height: 8px !important;
+  border-radius: 3px !important;
+  background: var(--reading-accent-blue) !important;
+  opacity: 0.8;
+  transform: translateY(-1px);
+}
+/* Figure headings get a teal marker so diagrams are scannable */
+.markdown-rendered h3:has(+ blockquote),
+.markdown-rendered h3:has(+ p),
+.markdown-rendered h3 {
+  scroll-margin-top: 1rem;
 }
 .markdown-rendered h4 {
   font-size: 1.02rem !important;
-  font-weight: 650 !important;
+  font-weight: 700 !important;
   margin-top: 1.5rem !important;
   margin-bottom: 0.5rem !important;
-  color: var(--reading-text-secondary) !important;
+  color: var(--reading-accent-teal) !important;
   text-transform: none !important;
-  letter-spacing: 0 !important;
+  letter-spacing: 0.01em !important;
+  border-bottom: 1px dashed var(--reading-border-subtle) !important;
+  padding-bottom: 0.25rem !important;
+  display: inline-block;
 }
 
 /* --------------------------------------------------------------------------
@@ -335,7 +367,10 @@
 }
 
 /* --------------------------------------------------------------------------
-   7. MERMAID: CALM BLOCK (no flex-center clip, no hover glow)
+   7. MERMAID FIGURES: READABLE IN DARK + LIGHT (fixes black/yellow boxes)
+   Why: Mermaid ships its own dark palette (near-black clusters, dim text,
+   black edge-label chips) that clashes with our calm theme and clips long
+   subgraph titles. These overrides force matching surfaces + real contrast.
    -------------------------------------------------------------------------- */
 
 .mermaid {
@@ -347,11 +382,161 @@
   box-shadow: none !important;
   display: block !important;
   overflow-x: auto !important;
+  overflow-y: hidden !important;
   text-align: center !important;
 }
 .mermaid svg {
   max-width: 100% !important;
   height: auto !important;
+  min-width: min(480px, 100%);
+  font-family: 'Plus Jakarta Sans', 'Vazirmatn', sans-serif !important;
+}
+
+/* --- Shared: arrows, markers, wrapping -------------------------------- */
+.mermaid svg .flowchart-link,
+.mermaid svg .edgePaths path,
+.mermaid svg .messageLine,
+.mermaid svg .transition {
+  stroke-width: 1.6px !important;
+}
+.mermaid svg .marker path,
+.mermaid svg marker path {
+  stroke: none !important;
+}
+.mermaid svg foreignObject div,
+.mermaid svg .nodeLabel,
+.mermaid svg .edgeLabel span,
+.mermaid svg .cluster span {
+  white-space: normal !important;
+  overflow-wrap: anywhere !important;
+  word-break: break-word !important;
+  text-align: center !important;
+  line-height: 1.45 !important;
+}
+.mermaid svg .cluster div {
+  max-width: 240px !important;
+  margin: 0 auto !important;
+}
+
+/* --- DARK: match midnight surfaces, lift text contrast ------------------ */
+.theme-dark .mermaid svg .flowchart-link,
+.theme-dark .mermaid svg .edgePaths path,
+.theme-dark .mermaid svg .messageLine {
+  stroke: #9aa3c0 !important;
+}
+.theme-dark .mermaid svg .marker path,
+.theme-dark .mermaid svg marker path {
+  fill: #9aa3c0 !important;
+}
+.theme-dark .mermaid svg .node rect,
+.theme-dark .mermaid svg .node polygon,
+.theme-dark .mermaid svg .node circle,
+.theme-dark .mermaid svg .node ellipse,
+.theme-dark .mermaid svg .state rect,
+.theme-dark .mermaid svg .actor {
+  fill: #24273a !important;
+  stroke: #8aadf4 !important;
+  stroke-width: 1.3px !important;
+}
+.theme-dark .mermaid svg .node text,
+.theme-dark .mermaid svg .node span,
+.theme-dark .mermaid svg .node div,
+.theme-dark .mermaid svg .nodeLabel,
+.theme-dark .mermaid svg .actor text {
+  fill: #dfe4f7 !important;
+  color: #dfe4f7 !important;
+}
+.theme-dark .mermaid svg .cluster rect {
+  fill: rgba(138, 173, 244, 0.06) !important;
+  stroke: rgba(138, 173, 244, 0.45) !important;
+  stroke-width: 1.2px !important;
+  rx: 8px !important;
+  ry: 8px !important;
+}
+.theme-dark .mermaid svg .cluster span,
+.theme-dark .mermaid svg .cluster div {
+  fill: #a5adcb !important;
+  color: #a5adcb !important;
+  background: transparent !important;
+}
+.theme-dark .mermaid svg .edgeLabel rect,
+.theme-dark .mermaid svg .edgeLabel foreignObject div {
+  fill: #1f2130 !important;
+  background: #1f2130 !important;
+  stroke: rgba(205, 211, 234, 0.18) !important;
+}
+.theme-dark .mermaid svg .edgeLabel span,
+.theme-dark .mermaid svg .edgeLabel text,
+.theme-dark .mermaid svg .messageText,
+.theme-dark .mermaid svg text {
+  fill: #cdd3ea !important;
+  color: #cdd3ea !important;
+}
+.theme-dark .mermaid svg .note rect,
+.theme-dark .mermaid svg .noteText {
+  fill: #24273a !important;
+}
+.theme-dark .mermaid svg .note span {
+  color: #cdd3ea !important;
+}
+/* database cylinder + special shapes keep tint, not black */
+.theme-dark .mermaid svg g.db rect,
+.theme-dark .mermaid svg g.stadium rect {
+  fill: #24273a !important;
+}
+
+/* --- LIGHT: warm paper surfaces, dark ink -------------------------------- */
+.theme-light .mermaid svg .flowchart-link,
+.theme-light .mermaid svg .edgePaths path,
+.theme-light .mermaid svg .messageLine {
+  stroke: #6b7280 !important;
+}
+.theme-light .mermaid svg .marker path,
+.theme-light .mermaid svg marker path {
+  fill: #6b7280 !important;
+}
+.theme-light .mermaid svg .node rect,
+.theme-light .mermaid svg .node polygon,
+.theme-light .mermaid svg .node circle,
+.theme-light .mermaid svg .node ellipse,
+.theme-light .mermaid svg .state rect,
+.theme-light .mermaid svg .actor {
+  fill: #ffffff !important;
+  stroke: #2f5fd0 !important;
+  stroke-width: 1.3px !important;
+}
+.theme-light .mermaid svg .node text,
+.theme-light .mermaid svg .node span,
+.theme-light .mermaid svg .node div,
+.theme-light .mermaid svg .nodeLabel {
+  fill: #33373f !important;
+  color: #33373f !important;
+}
+.theme-light .mermaid svg .cluster rect {
+  fill: rgba(47, 95, 208, 0.05) !important;
+  stroke: rgba(47, 95, 208, 0.35) !important;
+  stroke-width: 1.2px !important;
+  rx: 8px !important;
+  ry: 8px !important;
+}
+.theme-light .mermaid svg .cluster span,
+.theme-light .mermaid svg .cluster div {
+  fill: #5a6070 !important;
+  color: #5a6070 !important;
+  background: transparent !important;
+}
+.theme-light .mermaid svg .edgeLabel rect,
+.theme-light .mermaid svg .edgeLabel foreignObject div {
+  fill: #f1ede3 !important;
+  background: #f1ede3 !important;
+  stroke: rgba(51, 55, 63, 0.16) !important;
+}
+.theme-light .mermaid svg .edgeLabel span,
+.theme-light .mermaid svg .edgeLabel text,
+.theme-light .mermaid svg .messageText,
+.theme-light .mermaid svg text {
+  fill: #33373f !important;
+  color: #33373f !important;
 }
 
 /* Figure caption line under diagrams */
@@ -506,6 +691,15 @@
   border-right: 2px solid var(--reading-border-highlight) !important;
   padding: 0.4rem 1.1rem 0.4rem 0 !important;
 }
+[dir="rtl"] .markdown-rendered h3 {
+  flex-direction: row-reverse !important;
+}
+[dir="rtl"] .markdown-rendered h2 {
+  border-left: none !important;
+  border-right: 4px solid var(--reading-accent-blue) !important;
+  border-radius: 10px 0 0 10px !important;
+  padding: 0.6rem 0.95rem 0.6rem 1rem !important;
+}
 
 /* --------------------------------------------------------------------------
    12. REDUCED MOTION + PRINT (no animation fatigue, ink-friendly)
@@ -533,6 +727,10 @@
     -webkit-text-fill-color: #000 !important;
     background: none !important;
     border-color: #ccc !important;
+  }
+  .markdown-rendered h1::after,
+  .markdown-rendered h3::before {
+    display: none !important;
   }
   .markdown-rendered table,
   .markdown-rendered pre,
