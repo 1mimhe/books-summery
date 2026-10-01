@@ -2,10 +2,9 @@
 # Gitignore Configuration
 # ==========================================
 
-# Prompts & Generation Templates (tracked — needed for future books + PDF figure rule)
-# CHAPTER_SUMMARY_PROMPT.md
-# *prompt*.md
-# *PROMPT*.md
+# Prompts & Generation Templates (user-requested ignore: local-only)
+CHAPTER_REVIEW_AND_IMPROVEMENT_PROMPT.md
+CHAPTER_SUMMARY_PROMPT.md
 
 # Software Engineering Book PDFs & E-Books (User requested ignore)
 *.pdf
