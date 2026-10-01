@@ -5,212 +5,291 @@
 > [!NAV] **Chapter Navigation**
 > ⬅️ **Previous:** [[chapter-07-sharding|Chapter 07: Sharding]] | 🏠 **Index:** [[00-Master-Reading-Dashboard|Master Dashboard]] | ➡️ **Next:** [[chapter-09-the-trouble-with-distributed-systems|Chapter 09: The Trouble with Distributed Systems]]
 
-
 ---
 
 ## 1. Executive Summary & Core Engineering Problem
 
-- **Core Thesis:** Transactions are an essential abstraction designed to simplify application development by bundling a sequence of database reads and writes into a single logical unit of execution. Under the transactional guarantee, software engineers can treat complex distributed failures, race conditions, process crashes, and disk errors as a binary outcome: either the entire operation succeeds (**Commit**) or it completely fails and safely resets (**Abort**). However, the classic acronym **ACID** (Atomicity, Consistency, Isolation, Durability) obscures severe real-world trade-offs: full serializability imposes catastrophic lock contention and throughput collapse, forcing databases to default to **weak isolation levels** (Read Committed, Snapshot Isolation) that silently expose applications to subtle concurrency anomalies like read skew, lost updates, and write skew.
-- **Problem Statement:** Developing applications under the assumption that a database provides "ACID" without verifying the configured isolation level leads to catastrophic financial, clinical, and operational failures. A classic production disaster occurs in hospital on-call scheduling (Figure 8-8): an operational rule mandates that at least one doctor must remain on call at all times. Two doctors, Alice and Bob, both feel unwell and concurrently request to go off call. Under Snapshot Isolation (the default "strong" isolation level in PostgreSQL, Oracle, and CockroachDB), Alice's transaction reads the on-call count ($2$), sees it is safe to leave, and sets her status to off-call. Bob's transaction concurrently reads the same snapshot ($2$), concludes it is safe, and sets his status to off-call. Both transactions commit successfully without lock conflicts. The database enters an illegal state with **zero doctors on call**, yet neither the application nor the database threw an exception (**Write Skew**).
-- **Historical & Industry Context:** The transactional abstraction was formalized in the 1970s by Jim Gray and implemented in IBM System R. For decades, relational databases treated Two-Phase Locking (2PL) as the gold standard for serializability, accepting heavy latency penalties and deadlock aborts. The NoSQL movement of the 2000s initially abandoned multi-object transactions entirely to maximize horizontal scale. In the 2010s, modern hardware realities (abundant multi-core RAM and NVMe storage) enabled two breakthroughs: in-memory serial execution engines (VoltDB, Redis) and **Serializable Snapshot Isolation (SSI)** (Cahill et al., 2008), implemented in PostgreSQL 9.1 and CockroachDB, which delivers true serializability with the optimistic read throughput of MVCC. In the 2020s (2nd Edition inflection), Distributed SQL engines combined consensus algorithms (Raft/Paxos) with distributed transaction protocols to provide ACID semantics across globally sharded clusters without the blocking coordinator hazards of legacy XA Two-Phase Commit.
+> *"Some authors have claimed that general two-phase commit is too expensive to support, because of the performance or availability problems that it brings. We believe it is better to have application programmers deal with performance problems due to overuse of transactions as bottlenecks arise, rather than always coding around the lack of transactions."*
+> — **James Corbett et al.**, *Spanner: Google's Globally-Distributed Database* (2012)
+
+- **The Big Picture (Kleppmann's Framing):** In the harsh reality of data systems many things go wrong: software or hardware fails mid-write, the application crashes halfway through a series of operations, the network cuts the app off from the database or one node from another, concurrent clients overwrite each other, clients read half-updated state, race conditions surprise you. Fault-tolerance is a lot of work and requires rigorous testing. For decades **transactions** have been the mechanism of choice for simplifying this: group several reads and writes into one logical unit that either **commits** as a whole or **aborts/rolls back** as a whole. On abort the app can safely retry without worrying about partial failure.
+- **Core Thesis:** Transactions are not a law of nature; they were invented (IBM System R, 1975, still recognisable in MySQL/PostgreSQL/Oracle/SQL Server 50 years later) to let applications ignore partial failure and concurrency and push safety into the database. But **ACID is a marketing term**: one vendor's ACID ≠ another's. Serializability costs performance, so production systems default to weak isolation (Read Committed, Snapshot Isolation) that prevents only some anomalies and leaves read skew, lost update, write skew and phantoms to the application. Late-2000s NoSQL abandoned transactions for scale; 2010s NewSQL (CockroachDB, TiDB, Spanner, FoundationDB, YugabyteDB) proved sharding + consensus can provide ACID at scale — but not every system must be transactional.
+- **Problem Statement:** Assuming "ACID" means safe causes money loss, audit failure and data corruption. Canonical disaster — hospital on-call (Fig 8-8): invariant "≥1 doctor on call". Alice and Bob are both on call. Both concurrently `SELECT COUNT(*) WHERE on_call=true` → see 2 → both `UPDATE` their own row to `false` → both commit under Snapshot Isolation with no row conflict → **0 doctors on call**, no error. Same pattern double-books meeting rooms, overbooks flights, lets two users claim `alice` username, lets balances go negative.
+- **Historical & Industry Context:** Jim Gray / System R formalised transactions; Härder/Reuter coined ACID (1983); Gray et al. defined lock granularity and predicate locks (1976). 1970s–2000s: Two-Phase Locking the only serializable standard. 2000s NoSQL: transactions "unscalable", redefined to single-object linearizable CAS (Aerospike, Cassandra LWT). 2008 Cahill/Fekete/Roe: Serializable Snapshot Isolation → PostgreSQL 9.1, CockroachDB, FoundationDB. 2000s RAM cheap + short OLTP → single-thread serial execution (VoltDB/H-Store, Redis, Datomic). 2010s–2020s: Raft/Multi-Paxos + 2PC inside one engine = distributed ACID without XA blocking. Post Office Horizon scandal cited as what happens without ACID accounting.
 
 ---
 
 ## 2. In-Depth Technical Concepts & Internal Mechanics
 
-### 2.1 Deconstructing ACID: Definitions, Myths, and Invariants
-- **Atomicity (Abortability):**
-  - *The Myth:* Atomicity means operations happen concurrently without interference. (False: that is Isolation).
-  - *The Technical Reality:* Atomicity is about **fault recovery**. If an execution encounters an error mid-transaction (syntax error, disk full, network timeout, deadlocks, power loss), the database aborts the transaction and **discards all partial writes** made by that transaction (Figure 8-3). The database state reverts to exactly what it was before the transaction began.
-- **Consistency (Application Invariants):**
-  - *The Myth:* Consistency is a database-enforced mechanical guarantee.
-  - *The Technical Reality:* In ACID, consistency means the application's business rules and invariants (e.g., in a double-entry ledger, the sum of debits must equal the sum of credits) are preserved. The database can enforce simple constraints (foreign keys, uniqueness, `CHECK` constraints), but overall business consistency is strictly the **application's responsibility**. (Note: "Consistency" in ACID is entirely different from "Consistency" in CAP theorem, where it denotes linearizability).
-- **Isolation (Concurrency Control):**
-  - Concurrently executing transactions must not step on each other's toes. Formally, **Serializability** guarantees that the net result of running concurrent transactions is identical to running them sequentially, one at a time, in some total order.
-- **Durability (Persistence Guarantees):**
-  - Once a transaction commits successfully, its data will not be lost, even if a hardware crash or power outage occurs immediately afterward.
-  - *Mechanics:* In single-node databases, durability requires writing transaction log records to a non-volatile Write-Ahead Log (WAL) on disk and issuing an explicit `fsync` system call. In distributed databases, it requires replicating the commit to a quorum of nodes.
+### 2.1 Deconstructing ACID: Atomicity, Consistency, Isolation, Durability
 
----
+| Letter | Myth | Reality (book pp. 303–308 / PDF pp. 303–308) |
+| :--- | :--- | :--- |
+| **A – Atomicity (Abortability)** | "Concurrent users don't interfere" | **Crash safety for multi-write batches.** If a fault occurs after some writes (crash, network cut, disk full, constraint violation), abort and discard/undo all writes so far. Retry is safe because aborted = changed nothing. Better name would be *abortability*. Covers: process crash, TCP drop, power loss, `CHECK` failure. |
+| **C – Consistency (Invariants)** | "DB guarantees correctness" | **Application property.** Credits==debits, foreign keys valid, ≥1 doctor on call. DB enforces only declared `FOREIGN KEY / UNIQUE / CHECK / NOT NULL`, triggers, materialized views. Complex invariants (≥1 doctor, no overlapping bookings, balance≥0) cannot be declared in most engines — app must define transactions to preserve them. Overloaded word: replica consistency (Ch.6), consistent snapshot (happens-before), consistent hashing (Ch.7), CAP consistency (=linearizability, Ch.10) are different. |
+| **I – Isolation (Concurrency)** | "ACID = serializable" | **Concurrent txns isolated.** Textbook = serializability: committed result same as if run serially one-at-a-time. Real engines default to weaker levels. Oracle's "serializable" is really snapshot isolation [10,14]. |
+| **D – Durability (No forgetting)** | "Commit = safe forever" | **Promise committed writes survive.** Single-node: WAL + `fsync` + checksums + crash recovery (Ch.4 p.127). Replicated: copied to N nodes before ack. No perfect durability: all disks+backups destroyed = loss. |
 
-### 2.2 Single-Object vs. Multi-Object Operations
-- **Single-Object Operations:**
-  - Modern storage engines provide hardware-assisted atomicity and isolation for single-record mutations (e.g., updating a 20 KiB JSON document or a single table row).
-  - *Mechanisms:* Slotted page locks, compare-and-swap (CAS) memory instructions, and log sequence numbers ensure that a 16 KiB page write is never read as a half-written "torn page".
-- **Multi-Object Operations (The Real Need for Transactions):**
-  - Real-world operations span multiple records, tables, or secondary indexes:
-    1. *Relational Foreign Keys:* Inserting an order row and several order-line items must be coordinated.
-    2. *Denormalized Views & Caches:* Updating an email inbox must atomically update the message table and increment the unread counter (Figure 8-2).
-    3. *Secondary Indexes:* Updating a customer email requires writing the heap/clustered table and updating the secondary B-tree index. If a crash occurs between the two writes, the secondary index points to corrupted garbage.
+**Replication vs Durability — nothing is perfect:**
+- Disk write but machine dies → inaccessible until fixed; replicas stay available.
+- Correlated fault (power, bug on specific input) kills all replicas; in-memory-only loss.
+- Async replication: recent leader writes lost on failover (Ch.6 p.204).
+- SSDs violate `fsync` promises; firmware bugs (fail after exactly 32,768h); PostgreSQL misused `fsync` for 20 years [19–21]; FS/engine interactions corrupt files after crash [22,23]; corruption spreads replica→replica [24].
+- Bit-rot: data rots undetected; replicas+recent backups also rotten → need historical backup. 30–80% of SSDs develop ≥1 bad block in 4 years; HDDs fewer bad sectors but more total failures.
+- Worn SSD without power loses data in weeks–months (temperature dependent).
+- **Use together:** disk + remote replication + backups. Take guarantees with salt.
 
----
+### 2.2 Single-Object vs Multi-Object Operations
 
-### 2.3 Weak Isolation Levels: Read Committed
-- **Foundational Theory:** The most basic transactional isolation level. Read Committed provides two strict guarantees:
-  1. **No Dirty Reads:** When reading from the database, you will only see data that has already been committed (no uncommitted writes from other transactions) (Figure 8-4).
-  2. **No Dirty Writes:** When writing to the database, you will only overwrite data that has already been committed (Figure 8-5).
-- **Under-the-Hood Implementation Mechanics:**
-  - *Preventing Dirty Writes:* The database acquires **row-level exclusive locks** on every modified row. If Transaction A updates row 42, it holds the lock until commit or abort. If Transaction B attempts to update row 42, it blocks until Transaction A releases the lock.
-  - *Preventing Dirty Reads (The MVCC Read Solution):*
-    - *Naive Approach (Read Locks):* Require readers to acquire shared read locks. *Fatal Flaw:* A single long-running read query blocks all concurrent writes to those rows, destroying write throughput.
-    - *Production Approach:* For every row undergoing mutation, the database retains both the **old committed value** and the **new uncommitted value** written by the active transaction (Figure 8-4). While the transaction is in-flight, all other concurrent transactions are given the old committed value. Once committed, the new value becomes visible.
+> **Recap:** Atomicity = abort discards partial writes. Isolation = concurrent txn sees all-or-none of another's writes, not a subset. Both assume **multi-object** (rows/documents/records).
 
----
+**Fig 8-2 context — denormalized unread counter:** `SELECT COUNT(*) FROM emails WHERE recipient_id=2 AND unread_flag=true` too slow → add `unread_count` column. New mail = `INSERT email` + `increment counter`. Without isolation User 2 sees new mail but counter still 0. With accounting: balance vs payment. Without isolation record appears in one secondary index but not another (Ch.7 p.268).
 
-### 2.4 Snapshot Isolation & Multi-Version Concurrency Control (MVCC)
-- **The Read Skew (Non-Repeatable Read) Anomaly (Figure 8-6):**
-  - Alice has \$1,000 split across two bank accounts (\$500 in Account 1, \$500 in Account 2).
-  - Transaction 1 transfers \$100 from Account 2 to Account 1.
-  - Transaction 2 (Alice) runs an audit query to check her total wealth:
-    1. Alice reads Account 1: observes \$500 (before transfer applies).
-    2. Transaction 1 executes: deducts \$100 from Account 2, adds \$100 to Account 1, and **commits**.
-    3. Alice reads Account 2: observes \$400 (after transfer applied).
-  - *The Anomaly:* Alice sees a total balance of \$900 (\$500 + \$400). To her, \$100 appears to have vanished into thin air.
-  - While acceptable for short single-record queries, read skew is disastrous for backups, analytical reporting, and multi-table integrity audits.
-- **Snapshot Isolation Definition:**
-  - Each transaction reads from a **consistent snapshot** of the database taken at the exact instant the transaction started. The transaction sees all data that was committed at the time it began; writes committed by other transactions *after* the snapshot time are invisible.
-  - *Core Invariant:* **Readers never block writers, and writers never block readers.**
-- **Under-the-Hood MVCC Layout (PostgreSQL Engine - Figure 8-7):**
-  - The storage engine maintains multiple physical versions of each row simultaneously.
-  - Every transaction is assigned a monotonically increasing 32-bit or 64-bit integer **Transaction ID (`txid`)**.
-  - Every table row on disk carries hidden metadata headers:
-    ```text
-    [ xmin: 8B | xmax: 8B | infomask: 2B | t_ctid: 6B | ... user columns ... ]
-    ```
-    - `xmin`: The `txid` of the transaction that inserted (created) this row version.
-    - `xmax`: The `txid` of the transaction that deleted or updated this row version (initially 0).
-  - *Update Path:* An `UPDATE` does not overwrite the row in place. It marks `xmax` of the existing row with the current `txid`, and inserts a brand-new row version with `xmin = current_txid`.
-  - *Visibility Rules:* A transaction with ID $T$ reading the database evaluates each row version. A row version is visible to $T$ iff:
-    1. At the start of $T$, the `xmin` transaction had already committed.
-    2. The `xmin` transaction is not marked as aborted.
-    3. The `xmax` is either 0 (not deleted) OR the `xmax` transaction had not yet committed when $T$ started.
-- **Garbage Collection (Vacuuming):**
-  - When old row versions have an `xmax` older than the oldest active transaction in the cluster, background vacuum workers (e.g., PostgreSQL `VACUUM`) physically purge dead tuples and reclaim disk pages.
+| Aspect | Single-object write | Multi-object transaction |
+| :--- | :--- | :--- |
+| Example | 20 kB JSON doc, one K-V pair, one row | Order + 5 line items; email + counter; primary row + secondary index |
+| Atomicity need | Torn page? Half-sent 10 kB fragment spliced with old value? Partial read mid-write? | Crash between email insert and counter update → out of sync |
+| How provided | Log for crash recovery + per-object latch/lock; one thread per object | `BEGIN`…`COMMIT` on one TCP connection; abort on TCP drop. Non-relational multi-put ≠ transaction (may succeed on some keys, fail on others) |
+| Extra ops | Atomic `increment`, conditional write / CAS (`UPDATE … WHERE value=old`) — removes Fig 8-1 read-modify-write. Aerospike "strong", Cassandra LWT = linearizable single-object only | Foreign-key validity across tables; graph edges; denormalized sync; index maintenance |
 
----
+> Strictly, "atomic increment" means *isolated/serializable* increment in ACID terms, but everyone says atomic.
 
-### 2.5 Preventing Lost Updates
-- **The Lost Update Problem (Figure 8-1):**
-  - Two clients concurrently execute a read-modify-write cycle on the same record:
-    1. Client 1 reads counter $X = 42$.
-    2. Client 2 reads counter $X = 42$.
-    3. Client 1 writes $X = 43$.
-    4. Client 2 writes $X = 43$ (overwriting Client 1's update).
-  - One increment operation is permanently lost.
-- **Defensive Solutions:**
-  1. *Atomic Write Operations:*
-     ```sql
-     UPDATE counters SET value = value + 1 WHERE id = 'hits';
-     ```
-     Executed by acquiring an exclusive row latch, updating the value directly in the buffer pool, and logging to the WAL, eliminating client-side race windows.
-  2. *Explicit Pessimistic Locking (`SELECT ... FOR UPDATE`):*
-     ```sql
-     BEGIN;
-     SELECT value FROM counters WHERE id = 'hits' FOR UPDATE;
-     -- Application modifies value in memory
-     UPDATE counters SET value = 43 WHERE id = 'hits';
-     COMMIT;
-     ```
-     Forces concurrent readers attempting `FOR UPDATE` to block until the lock is released.
-  3. *Automatic Lost Update Detection (PostgreSQL / Oracle):*
-     Snapshot isolation in PostgreSQL automatically detects concurrent writes to the same row. If Transaction B attempts to mutate a row that was updated by Transaction A after B's snapshot began, Transaction B is aborted with an error: `ERROR: could not serialize access due to concurrent update`.
-  4. *Compare-and-Set (CAS / Optimistic Concurrency Control):*
-     ```sql
-     UPDATE counters SET value = 43 WHERE id = 'hits' AND value = 42;
-     ```
-     If another transaction updated `value` first, the query affects 0 rows, prompting an application retry.
+**Do we need multi-object?** Sometimes single-object suffices. But: relational FKs, document denormalization (join-less DBs force it), secondary indexes — all need coordinated writes. Without transactions error handling explodes (Ch.13 alternatives).
 
----
+### 2.3 Handling Errors and Aborts — Retry Is the Point
 
-### 2.6 Write Skew and Phantoms
-- **Foundational Theory:** Write skew is the subtlest and most dangerous concurrency anomaly. It is **not** a dirty write, nor is it a lost update:
-  - In a lost update, two transactions mutate the **same row**.
-  - In write skew, two transactions read the **same set of rows**, but make mutations to **different rows**, breaking a global cross-row invariant (Figure 8-8).
-- **The Mathematical Pattern of Write Skew:**
-  1. A `SELECT` query checks for rows satisfying a precondition ($C$).
-  2. Depending on the query result, the application code makes a business decision.
-  3. The application executes an `INSERT`, `UPDATE`, or `DELETE` that alters the precondition ($C$).
-  4. Concurrently, a second transaction evaluates the exact same precondition ($C$) and executes a mutation to a *different* record.
-  5. Both transactions commit successfully under Snapshot Isolation, violating the invariant.
-- **Real-World Manifestations:**
-  - *On-Call Doctors:* Precondition: $\text{count}(\text{doctors on call}) \ge 2$. Alice goes off call; Bob goes off call. Invariant breached ($\text{count} = 0$).
-  - *Meeting Room Booking:* Precondition: $\text{count}(\text{bookings for Room A at 2 PM}) = 0$. Two users concurrently book Room A for 2 PM. Both queries see 0 bookings; both insert a reservation; double booking occurs!
-  - *Username Registration:* Precondition: username does not exist. Two users concurrently register `"alice"`.
-  - *Multiplayer Game:* Moving two pieces to the same board coordinates concurrently.
-- **The Phantom Phenomenon:**
-  - A write in one transaction changes the result of a search query in another transaction.
-  - Snapshot isolation prevents phantoms for read-only queries, but cannot prevent phantoms from causing write skew.
-- **Mitigation: Materializing Conflicts:**
-  - If no rows exist to lock (e.g., locking a non-existent meeting room booking), you can artificially materialize physical rows (e.g., pre-inserting a table of 15-minute time slots for each room) and execute `SELECT ... FOR UPDATE` on the slot row. Highly complex and leak-prone; true **Serializability** is the only robust solution.
+ACID philosophy: rather violate atomicity/isolation/durability → abandon txn entirely than leave half-finished. Leaderless ("best effort": do as much as possible, app recovers) differs.
 
----
+- ORMs (Rails ActiveRecord, Django) usually **don't retry** — exception bubbles, user input discarded. Shame: rollback exists to enable safe retry.
+- **Retry only transient errors:** deadlock, isolation violation, network blip, failover. Never retry permanent `constraint violation`.
+- **Hazards:** (1) Txn actually committed but ack lost → retry duplicates unless app-level dedup/idempotence. (2) Overload/contention → retry worsens storm → cap retries + exponential backoff + treat overload separately (Ch.2 p.38). (3) Side effects outside DB (send email) happen even if abort → need 2PC across systems or outbox/idempotence. (4) Client crash while retrying = intended writes lost.
 
-### 2.7 Serializability: 2PL, Stored Procedures, and SSI
+### 2.4 Read Committed — No Dirty Reads, No Dirty Writes
 
-To eliminate write skew and all concurrency anomalies, systems must enforce **Serializability**. Three architectural implementations exist:
+Strongest weak level most engineers meet. Default in Oracle, PostgreSQL, SQL Server. Guarantees:
 
-#### 1. Actual Serial Execution (Single-Threaded In-Memory Engines: VoltDB, Redis - Figure 8-9)
-- *Theory:* The fastest way to handle concurrency is to eliminate concurrency entirely. Execute transactions sequentially on a single CPU thread.
-- *Why It Works in Modern Systems:*
-  - RAM is vast and cheap; active OLTP working sets fit in memory.
-  - Transactions avoid disk I/O waits during execution (WAL logging is batched/pipelined).
-  - Eliminates all locking, latching, and two-phase commit overhead.
-- *Strict Constraints:*
-  - Transactions must be submitted as **Stored Procedures** (Figure 8-9). Interactive multi-statement transactions (`BEGIN` $\to$ network hop $\to$ query $\to$ network hop $\to$ `COMMIT`) hold the thread idle during network I/O, destroying throughput.
-  - A single slow transaction halts the entire database.
+| Guarantee | Meaning | Fig |
+| :--- | :--- | :--- |
+| **No dirty reads** | Read only committed data. Txn's writes invisible until commit, then all-at-once | Fig 8-4: U1 sets `x=3` (old 2) uncommitted; U2 `GET x` still returns 2; only after `COMMIT` sees 3 |
+| **No dirty writes** | Overwrite only committed data. Second writer to same row waits for first to commit/abort (row lock held to end) | Fig 8-5: Aaliyah and Bryce buying same car — listing table vs invoice table. Without it sale awarded to Bryce but invoice sent to Aaliyah (mixed writes). Prevented |
 
-#### 2. Two-Phase Locking (2PL - MySQL InnoDB, SQL Server)
-- *Theory:* For decades, the dominant serializability algorithm.
-- *Locking Rules:*
-  - To read an object, a transaction must acquire a **Shared Lock ($S$)**. Multiple transactions can hold shared locks concurrently.
-  - To mutate an object, a transaction must acquire an **Exclusive Lock ($X$)**. Only one transaction can hold an exclusive lock.
-  - *The Blocking Rule:* If Object $O$ has an $S$-lock, writers are blocked. If Object $O$ has an $X$-lock, all other readers and writers are blocked. **Readers block writers, and writers block readers.**
-- *The Two Phases:*
-  - *Growing Phase:* Locks are acquired as operations execute; no locks are released.
-  - *Shrinking Phase:* All acquired locks are held until the **end of the transaction** (`COMMIT` or `ABORT`) and released simultaneously (Strict 2PL).
-- *Preventing Phantoms: Predicate Locks & Index-Range Locks:*
-  - *Predicate Lock:* Locks all records matching an arbitrary condition (e.g., `WHERE room_id = 123 AND start_time >= '14:00'`), even rows that do not yet exist! Extremely expensive to evaluate in practice.
-  - *Index-Range Locks (Next-Key Locking):* The engine locks a range of index keys (e.g., all B-tree entries for `room_id = 123`). Any attempt to insert a new row within that index interval is blocked until the transaction completes.
-- *The Collapse of 2PL at Scale:*
-  - High probability of deadlocks; database engine must continuously run cycle-detection on the wait-for graph, aborting and rolling back victim transactions.
-  - Severe queueing delays drive p99 and p99.9 latencies exponentially higher under moderate lock contention.
+**Why prevent?** Dirty read of Fig 8-2 email without counter confuses users and lets txns decide on half-state. If aborting txn's writes were visible, readers of rolled-back data would cascade-abort.
 
-#### 3. Serializable Snapshot Isolation (SSI - PostgreSQL, CockroachDB)
-- *Theory:* An **optimistic concurrency control** algorithm. Transactions execute under standard Snapshot Isolation with zero locking. The engine tracks read-write conflicts at runtime; if a non-serializable interleaving is detected, the transaction is safely aborted and retried.
-- *Tracking Conflict Graphs (Figures 8-10 & 8-11):*
-  - The database must detect when a transaction executes writes that invalidate the premises of another transaction's prior reads.
-  - *Mechanism 1: Detecting Stale MVCC Reads (Figure 8-10):* Transaction 43 reads rows. Concurrently, Transaction 42 writes to those rows. When Transaction 43 prepares to commit, the engine checks whether any read row versions have been superseded by committed writes; if so, Transaction 43 is aborted.
-  - *Mechanism 2: Detecting Writes That Affect Prior Reads (Figure 8-11):* When Transaction 42 executes an index scan, the engine places a lightweight lock-free tracking lock (a "SIREAD" lock) on the B-tree index entries. When Transaction 43 inserts a row into that index range, it notices the SIREAD lock and notifies Transaction 42 that its read premise has been invalidated.
-- *Performance Advantage:* Readers never block writers, and writers never block readers. Under low-to-moderate contention, SSI achieves throughput comparable to raw Snapshot Isolation while mathematically guaranteeing complete freedom from write skew and phantoms.
+**Implementation:**
+- Dirty writes: **row-level exclusive locks** held to commit/abort. One holder per row.
+- Dirty reads: option A — brief shared read lock (Db2, SQL Server `read_committed_snapshot=off`). Bad: one long write stalls all readers → knock-on operability failure. Option B (common) — keep old committed + new uncommitted (Fig 8-4), readers get old value; switch on commit. See MVCC §2.5.
+- Does **not** prevent Fig 8-1 counter race (second write after first committed → not dirty) — need §2.6.
+- `READ UNCOMMITTED`: prevents dirty writes only, returns latest even if uncommitted. Saves version storage, slightly fewer lost updates, but dirty reads allowed.
 
----
+### 2.5 Snapshot Isolation, Repeatable Read and MVCC
 
-### 2.8 Distributed Transactions & Two-Phase Commit (2PC)
-- **The Distributed Atomic Commitment Problem:**
-  - A transaction updates data across multiple distinct database shards, partitions, or message queues (Figure 8-12).
-  - If Node 1 commits successfully, but Node 2 fails due to a unique constraint violation or disk-full error, the system enters an inconsistent state.
-  - Single-node `COMMIT` is non-reversible; distributed systems require an atomic commitment protocol.
-- **Two-Phase Commit (2PC) Algorithm (Figure 8-13):**
-  - Managed by a centralized **Coordinator** (transaction manager) orchestrating multiple **Participant** nodes.
-  - *Phase 1: Prepare Phase*
-    1. Coordinator assigns a globally unique transaction ID.
-    2. Coordinator sends a `PREPARE` message to all participants.
-    3. Each participant executes the transaction locally: writes undo and redo logs to disk, acquires all local locks, and verifies invariants.
-    4. If successful, participant writes `VOTE_COMMIT` to its local WAL and replies `YES`.
-    5. *The Irreversible Invariant:* By voting `YES`, the participant gives up the right to abort; it **promises** to commit if instructed, no matter what happens (even surviving subsequent crashes).
-  - *Phase 2: Commit Phase*
-    1. Coordinator collects votes.
-    2. If **all** participants voted `YES`: Coordinator writes `COMMIT` to its local WAL (the decision is now irrevocable) and sends `COMMIT` requests to all participants.
-    3. If **any** participant voted `NO` (or timed out): Coordinator writes `ABORT` to its local WAL and sends `ABORT` requests to all participants.
-    4. Participants apply mutations, release all held locks, and reply `ACK`.
-    5. Coordinator marks transaction completed in its WAL.
-- **The In-Doubt (Uncertain) Coordinator Failure Disaster (Figure 8-14):**
-  - *The Scenario:* All participants vote `YES` in Phase 1. The coordinator writes `COMMIT` to its log, but **crashes before sending the Phase 2 commit messages**.
-  - *The Dilemma:*
-    - Participant 1 has voted `YES`. It cannot abort unilaterally, because the coordinator may have decided to commit.
-    - Participant 1 cannot commit unilaterally, because another participant may have voted `NO` causing an abort.
-    - Participant 1 is **In-Doubt**. It must hold all exclusive row locks indefinitely.
-  - *The Production Collapse:* Because participants hold row locks on hot records, all subsequent transactions attempting to touch those rows queue up and block. The entire database freezes until the coordinator recovers its WAL or an operator manually resolves the in-doubt transaction.
+Read Committed still has **read skew / nonrepeatable read** (Fig 8-6):
+
+| Step | Alice ($1000 = $500 checking + $500 saving) | Transfer $100 saving→checking |
+| :--- | :--- | :--- |
+| 1 | Reads checking → $500 (before) | — |
+| 2 | — | Deduct saving $500→$400, add checking $500→$600, COMMIT |
+| 3 | Reads saving → $400 (after) | — |
+| Result | Sees $500+$400=**$900**, $100 vanished | — |
+
+Committed at read time, so allowed under Read Committed. Transient for Alice (reload fixes) but permanent for **backups** (hours-long copy mixes old+new parts → restore bakes in missing money) and **analytics/integrity scans** (nonsense if observing different times).
+
+**Snapshot Isolation fix:** each txn reads from **consistent snapshot at start**. Later commits invisible. Long read-only queries (backup/analytics) easy to reason. Supported (variants) by PostgreSQL, MySQL InnoDB, Oracle, SQL Server, TiDB, Aurora DSQL, BigQuery — behaviour differs [30,42,43].
+
+- Oracle/TiDB/Aurora DSQL choose SI as *highest* level.
+- Readers never block writers, writers never block readers — no lock contention between long reads and writes.
+
+**MVCC (PostgreSQL Fig 8-7):**
+- `txid` always-increasing per txn start. Every write tagged with writer `txid`.
+- Row has `inserted_by` + `deleted_by` (empty until delete). Delete = mark, not remove. Update = delete + insert. E.g. txn 13 deducts $100 from acct 2: old row `balance $500 deleted_by 13`, new row `balance $400 inserted_by 13`. Versions in same heap, linked list newest↔oldest. GC removes versions invisible to all.
+- **Visibility (snapshot S, reader R):**
+  1. Ignore writes by txns in-progress at R start (even if they later commit).
+  2. Ignore writes by txns with `txid` > R start (started later), even if committed.
+  3. Ignore writes by aborted txns (GC later; no eager cleanup needed).
+  4. All else visible. I.e. row visible iff inserter committed before R started AND deleter not committed before R started.
+- Txn 12 reading acct 2 sees $500 because deleter 13 started after 12 (rule 2).
+- Long txn pins snapshot → holds old versions → overhead.
+- **Indexes:** entry points to one version (oldest/newest) + chain to visible version. Filter by txid. GC removes index entries with row. PostgreSQL optimises same-page updates to avoid index churn; others store diffs not full copies.
+- **Immutable B-trees (CouchDB/Datomic/LMDB):** copy-on-write — new copies of modified pages up to new root. Root = snapshot. No txid filtering; background compaction/GC.
+- **Naming confusion:** SQL standard (System R 1975, pre-SI) defines `REPEATABLE READ`, not SI. PostgreSQL calls SI "repeatable read" (meets standard so claims compliance). MySQL "repeatable read" = weaker MVCC, not true SI [43]. Db2 "repeatable read" = serializable [10]. Oracle "serializable" = SI. Standard ambiguous [38]; formal definitions [39,40] unsatisfied by most. Nobody knows what repeatable read means — check engine docs.
+
+### 2.6 Preventing Lost Updates (Fig 8-1: 42 → 43 not 44)
+
+Read-modify-write in app: `SELECT value (42)` → `+1` → `UPDATE 43`. Two concurrent → one clobbered. Instances: counter/balance, JSON list append (parse→modify→writeback), wiki full-page overwrite.
+
+| Solution | How | When best / caveat |
+| :--- | :--- | :--- |
+| **Atomic write** `UPDATE counters SET value=value+1 WHERE key='foo'`; MongoDB/Redis atomic doc/list ops | DB exclusively locks object or single-threads op | Best if expressible. ORM trap: easy to do unsafe RMW instead [51–53]. Wiki arbitrary edit needs CRDT/OT (Ch.6 p.227) |
+| **Explicit lock** `SELECT … FOR UPDATE` (Ex 8-1: game `figures WHERE name='robot' … FOR UPDATE`, validate move, `UPDATE position='c4'`) | App locks rows, does RMW, others wait | Flexible (game rules not SQL). Must not forget lock anywhere. Multi-object → deadlock → auto-detect + app retry |
+| **Auto-detect + abort/retry** | Allow parallel, abort on lost update, app retries | PostgreSQL repeatable-read, Oracle serializable, SQL Server snapshot auto-detect. **MySQL InnoDB repeatable-read does NOT** [30,43]. Authors argue true SI must prevent lost updates, so MySQL ≠ SI. No app change needed, less error-prone, but needs retry harness |
+| **Conditional write / CAS / optimistic locking** `UPDATE wiki_pages SET content='new' WHERE id=1234 AND content='old'` or `version=old_version`; check row-count, retry | Only if unchanged since read. CPU CAS analogue | For DBs without txns. MVCC exception: `WHERE` sees later-committed values even if snapshot wouldn't. Needs version column if comparing full content expensive |
+| **Replication conflict resolution** | Multi-leader/leaderless can't lock (no single copy). Allow siblings, merge after | Works if commutative (counter increment, set-add → CRDT). Non-commutative CAS can't merge. LWW loses updates (Ch.6 p.224) |
+
+- **Compare-and-set in SQL — Fig 8-1 counter 42→44 (book p.323):** The textbook compare-and-set guard for the lost-update race is to predicate the write on the previously read value, so the second writer's precondition fails instead of clobbering:
+```sql
+-- Session A and B both read value=42
+SELECT value FROM counters WHERE key='hits'; -- returns 42 in both sessions
+-- Session A succeeds (42 still current):
+UPDATE counters SET value = 43 WHERE key='hits' AND value = 42; -- row-count 1 → commit
+-- Session B now retries: its compare-and-set fails (value is 43, not 42), so it must re-read and retry:
+UPDATE counters SET value = 43 WHERE key='hits' AND value = 42; -- row-count 0 → compare-and-set conflict
+```
+With a version column (optimistic locking, safer than comparing wide content) the same compare-and-set pattern is `UPDATE wiki_pages SET content='new', version=version+1 WHERE id=1234 AND version=7`. Book notes (p.323) that many MVCC engines make an exception so the `WHERE` clause of `UPDATE/DELETE` sees later-committed values even when the snapshot would not — precisely to make this compare-and-set check work. Without that exception the compare-and-set would falsely succeed on a stale snapshot.
+- **Compare-and-set retry loop (application code, no txn required):** A compare-and-set operation is single-row linearizable on most stores (Postgres, MySQL, Cassandra LWT `IF`, DynamoDB `ConditionExpression`, etcd `mod_revision`, ZooKeeper version). Canonical loop:
+```python
+def cas_increment(db, key, max_retries=10):
+    for attempt in range(max_retries):
+        old = db.execute("SELECT value, version FROM counters WHERE key=%s", (key,))[0]
+        # old = (42, v7) on first try
+        n = db.execute(
+            "UPDATE counters SET value=%s, version=version+1 WHERE key=%s AND version=%s",
+            (old.value + 1, key, old.version))
+        if n.rowcount == 1:
+            return old.value + 1  # compare-and-set succeeded
+        # compare-and-set failed: someone else won — back off + re-read
+        time.sleep(random.uniform(0, 0.005 * (2 ** attempt)))
+    raise SerializationError("compare-and-set retry storm — add FOR UPDATE or serializable")
+```
+Three compare-and-set facts from the book: (1) compare-and-set is the database analogue of the CPU `CMPXCHG` instruction and of `compare-and-swap` in shared-memory concurrency; (2) compare-and-set prevents lost update without holding a lock across user think time (unlike `SELECT FOR UPDATE`), at the cost of client retries; (3) compare-and-set cannot be merged in multi-leader/leaderless replication — concurrent compare-and-set writes to different replicas create siblings that still need CRDT/merge or last-write-wins (which reintroduces loss).
+
+### 2.7 Write Skew, Phantoms and Materializing Conflicts
+
+Lost/dirty writes = same object. **Write skew = read same objects, update different objects, break global invariant.** Generalisation of lost update.
+
+**Hospital (Fig 8-8) step-by-step (Alice/Bob = Aaliyah/Bryce in book):**
+
+| Step | Txn 1 (Alice sick) | Txn 2 (Bob sick) |
+| :--- | :--- | :--- |
+| Start | `BEGIN` (snapshot S1) | `BEGIN` (snapshot S2) |
+| Check | `SELECT COUNT(*) WHERE on_call=true` → 2, safe | `SELECT COUNT(*) WHERE on_call=true` → 2, safe |
+| Write | `UPDATE doctors SET on_call=false WHERE id=Alice` | `UPDATE doctors SET on_call=false WHERE id=Bob` |
+| Commit | SUCCESS (different row, no lock conflict) | SUCCESS |
+| Result | **0 on call**, invariant violated, zero errors | — |
+
+Serially second would see 1 and refuse. Concurrently both see 2.
+
+**Why hard:**
+- Single-object atomics don't help (multi-object).
+- SI lost-update detection doesn't fire (different rows) — not in PG repeatable-read, MySQL RR, Oracle serializable, SQL Server snapshot [30]. Need true serializable (§2.8).
+- Constraints: need multi-object constraint (≥1 doctor). Most DBs lack; triggers/materialized views possible [12] but hard.
+- Second-best without serializable: `SELECT … WHERE on_call=true AND shift_id=1234 FOR UPDATE` + update. Locks all depended rows.
+
+**More write-skew instances:**
+- **Meeting room (Ex 8-2):** `SELECT COUNT(*) WHERE room=123 AND end>'12:00' AND start<'13:00'` → 0 → `INSERT booking 12:00–13:00`. Two concurrent both see 0, both insert → double-booked. Needs serializable.
+- **Multiplayer:** Ex 8-1 lock stops same-figure race but not two figures → same square or rule violation. Uniqueness may help else skew.
+- **Username claim:** check-then-insert same name concurrently → duplicate unless `UNIQUE` constraint (second aborts — simple fix).
+- **Double-spend:** insert spend, sum account, check ≥0. Two concurrent spends each see positive alone but negative together.
+
+**Phantoms:** steps 1-SELECT (search condition) → 2-decide → 3-INSERT/UPDATE/DELETE changes precondition so re-running SELECT differs (one fewer doctor, room now booked, square taken, name taken, less money). Order can vary (write→select→abort/commit). Doctor case row existed so `FOR UPDATE` works. Other four check *absence* — `SELECT FOR UPDATE` locks nothing [58]. Write changes search result = **phantom** [4]. SI avoids phantoms for read-only, but read-write phantoms → write skew. ORM SQL prone [52,53].
+
+**Materializing conflicts (last resort):** invent lock object. Meeting rooms: pre-create `slots(room,time_15min)` for 6 months. Txn `SELECT FOR UPDATE` slot rows for desired range → check overlap → insert booking. Slots carry no booking info, just conflict points. Turns phantom into concrete row lock [14]. Hard to design, leaks concurrency into data model — prefer serializable.
+
+### 2.8 Serializability — Three Techniques
+
+> Weak levels hard to understand, inconsistently named, no static-analysis/deterministic-test tools. Researcher answer since 1970s: **use serializable** — parallel execution ≡ some serial order → if correct singly, correct concurrently. Why not everyone? Performance. Three options:
+
+#### (a) Actual Serial Execution (Fig 8-9) — VoltDB/H-Store, Redis, Datomic
+
+Remove concurrency: one txn at a time, single thread → serializable by definition. Feasible since 2000s because: (1) RAM cheap → active set in memory (Ch.4 p.133), no disk wait; (2) OLTP txns short, few reads/writes (Ch.1 p.3); long analytics read-only on SI snapshot outside loop. Avoids lock coordination; sometimes faster than concurrent.
+
+- **Must use stored procedures, not interactive:** early DBs imagined whole user flow (search→itinerary→pay) as one txn, but humans slow → huge idle concurrency. Web keeps txns short (one HTTP request). Still interactive = app↔DB round-trips per statement. Single-thread + network wait = dreadful throughput (thread idle). So: single-statement or submit whole code ahead as stored proc (Fig 8-9: interactive N round-trips vs proc in-memory no I/O).
+- **Stored proc reputation:** vendor dialects (PL/SQL, T-SQL, PL/pgSQL) ugly, no libs; hard to debug/version/test/monitor; one bad proc hurts shared DB; multitenant untrusted code risky [64]. Overcome: VoltDB Java/Groovy, Datomic Java/Clojure, Redis Lua, MongoDB JS; GraphQL proxy validation use-case; VoltDB replicates by re-executing deterministic proc on each replica (needs deterministic APIs for time — Ch.5 p.187; = state machine replication, Ch.10).
+- **Sharding to scale:** single core bottleneck; read-only elsewhere on SI. Shard so each txn single-shard → per-core thread, linear scale [61]. Cross-shard needs lockstep → vastly slower (VoltDB ~1,000 cross-shard writes/s, not scalable [63]; research [65]). Feasibility = data layout (K-V easy, secondary indexes hard — Ch.7 p.268).
+- **When viable:** every txn small/fast (one slow stalls all), active set in memory (cold to disk ok if never touched serially), write throughput single-core or single-shardable.
+
+#### (b) Two-Phase Locking (2PL / SS2PL) — MySQL InnoDB serializable, SQL Server, Db2 RR
+
+> Not 2PC. 2PL=isolation, 2PC=atomic commit (p.324). Ignore name similarity. Two-phase locking is about isolation; two-phase commit is about atomic commit — different problems despite similar names.
+
+- **Two-phase locking fundamentals (book pp.337–338):** Locks prevent dirty writes; two-phase locking is much stronger: readers need **shared (S)**, writers **exclusive (X)**. A read object → B writer waits; A written → B reader waits (Fig 8-4 old-version read unacceptable under two-phase locking). **Writers block readers and vice versa** — opposite of SI mantra. Because two-phase locking blocks both directions it protects lost update + write skew + phantoms (with predicate locks below).
+- **Two-phase locking lock modes S/X and compatibility matrix:** Per-object S/X is a multi-reader single-writer lock. Read→S (many concurrent ok unless X held). Write→X (no other holder). Read→write upgrades (S→X, deadlock-prone if two holders upgrade concurrently). The two-phase locking compatibility matrix is:
+
+| Requested ↓ / Held → | No lock | S (shared) | X (exclusive) |
+| :--- | :--- | :--- | :--- |
+| **S (read)** | Granted (two-phase locking growing phase) | Granted (multi-reader) | **Wait** — reader blocks behind writer |
+| **X (write)** | Granted | **Wait** — writer blocks behind readers | **Wait** — writer blocks behind writer |
+| **S→X upgrade** | — | Granted if sole holder else **Wait + deadlock risk** | **Wait** |
+
+Under two-phase locking all locks are held to commit/abort. Phase 1 growing (acquire), phase 2 shrinking (release), no overlap → "two-phase". This strict two-phase locking (SS2PL) variant is what MySQL InnoDB serializable, SQL Server serializable, and Db2 repeatable-read implement.
+- **Two-phase locking deadlock detection (p.339):** Deadlock (A waits B, B waits A, or longer cycle A→B→C→A via S/X waits) → the engine builds a waits-for graph and auto-detects a cycle, then aborts one victim (usually youngest/cheapest) → app must retry. Two-phase locking deadlocks are far more frequent than read-committed row-lock deadlocks because S-locks also block. Production guards: `innodb_lock_wait_timeout`, statement timeouts, consistent lock order (always lock rows in PK order), keep two-phase locking transactions short, and never do user round-trips while holding two-phase locking locks. Minimal lock-manager sketch:
+```python
+class TwoPhaseLockingManager:
+    """Simplified two-phase locking: S/X with growing/shrinking phases."""
+    COMPAT = {('S','S'): True, ('S','X'): False, ('X','S'): False, ('X','X'): False}
+    def __init__(self): self.held = {}  # obj -> [(txid, mode)]
+    def acquire(self, txid, obj, mode):
+        if txid in getattr(self, '_shrinking', set()):
+            raise RuntimeError("two-phase locking: no acquire after release")
+        for other, m in self.held.get(obj, []):
+            if other != txid and not self.COMPAT[(mode, m)]:
+                return False  # would block in real two-phase locking; record edge txid->other
+        self.held.setdefault(obj, []).append((txid, mode))
+        return True
+    def release_all(self, txid):
+        for obj in list(self.held): self.held[obj] = [(t,m) for t,m in self.held[obj] if t != txid]
+```
+- **Performance of two-phase locking:** Worst of serializable options since 1970s — the reason weak levels exist. Lock overhead + reduced concurrency: any potential race → wait. Full-table read (backup/analytics/integrity Ch.8 p.293) takes table S-lock under two-phase locking → waits for writers, then blocks all writers for duration → writes unavailable, unstable p99 (Ch.2 p.37), one slow txn halts system. Timeouts/slow-query monitoring essential. Deadlocks more frequent than read-committed → wasted retry work.
+- **Two-phase locking predicate locks (to stop phantoms, p.340):** lock all objects matching search, even future inserts. `SELECT * WHERE room=123 AND end>'12:00' AND start<'13:00'` → shared predicate lock under two-phase locking; writer checks old/new value against predicates, waits if match. Prevents all skew → serializable. Conceptually the predicate lock belongs to the search condition, not to existing rows — so inserts that would match (phantoms) also block.
+- **Two-phase locking index-range / next-key locking (practical approximation, p.341):** predicate matching many locks costly. Approximate with larger set (room 123 any time, or any room noon–1pm — safe: matching original ⇒ matches approximation). Attach shared lock to index entry/range used for search (room_id index → lock entry 123; time index → lock noon–1pm range). Writer updating same index part hits lock, waits. Less precise (locks extra) but cheap. No suitable index → table S-lock (safe, slow). InnoDB `next-key` = record lock + gap lock; `REPEATABLE READ` uses it to block phantom inserts, `SERIALIZABLE` extends two-phase locking S-locks to plain `SELECT`s.
+
+#### (c) Serializable Snapshot Isolation (SSI) — PostgreSQL serializable, SQL Server Hekaton, HyPer, CockroachDB, FoundationDB, BadgerDB
+
+Bleak choice (slow serializable vs racy weak) broken 2008 [55,67]: full serializability ~ snapshot cost.
+
+- **Optimistic vs pessimistic:** 2PL pessimistic (if possibly dangerous, wait — like mutex). Serial execution extreme pessimism (whole DB/shard X-lock, compensate with speed). SSI optimistic (continue hoping ok; at commit check violation → abort+retry only non-serializable). Old idea [70,71]: bad under high contention (many aborts; retries worsen saturated system) but better with spare capacity + low contention. Commutative atomics (counter increments unread in txn) reduce conflicts.
+- Base = SI consistent snapshot + conflict detector → abort set.
+- **Outdated premise pattern (write-skew root):** txn reads → decides → writes; snapshot premise ("2 doctors on call") may change before commit. DB doesn't know how app uses query → assume any query-result change may invalidate writes (causal dependency). Must detect acted-on-stale-premise → abort.
+- **Case 1 — stale MVCC read (Fig 8-10, PDF p.344):** Txn 43 sees Aaliyah `on_call=true` because Txn 42 uncommitted; by 43 commit, 42 committed → premise false. Phantom inserts worse. Fix: track ignored writes via visibility rules; at commit if any ignored now committed → abort. Don't abort immediately: 43 may be read-only (no skew risk), may never write, 42 may abort/still-uncommitted → unnecessary abort. Preserves long snapshot reads.
+- **Case 2 — writes affecting prior reads (Fig 8-11, PDF p.345, dangerous structures):** like 2PL index-range but **non-blocking tripwire (SIREAD)**. Txns 42+43 `SEARCH WHERE shift=1234` → record in index 1234 (or table if no index; kept only while concurrents live). Writer scans indexes for recent readers of affected range; instead of blocking, notifies "data may be stale". Fig 8-11: 43 notifies 42 and vice versa. 42 commits first ok (43 not yet committed); 43 commit sees conflicting 42 committed → aborts.
+- **Performance:** granularity trade-off (fine = precise aborts but bookkeeping; coarse = fast but false aborts). PostgreSQL proves some overwrites still serializable to cut aborts [14,56]. Big win vs 2PL: no blocking, predictable latency, lock-free snapshot reads for read-heavy. Vs serial: not single-core; FoundationDB distributes detection multi-machine, multi-shard R/W serializable. Vs SI: small checking overhead; debate whether always use SSI [69,72]. Abort rate key: long R/W txns conflict → keep R/W short (long read-only ok); less slow-txn sensitive than 2PL/serial.
+
+### 2.9 Distributed Transactions — Atomic Commit Problem
+
+Single-node: leader executes, followers apply log. Single-node atomicity = storage engine: WAL writes then `commit` record; crash recovery commits iff commit record on disk. Deciding moment = disk finishing commit record; single disk controller makes atomic.
+
+Distributed (multi-shard, global secondary index Ch.7 p.268): concurrency like single-node (sharded serial, distributed 2PL/SSI checkers [8]) but **atomicity new**: sending `commit` to all nodes independently → mixed outcome (Fig 8-12, PDF p.348): constraint conflict on some, network loss/timeout on others, crash before commit record → some commit some abort. Once committed visible under read-committed+ (Fig 8-12: User 2 reads DB2 data whose DB1 commit failed → can't retro-abort without cascading). Need **all commit or all abort**.
+
+#### Two-Phase Commit (2PC) — Figs 8-13/8-14
+
+Classic two-phase commit [13,73,74]; internal two-phase commit + XA/JTA/WS-AtomicTransaction [75–77]. The two-phase commit flow (Fig 8-13 success) splits commit into prepare + commit phases — hence the name two-phase commit:
+
+| Phase | Coordinator (Narayana, JOTM, BTM, MSDTC; often lib in app/JEE container) | Participants (DB nodes) |
+| :--- | :--- | :--- |
+| Normal R/W | Issues global txn ID; app does single-node txn per participant tagged with ID; anyone can abort on crash/timeout | Execute reads/writes |
+| **1 Prepare** | Sends `PREPARE(id)` to all; tracks votes. Fail/timeout → send `ABORT` | Ensure commitable under all circumstances: fsync data, check conflicts/constraints. `YES` = promise to commit if asked, surrender abort right (not yet committed) |
+| **2 Commit/Abort** | If all YES → write `COMMIT` to local log (**commit point**), then send `COMMIT`; else `ABORT`. Retry sends forever. Decision irrevocable | Commit/abort on receipt; crashed YES-voter commits on recovery |
+
+Marriage analogy for two-phase commit: officiant asks each "I do?"; both yes → pronounce married (broadcast); any no → abort [78]. Points of no return in two-phase commit: YES vote + coordinator decision (single-node lumps as log write). Faint after "I do" → query officiant by ID or wait two-phase commit retry.
+
+**Two-phase commit coordinator failure (Fig 8-14, PDF p.351):** fail before prepare → safe abort. After YES vote participant in two-phase commit is **in doubt/uncertain**: cannot unilaterally commit (other may abort) nor abort (coordinator may have committed) — timeout doesn't help. Must wait for two-phase commit coordinator recovery. Recovery reads the two-phase commit log; no commit record → abort. Commit point = coordinator's single-node atomic commit. Disk loss of the two-phase commit log → cannot auto-recover; admin manual commit/rollback; truncated tail may resurrect committed as aborted → violates atomicity.
+
+**Three-phase commit (3PC) vs two-phase commit [13,79]:** nonblocking alternative to two-phase commit but assumes bounded delay/response — false with unbounded network/pause (Ch.9) → no atomicity. Practical fix for two-phase commit blocking: fault-tolerant consensus coordinator (Ch.10) replicating the two-phase commit coordinator log via Raft/Paxos so a new coordinator can resume in-doubt two-phase commit transactions.
+
+#### Heterogeneous (XA) vs Database-Internal
+
+- **Internal:** YugabyteDB, TiDB, FoundationDB, Spanner, VoltDB, Cassandra, MySQL NDB — same software → any protocol, optimised, fast, reliable.
+- **Heterogeneous:** different vendors / DB+MQ → must share protocol → hard. Focus here.
+
+**Exactly-once via heterogeneous txn:** atomically commit MQ ack + DB writes → redeliver on abort → effectively once (abort discards side effects). Needs same protocol everywhere; email server without 2PC → duplicate sends on retry. See §2.10 for no-2PC alternative.
+
+**XA (X/Open XA 1991) — heterogeneous two-phase commit:** C API (not network protocol) for two-phase commit across vendors; JTA/JDBC/JMS bindings in Java EE. Driver calls XA to join a two-phase commit transaction, sends info to server, exposes prepare/commit/abort callbacks. The two-phase commit coordinator (often in-app lib) tracks participants, collects two-phase commit votes, logs the two-phase commit decision on local disk. App crash = two-phase commit coordinator gone; YES-voters stuck in two-phase commit in-doubt; must restart app server, replay two-phase commit log via XA callbacks (DB can't call coordinator, only via driver).
+
+- **Holding locks while in doubt in two-phase commit (Fig 8-13 shaded):** row X-locks (read-committed) + S-locks (two-phase locking serializable) held from two-phase commit PREPARE to commit/abort → 20-min two-phase commit coordinator outage = 20-min lock hold; lost two-phase commit log = forever until manual. Block writers (and readers by level) → app unavailable.
+- **Two-phase commit recovery pain:** theory clean two-phase commit log replay; practice orphaned two-phase commit in-doubts [85,86] (two-phase commit log lost/corrupt/bug) survive DB reboot (must preserve to protect atomicity) → admin examines each two-phase commit transaction, finds committed/aborted participant, forces same elsewhere under outage pressure. **Heuristic decisions** (unilateral commit/abort without two-phase commit coordinator [75]) = euphemism for probably breaking atomicity — only catastrophic escape for a stuck two-phase commit.
+- **Why XA two-phase commit is problematic:** single-node two-phase commit coordinator SPOF + its local two-phase commit log as durable as DB; even replicated coordinator doesn't help — coordinator↔participants communicate only via app code/drivers → app is SPOF (fix needs replicated/restartable app like durable execution Ch.5 p.187, no tool does). Lowest-common-denominator two-phase commit: no cross-system deadlock detection, no SSI (needs cross-system conflict protocol). Keeping heterogeneous stores consistent needs different solution (§2.10, Ch.12).
+
+**Database-internal fixes:** replicate coordinator + auto-failover, direct coordinator↔shard RPC (no app in path), replicate shards (fewer aborts), couple commit with distributed concurrency (deadlock detection, cross-shard consistent reads). Consensus replicates both (Ch.10). Levels: SI [6], SSI [5,8] across shards.
+
+### 2.10 Exactly-Once Revisited — Idempotence Without 2PC
+
+Don't need cross-system atomicity for exactly-once:
+
+1. Each message unique ID; DB table `processed_ids`. `BEGIN`; if ID present → `ACK` + drop (already done).
+2. Else `INSERT ID` + process (more writes, same txn); `COMMIT`.
+3. On commit success → `ACK` broker.
+4. On ACK success → `DELETE ID` (separate txn; crash before delete = harmless leftover).
+- Crash before commit → abort → broker retries. Crash after commit before ACK → retry sees ID → drops. Concurrent retry before abort → `UNIQUE` on ID blocks double-insert.
+- Records idence → safe retry. Kafka Streams same pattern (Ch.12). Internal distributed txns still help scale (IDs one shard, data others, atomic across shards).
 
 ---
 
@@ -220,276 +299,401 @@ To eliminate write skew and all concurrency anomalies, systems must enforce **Se
 >
 > | Book Fig | PDF page | What to compare |
 > |---|---|---|
-> | Fig 8-1 | PDF p.306 | Counter race |
-> | Fig 8-2 | PDF p.309 | Dirty read |
-> | Fig 8-3 | PDF p.309 | Aborted writes |
-> | Fig 8-4 | PDF p.314 | No dirty reads |
-> | Fig 8-5 | PDF p.316 | Dirty writes |
-> | Fig 8-6 | PDF p.318 | Read skew |
-> | Fig 8-7 | PDF p.320 | Snapshot isolation MVCC |
+> | Fig 8-1 | PDF p.306 | Counter race 42→43 |
+> | Fig 8-2 | PDF p.309 | Dirty read: mail vs counter |
+> | Fig 8-3 | PDF p.309 | Abort discards writes |
+> | Fig 8-4 | PDF p.314 | No dirty reads (x=2 vs 3) |
+> | Fig 8-5 | PDF p.316 | Dirty writes: car Aaliyah/Bryce |
+> | Fig 8-6 | PDF p.318 | Read skew $500/$400 |
+> | Fig 8-7 | PDF p.320 | MVCC xmin/xmax |
 > | Fig 8-8 | PDF p.327 | Write-skew doctors |
-> | Fig 8-9 | PDF p.334 | In-memory commit |
-> | Fig 8-10 | PDF p.344 | Stale MVCC read |
-> | Fig 8-11 | PDF p.345 | Index-range lock |
-> | Fig 8-12 | PDF p.348 | Multi-node commit |
-> | Fig 8-13 | PDF p.349 | 2PC prepare |
-> | Fig 8-14 | PDF p.351 | 2PC coordinator fail |
+> | Fig 8-9 | PDF p.334 | Interactive vs stored proc |
+> | Fig 8-10 | PDF p.344 | Stale MVCC read (42/43) |
+> | Fig 8-11 | PDF p.345 | SSI tripwire |
+> | Fig 8-12 | PDF p.348 | Partial commit |
+> | Fig 8-13 | PDF p.349 | 2PC success |
+> | Fig 8-14 | PDF p.351 | Coordinator crash in-doubt |
 
-
-### Figure 8-1: Race Condition in Concurrent Counter Increment
-- **Figure Reference:** `Figure 8-1: A race condition between two clients concurrently incrementing a counter (reconstructed from text p. 272)`
-- **Original PDF:** Fig 8-1 → PDF p.306 — open the PDF at page 306 to compare with the Mermaid reconstruction below.
-- **Visual Flow & Description:** Shows two clients reading counter value 42 concurrently. Both increment to 43 and write back. The counter ends at 43 instead of 44, losing an update.
+### Figure 8-1: Race Condition — Concurrent Counter Increment
+- **Figure Reference:** `Figure 8-1: A race condition between two clients concurrently incrementing a counter`
+- **Original PDF:** Fig 8-1 → PDF p.306
+- **Visual Flow:** Both read 42, both compute 43, both write 43. Should be 44.
 - **Mermaid Sequence Diagram:**
 
 ```mermaid
 sequenceDiagram
   autonumber
   actor C1 as Client 1
-  participant DB as Database Storage (Counter X)
+  participant DB as Database (Counter X)
   actor C2 as Client 2
-
-  C1->>DB: 1. SELECT value FROM counters WHERE id = 'hits'
-  DB-->>C1: Returns value = 42
-
-  C2->>DB: 2. SELECT value FROM counters WHERE id = 'hits'
-  DB-->>C2: Returns value = 42
-
-  Note over C1: Computes 42 + 1 = 43
-  C1->>DB: 3. UPDATE counters SET value = 43 WHERE id = 'hits'
-  DB-->>C1: 200 OK
-
-  Note over C2: Computes 42 + 1 = 43
-  C2->>DB: 4. UPDATE counters SET value = 43 WHERE id = 'hits'
-  DB-->>C2: 200 OK
-
-  Note over DB: LOST UPDATE: Final value is 43 (Expected 44!)
+  C1->>DB: 1. SELECT value WHERE id='hits'
+  DB-->>C1: Returns 42
+  C2->>DB: 2. SELECT value WHERE id='hits'
+  DB-->>C2: Returns 42
+  Note over C1: Computes 42+1=43<br/>read-modify-write
+  C1->>DB: 3. UPDATE value=43
+  DB-->>C1: OK
+  Note over C2: Computes 42+1=43<br/>clobbers C1
+  C2->>DB: 4. UPDATE value=43
+  DB-->>C2: OK
+  Note over DB: LOST UPDATE:<br/>Final 43, expected 44!
 ```
 
-- **Key Takeaway:** Read-modify-write cycles require atomic database operations or explicit locking to prevent concurrent overwrites.
+- **Key Takeaway:** RMW needs atomic op, `FOR UPDATE`, CAS or auto-detect.
 
 ---
 
-### Figure 8-4: Read Committed Isolation: Eliminating Dirty Reads
-- **Figure Reference:** `Figure 8-4: No dirty reads: User 2 sees the new value only after User 1 commits (reconstructed from text p. 279)`
-- **Original PDF:** Fig 8-4 → PDF p.314 — open the PDF at page 314 to compare with the Mermaid reconstruction below.
-- **Visual Flow & Description:** User 1 updates $x=3$ within an uncommitted transaction. User 2 reads $x$ and receives the older committed value 2. User 2 observes $x=3$ only after User 1 commits.
+### Figure 8-2: Violating Isolation — Dirty Read (Mailbox + Counter)
+- **Figure Reference:** `Figure 8-2: Violating isolation: one transaction reads another's uncommitted writes`
+- **Original PDF:** Fig 8-2 → PDF p.309
+- **Visual Flow:** Txn A inserts mail + increments counter. User 2 reads between: sees mail but counter 0.
 - **Mermaid Sequence Diagram:**
 
 ```mermaid
 sequenceDiagram
   autonumber
-  actor U1 as User 1 (Transaction 1)
-  participant DB as Database Engine
-  actor U2 as User 2 (Transaction 2)
-
-  U1->>DB: BEGIN
-  U1->>DB: UPDATE kv SET value = 3 WHERE key = 'x'
-  Note over DB: Uncommitted modification: x = 3 (old value = 2)
-
-  U2->>DB: SELECT value FROM kv WHERE key = 'x'
-  DB-->>U2: Returns value = 2 (Old Committed Version!)
-
-  U1->>DB: COMMIT
-  Note over DB: Value 3 is now officially committed
-
-  U2->>DB: SELECT value FROM kv WHERE key = 'x'
-  DB-->>U2: Returns value = 3 (New Version Visible)
+  actor W as Writer Txn (New mail)
+  participant DB as Database
+  actor R as User 2 (Reader)
+  W->>DB: BEGIN<br/>INSERT email id=99
+  Note over DB: Uncommitted mail visible?<br/>Counter not yet updated
+  R->>DB: SELECT * FROM emails<br/>WHERE recipient=2
+  DB-->>R: Sees new unread mail!
+  R->>DB: SELECT unread_count
+  DB-->>R: Returns 0 (stale!)
+  Note over R: INCONSISTENT:<br/>Mail present, count zero!
+  W->>DB: UPDATE counter=+1<br/>COMMIT
 ```
 
-- **Key Takeaway:** Read Committed ensures uncommitted mutations remain invisible to concurrent transactions, preventing dirty reads without requiring shared read locks.
+- **Key Takeaway:** Need isolation all-or-none across objects; same for balances, indexes.
 
 ---
 
-### Figure 8-6: Read Skew (Non-Repeatable Read) Anomaly
-- **Figure Reference:** `Figure 8-6: Read skew: Alice observes the database in an inconsistent state during an account transfer (reconstructed from text p. 282)`
-- **Original PDF:** Fig 8-6 → PDF p.318 — open the PDF at page 318 to compare with the Mermaid reconstruction below.
-- **Visual Flow & Description:** A transfer moves \$100 from Account 2 to Account 1. Alice reads Account 1 before the transfer and Account 2 after the transfer, seeing an apparent total of \$900 instead of \$1,000.
+### Figure 8-3: Atomicity — Abort Undoes Prior Writes
+- **Figure Reference:** `Figure 8-3: Atomicity ensures if error occurs prior writes undone`
+- **Original PDF:** Fig 8-3 → PDF p.309
+- **Visual Flow:** Insert mail ok, counter update fails (disk full / constraint) → whole txn rolled back, mail disappears.
+- **Mermaid Sequence Diagram:**
+
+```mermaid
+sequenceDiagram
+  autonumber
+  actor App as Application
+  participant DB as Database
+  App->>DB: BEGIN
+  App->>DB: INSERT email id=99
+  DB-->>App: OK (uncommitted)
+  App->>DB: UPDATE counter=+1
+  DB-->>App: ERROR: disk full!
+  App->>DB: ROLLBACK
+  Note over DB: Discards mail insert<br/>State as before BEGIN<br/>Safe to retry
+```
+
+- **Key Takeaway:** Abortability lets app retry without deduping partial effects.
+
+---
+
+### Figure 8-4: No Dirty Reads — Read Committed
+- **Figure Reference:** `Figure 8-4: No dirty reads: user 2 sees new x only after commit`
+- **Original PDF:** Fig 8-4 → PDF p.314
+- **Mermaid Sequence Diagram:**
+
+```mermaid
+sequenceDiagram
+  autonumber
+  actor U1 as User 1 (Txn 1)
+  participant DB as Database Engine
+  actor U2 as User 2 (Txn 2)
+  U1->>DB: BEGIN<br/>UPDATE x=3 (old 2)
+  Note over DB: Uncommitted x=3<br/>Committed x=2 retained
+  U2->>DB: GET x
+  DB-->>U2: Returns 2 (old committed)<br/>No dirty read!
+  U1->>DB: COMMIT
+  Note over DB: x=3 now visible<br/>Atomic switchover
+  U2->>DB: GET x
+  DB-->>U2: Returns 3
+```
+
+- **Key Takeaway:** Old+new versions or read locks hide uncommitted.
+
+---
+
+### Figure 8-5: Dirty Writes Mixed Up — Car Sale
+- **Figure Reference:** `Figure 8-5: With dirty writes conflicting writes mixed up`
+- **Original PDF:** Fig 8-5 → PDF p.316
+- **Visual Flow:** Aaliyah and Bryce buy same car. Listings table wins to Bryce, invoices to Aaliyah → sale to Bryce but bill to Aaliyah.
+- **Mermaid Sequence Diagram:**
+
+```mermaid
+sequenceDiagram
+  autonumber
+  actor A as Aaliyah (Txn A)
+  participant DB as Database (Listings + Invoices)
+  actor B as Bryce (Txn B)
+  A->>DB: BEGIN<br/>UPDATE listings SET owner=Aaliyah
+  Note over DB: Uncommitted listing=Aaliyah<br/>Lock held
+  B->>DB: BEGIN<br/>UPDATE listings SET owner=Bryce
+  Note over DB: Must wait (no dirty write)<br/>Row lock blocks B
+  A->>DB: UPDATE invoices SET bill=Aaliyah
+  B->>DB: UPDATE invoices SET bill=Bryce
+  Note over DB: Without locks:<br/>Listings=Bryce + Invoices=Aaliyah<br/>MIXED! Prevented by read-committed
+```
+
+- **Key Takeaway:** Row X-locks to commit order writes per row; multi-row still needs stronger.
+
+---
+
+### Figure 8-6: Read Skew — Aaliyah $900
+- **Figure Reference:** `Figure 8-6: Read skew: Aaliyah observes inconsistent state`
+- **Original PDF:** Fig 8-6 → PDF p.318
 - **Mermaid Flowchart:**
 
 ```mermaid
 flowchart TD
-  subgraph T1["Transaction 1: Move $100 from Acc 2 to Acc 1"]
+  subgraph T1["Transfer $100 Sav→Chk"]
     direction TB
-    W1["1. UPDATE Acc 2: $500 -> $400"]
-    W2["2. UPDATE Acc 1: $500 -> $600"]
-    C1["3. COMMIT"]
+    W1["UPDATE saving:<br/>$500 → $400"]
+    W2["UPDATE checking:<br/>$500 → $600"]
+    C1["COMMIT"]
     W1 --> W2 --> C1
   end
-
-  subgraph T2["Transaction 2: Alice Audit ($1000 Total Expected)"]
+  subgraph T2["Aaliyah audit (expects $1000)"]
     direction TB
-    R1["1. Read Acc 1: Observes $500"]
-    R2["2. Read Acc 2: Observes $400"]
-    CALC["Calculates Total: $500 + $400 = $900!"]
+    R1["Read checking → $500<br/>(before T1)"]
+    R2["Read saving → $400<br/>(after T1)"]
+    CALC["Total $500+$400=$900!<br/>$100 vanished"]
     R1 --> R2 --> CALC
   end
-
-  R1 -.->|"Reads before T1"| W1
-  W2 -.->|"Committed before R2"| R2
-
-  CALC -.->|"READ SKEW: $100 appears lost during transit!"| ANOMALY["Non-Repeatable Read"]
+  R1 -.->|"Before"| W1
+  W2 -.->|"Committed before"| R2
+  CALC -.->|"READ SKEW<br/>Nonrepeatable read"| ANOM["Allowed under<br/>read-committed"]
 ```
 
-- **Key Takeaway:** Read skew causes temporary inconsistency to appear permanent to concurrent readers; Snapshot Isolation eliminates this by locking reads to a consistent point in time.
+- **Key Takeaway:** Snapshot isolation freezes snapshot at start → both reads $500.
 
 ---
 
-### Figure 8-7: MVCC Snapshot Isolation in PostgreSQL
-- **Figure Reference:** `Figure 8-7: Implementing snapshot isolation using multiversion concurrency control (reconstructed from text p. 284)`
-- **Original PDF:** Fig 8-7 → PDF p.320 — open the PDF at page 320 to compare with the Mermaid reconstruction below.
-- **Visual Flow & Description:** Depicts table rows on disk with `xmin` and `xmax` transaction headers. Transaction 13 deducts \$100 from Account 2, creating a new row version. Transaction 12's snapshot sees only older committed versions.
+### Figure 8-7: MVCC Snapshot Isolation (PostgreSQL)
+- **Figure Reference:** `Figure 8-7: Implementing snapshot isolation using MVCC`
+- **Original PDF:** Fig 8-7 → PDF p.320
 - **Mermaid Flowchart:**
 
 ```mermaid
 flowchart TD
-  subgraph DISK["Physical Table Pages on Disk (MVCC Versions)"]
+  subgraph DISK["Heap pages (versions)"]
     direction TB
-    V1["Row Acc 1 (v1): [ xmin: 10 | xmax: 13 | balance: $500 ]"]
-    V2["Row Acc 1 (v2): [ xmin: 13 | xmax: 0  | balance: $600 ]"]
-    V3["Row Acc 2 (v1): [ xmin: 10 | xmax: 13 | balance: $500 ]"]
-    V4["Row Acc 2 (v2): [ xmin: 13 | xmax: 0  | balance: $400 ]"]
+    V1["Acct1 v1:<br/>xmin 10 xmax 13 bal $500"]
+    V2["Acct1 v2:<br/>xmin 13 xmax 0 bal $600"]
+    V3["Acct2 v1:<br/>xmin 10 xmax 13 bal $500"]
+    V4["Acct2 v2:<br/>xmin 13 xmax 0 bal $400"]
   end
-
-  subgraph T12["Transaction 12 (Snapshot taken at txid=12)"]
+  subgraph T12["Txn 12 snapshot (started before 13)"]
     direction TB
-    Q1["Reads Acc 1 -> Sees V1 ($500) because xmin 13 > 12 (Future txid!)"]
-    Q2["Reads Acc 2 -> Sees V3 ($500) because xmin 13 > 12 (Future txid!)"]
-    TOTAL["Alice calculates: $500 + $500 = $1,000 (Consistent!)"]
+    Q1["Read Acct1 → V1 $500<br/>V2 xmin13>12 invisible"]
+    Q2["Read Acct2 → V3 $500<br/>V4 invisible"]
+    TOT["Total $1000 consistent!"]
   end
-
   DISK -.-> T12
 ```
 
-- **Key Takeaway:** MVCC assigns monotonic transaction IDs to row versions, allowing long-running queries to evaluate point-in-time snapshots with zero lock contention.
+- **Key Takeaway:** `xmin/xmax` + 4 visibility rules → readers never block writers.
 
 ---
 
-### Figure 8-8: Write Skew in On-Call Hospital Scheduling
-- **Figure Reference:** `Figure 8-8: A write skew causing an application bug (reconstructed from text p. 291)`
-- **Original PDF:** Fig 8-8 → PDF p.327 — open the PDF at page 327 to compare with the Mermaid reconstruction below.
-- **Visual Flow & Description:** Shows Alice and Bob concurrently going off call. Both transactions query active doctors, receive count 2, and update their own status. Both commit, leaving zero doctors on call.
+### Figure 8-8: Write Skew — On-Call Doctors
+- **Figure Reference:** `Figure 8-8: A write skew causing application bug`
+- **Original PDF:** Fig 8-8 → PDF p.327
 - **Mermaid Sequence Diagram:**
 
 ```mermaid
 sequenceDiagram
   autonumber
-  actor Alice as Doctor Alice (Tx 1)
-  participant DB as Database (Snapshot Isolation)
-  actor Bob as Doctor Bob (Tx 2)
-
-  Alice->>DB: BEGIN (Snapshot active)
-  Bob->>DB: BEGIN (Snapshot active)
-
-  Alice->>DB: SELECT COUNT(*) FROM doctors WHERE on_call = true AND shift = 101
-  DB-->>Alice: Returns 2 (Alice & Bob)
-
-  Bob->>DB: SELECT COUNT(*) FROM doctors WHERE on_call = true AND shift = 101
-  DB-->>Bob: Returns 2 (Alice & Bob)
-
-  Note over Alice: Rule: Count >= 2, safe to go off call
-  Alice->>DB: UPDATE doctors SET on_call = false WHERE name = 'Alice'
-
-  Note over Bob: Rule: Count >= 2, safe to go off call
-  Bob->>DB: UPDATE doctors SET on_call = false WHERE name = 'Bob'
-
-  Alice->>DB: COMMIT (Success!)
-  Bob->>DB: COMMIT (Success!)
-
-  Note over DB: DISASTER: 0 doctors on call! Invariant breached under Snapshot Isolation!
+  actor Alice as Alice (Txn 1)
+  participant DB as Database (SI)
+  actor Bob as Bob (Txn 2)
+  Alice->>DB: BEGIN (snapshot)
+  Bob->>DB: BEGIN (snapshot)
+  Alice->>DB: SELECT COUNT(*) WHERE on_call=true
+  DB-->>Alice: 2 (Alice+Bob)
+  Bob->>DB: SELECT COUNT(*) WHERE on_call=true
+  DB-->>Bob: 2 (Alice+Bob)
+  Note over Alice: Premise: ≥2 → safe<br/>to go off call
+  Alice->>DB: UPDATE Alice on_call=false
+  Note over Bob: Premise: ≥2 → safe<br/>to go off call
+  Bob->>DB: UPDATE Bob on_call=false
+  Alice->>DB: COMMIT OK (different rows)
+  Bob->>DB: COMMIT OK
+  Note over DB: VIOLATION:<br/>0 doctors on call!
 ```
 
-- **Key Takeaway:** Write skew bypasses row-level write locks because concurrent transactions mutate different physical rows, requiring true Serializability (SSI or 2PL) to detect.
+- **Key Takeaway:** Different rows → no conflict detected; needs serializable or `FOR UPDATE` or constraint.
 
 ---
 
-### Figure 8-11: Serializable Snapshot Isolation (SSI) Conflict Detection
-- **Figure Reference:** `Figure 8-11: In SSI, detecting when one transaction modifies another transaction's read premises (reconstructed from text p. 306)`
-- **Original PDF:** Fig 8-11 → PDF p.345 — open the PDF at page 345 to compare with the Mermaid reconstruction below.
-- **Visual Flow & Description:** Shows transactions 42 and 43 reading an index range. When Transaction 43 writes a row affecting the index range read by Transaction 42, the engine detects the conflict and aborts Transaction 42.
+### Figure 8-9: Interactive vs Stored Procedure
+- **Figure Reference:** `Figure 8-9: Difference between interactive txn and stored procedure`
+- **Original PDF:** Fig 8-9 → PDF p.334
+- **Mermaid Sequence Diagram:**
+
+```mermaid
+sequenceDiagram
+  autonumber
+  actor App as Application
+  participant DB as DB Single Thread
+  Note over App,DB: Interactive (slow on serial thread)
+  App->>DB: BEGIN + SELECT doctors
+  DB-->>App: 2 rows (network RTT)
+  Note over DB: Thread idle waiting<br/>Throughput collapses!
+  App->>DB: UPDATE Alice=false
+  DB-->>App: OK (another RTT)
+  App->>DB: COMMIT
+  Note over App,DB: Stored proc (fast)
+  App->>DB: CALL go_off_call('Alice')
+  Note over DB: All in memory<br/>No I/O wait<br/>µs execution
+  DB-->>App: OK
+```
+
+- **Key Takeaway:** Serial execution requires single-statement/procs; network stalls kill it.
+
+---
+
+### Figure 8-10: Detecting Stale MVCC Reads (SSI)
+- **Figure Reference:** `Figure 8-10: Detecting when txn reads outdated MVCC snapshot`
+- **Original PDF:** Fig 8-10 → PDF p.344
+- **Mermaid Sequence Diagram:**
+
+```mermaid
+sequenceDiagram
+  autonumber
+  participant T42 as Txn 42 (Writer)
+  participant DB as MVCC Engine
+  participant T43 as Txn 43 (Reader)
+  T42->>DB: UPDATE Aaliyah on_call=false<br/>(uncommitted)
+  T43->>DB: SELECT WHERE shift=1234
+  DB-->>T43: Sees Aaliyah=true (ignores 42)<br/>Tracks ignored write!
+  T42->>DB: COMMIT
+  Note over DB: 42 now committed<br/>43 premise stale
+  T43->>DB: COMMIT attempt
+  DB-->>T43: ABORT: read stale!<br/>Retry required
+  Note over DB: Read-only would not abort<br/>Defer check to commit
+```
+
+- **Key Takeaway:** SSI tracks ignored writes; aborts only if they commit before reader commits and reader also wrote.
+
+---
+
+### Figure 8-11: SSI — Writes Affecting Prior Reads (Tripwire)
+- **Figure Reference:** `Figure 8-11: In SSI detecting when one txn modifies another's reads`
+- **Original PDF:** Fig 8-11 → PDF p.345
 - **Mermaid Flowchart:**
 
 ```mermaid
 flowchart TD
-  subgraph IDX["B-Tree Index: Shift 101 On-Call Doctors"]
+  subgraph IDX["Index shift=1234"]
     direction LR
-    E1["Index Entry: Alice (on_call = true)"]
-    E2["Index Entry: Bob (on_call = true)"]
+    E1["Alice on_call=true"]
+    E2["Bob on_call=true"]
   end
-
-  T42["Tx 42 (Alice): Reads Index -> Registers SIREAD Lock"] --> IDX
-  T43["Tx 43 (Bob): Reads Index -> Registers SIREAD Lock"] --> IDX
-
-  T42 -->|"Mutates Alice -> on_call=false"| E1
-  T43 -->|"Mutates Bob -> on_call=false"| E2
-
-  subgraph ENGINE["SSI Engine: Conflict Graph Analyzer"]
-    direction TB
-    DET["Detects rw-antidependency cycle:
-    Tx 42 read invalidated by Tx 43 write!
-    Tx 43 read invalidated by Tx 42 write!"]
-  end
-
-  E1 --> ENGINE
-  E2 --> ENGINE
-  ENGINE ==>|"ABORT Tx 42 with SerializationFailure"| ABORT["Abort & Retry Tx 42"]
+  T42["Txn42 reads index<br/>SIREAD 1234"] --> IDX
+  T43["Txn43 reads index<br/>SIREAD 1234"] --> IDX
+  T42 -->|"Write Alice=false<br/>Tripwire fires"| ENG["SSI engine:<br/>rw-antidependency<br/>42↔43 cycle?"]
+  T43 -->|"Write Bob=false"| ENG
+  ENG ==>|"42 commits first OK<br/>43 aborts"| AB["Abort 43<br/>SerializationFailure"]
 ```
 
-- **Key Takeaway:** SSI detects non-serializable interleavings optimistically by tracking index-range read dependencies, preventing write skew without blocking readers.
+- **Key Takeaway:** Non-blocking SIREAD + cycle detect → serializable without blocking.
 
 ---
 
-### Figure 8-13 & 8-14: Two-Phase Commit (2PC) & The In-Doubt Coordinator Crash
-- **Figure Reference:** `Figure 8-13: Successful 2PC execution vs. In-Doubt participant hang during coordinator crash (reconstructed from text pp. 310-312)`
-- **Original PDF:** Fig 8-13 → PDF p.349 — open the PDF at page 349 to compare with the Mermaid reconstruction below. & 8-14
-- **Visual Flow & Description:** Illustrates 2PC flow. Phase 1 collects votes. In Phase 2, the coordinator crashes after all nodes vote YES. Database 1 is stuck in an in-doubt state, holding locks indefinitely.
+### Figure 8-12: Partial Commit Across Nodes
+- **Figure Reference:** `Figure 8-12: When txn involves multiple nodes may commit on some fail on others`
+- **Original PDF:** Fig 8-12 → PDF p.348
 - **Mermaid Sequence Diagram:**
 
 ```mermaid
 sequenceDiagram
   autonumber
-  participant C as Transaction Coordinator
-  participant D1 as Database Participant 1
-  participant D2 as Database Participant 2
-
-  Note over C,D2: Phase 1: Prepare Phase
-  C->>D1: PREPARE (Can you commit Tx 99?)
-  activate D1
-  D1->>D1: Write Undo/Redo to disk; Acquire Row Locks
-  D1-->>C: VOTE_COMMIT (YES - Promised!)
-  deactivate D1
-
-  C->>D2: PREPARE (Can you commit Tx 99?)
-  activate D2
-  D2->>D2: Write Undo/Redo to disk; Acquire Row Locks
-  D2-->>C: VOTE_COMMIT (YES - Promised!)
-  deactivate D2
-
-  Note over C: Coordinator writes COMMIT to local WAL
-  Note over C: CRASH! Coordinator dies before sending Commit RPCs!
-
-  Note over D1,D2: Phase 2: Stalled In-Doubt
-  Note over D1: Participant 1 is IN-DOUBT!
-  Note over D1: Cannot Abort (C might have committed)
-  Note over D1: Cannot Commit (Waiting for instruction)
-  Note over D1: Exclusive row locks held INDEFINITELY!
+  actor App as Application
+  participant D1 as Database 1
+  participant D2 as Database 2
+  App->>D1: COMMIT txn (deduct)
+  App->>D2: COMMIT txn (credit)
+  D1-->>App: FAIL: constraint/timeout/crash
+  D2-->>App: OK committed + visible!
+  Note over D1,D2: INCONSISTENT:<br/>D2 shows data D1 aborted<br/>No retraction possible
 ```
 
-- **Key Takeaway:** 2PC is a blocking protocol; if the coordinator crashes during Phase 2, participants must hold exclusive locks until the coordinator recovers.
+- **Key Takeaway:** One-phase commit cannot be atomic; need 2PC.
+
+---
+
+### Figure 8-13: Successful 2PC
+- **Figure Reference:** `Figure 8-13: Successful execution of 2PC`
+- **Original PDF:** Fig 8-13 → PDF p.349
+- **Mermaid Sequence Diagram:**
+
+```mermaid
+sequenceDiagram
+  autonumber
+  participant C as Coordinator
+  participant P1 as Participant 1
+  participant P2 as Participant 2
+  Note over C,P2: Phase 1: Prepare
+  C->>P1: PREPARE txn 99?
+  P1->>P1: fsync + checks<br/>Acquire locks
+  P1-->>C: YES (promise!)
+  C->>P2: PREPARE txn 99?
+  P2->>P2: fsync + checks<br/>Acquire locks
+  P2-->>C: YES (promise!)
+  Note over C: All YES → write COMMIT<br/>to log (commit point)
+  Note over C,P2: Phase 2: Commit
+  C->>P1: COMMIT (retry forever)
+  C->>P2: COMMIT
+  P1-->>C: ACK release locks
+  P2-->>C: ACK release locks
+```
+
+- **Key Takeaway:** YES = irrevocable promise; coordinator log decides.
+
+---
+
+### Figure 8-14: Coordinator Crash — In-Doubt
+- **Figure Reference:** `Figure 8-14: Coordinator crashes after participants vote yes`
+- **Original PDF:** Fig 8-14 → PDF p.351
+- **Mermaid Sequence Diagram:**
+
+```mermaid
+sequenceDiagram
+  autonumber
+  participant C as Coordinator
+  participant D1 as Database 1
+  participant D2 as Database 2
+  C->>D1: PREPARE
+  D1-->>C: YES (locks held)
+  C->>D2: PREPARE
+  D2-->>C: YES (locks held)
+  Note over C: Writes COMMIT to log
+  C->>D2: COMMIT
+  Note over C: CRASH before D1 COMMIT!<br/>Log needed for recovery
+  Note over D1: IN-DOUBT:<br/>Cannot commit (other may abort)<br/>Cannot abort (other committed)<br/>Holds locks indefinitely!
+```
+
+- **Key Takeaway:** Blocking protocol; participants wait for coordinator recovery; lost log = manual surgery.
 
 ---
 
 ## 4. Real-World Systems, Case Studies & Code Examples
 
-### 4.1 Industry Implementations & Architectural Divergence
-- **PostgreSQL (MVCC + SSI):** Default isolation is Read Committed. Supports true Serializable isolation via Serializable Snapshot Isolation (SSI). Tracks SIREAD locks in memory without acquiring physical row read locks.
-- **MySQL InnoDB (MVCC + 2PL):** Default isolation is Repeatable Read. Does **not** detect write skew or lost updates under Repeatable Read. Implements `SERIALIZABLE` via strict Two-Phase Locking (2PL) using shared next-key locks, causing high deadlock rates under concurrency.
-- **CockroachDB & YugabyteDB (Distributed SQL / Multi-Raft SSI):** Eliminates centralized coordinators by running distributed transactions over Raft consensus groups. CockroachDB implements pure serializability using an optimistic, latch-free variant of SSI backed by Hybrid Logical Clocks (HLC).
-- **VoltDB & Redis (In-Memory Serial Execution):** VoltDB executes stored procedures sequentially on dedicated single-threaded CPU partitions. Eliminates all locking and latching overhead, achieving $>100,000\ \text{tx/sec}$ per core on in-memory working sets.
+### 4.1 Industry Implementations
 
----
+- **PostgreSQL (MVCC + SSI):** Default Read Committed. Repeatable Read = SI (auto lost-update detect). Serializable = SSI with SIREAD, reduced false aborts. Aggressive `autovacuum` needed (`scale_factor 0.05` on hot tables).
+- **MySQL InnoDB (MVCC + 2PL):** Default Repeatable Read ≠ SI (no lost-update detect, locking reads). Serializable = 2PL next-key locks → deadlocks. Use `SELECT … FOR UPDATE` / `UNIQUE` + retry.
+- **Oracle / SQL Server:** Oracle "serializable" = SI; SQL Server snapshot + Hekaton SSI. Db2 RR = serializable 2PL.
+- **CockroachDB / YugabyteDB / TiDB / Spanner / FoundationDB:** NewSQL internal 2PC + consensus-replicated coordinator/shards, direct RPC, SSI/SI across shards. CockroachDB HLC + SSI; Spanner TrueTime + strict serializable; FoundationDB distributed SSI conflict detection; VoltDB sharded serial procs (~1k cross-shard w/s).
+- **VoltDB / Redis / Datomic:** In-memory serial procs, >100k txn/s/core, deterministic replication (VoltDB).
+- **XA coordinators:** Narayana (JBoss), Atomikos/BTM, JOTM, MSDTC; WS-AtomicTransaction for SOAP; JMS/JDBC XA drivers.
 
-### 4.2 Production Implementation: Multi-Version Concurrency Control (MVCC) Engine
+### 4.2 Production Implementation: MVCC Engine
 
 ```python
 from typing import Dict, List, Optional, Tuple, Any
@@ -497,273 +701,178 @@ from typing import Dict, List, Optional, Tuple, Any
 class RowVersion:
     def __init__(self, value: Any, xmin: int, xmax: int = 0):
         self.value = value
-        self.xmin = xmin  # txid that created this version
-        self.xmax = xmax  # txid that deleted/superseded this version (0 = active)
+        self.xmin = xmin
+        self.xmax = xmax
 
 class MVCCDatabase:
-    """
-    In-memory storage engine demonstrating Multi-Version Concurrency Control (MVCC)
-    with Snapshot Isolation visibility rules matching PostgreSQL.
-    """
     def __init__(self):
         self.next_txid = 1
         self.storage: Dict[str, List[RowVersion]] = {}
-        self.active_transactions: set = set()
-        self.committed_transactions: set = set()
+        self.active: set = set()
+        self.committed: set = set()
 
-    def begin_transaction(self) -> Tuple[int, set]:
-        txid = self.next_txid
-        self.next_txid += 1
-        # Snapshot captures active transactions at the time this tx begins
-        snapshot = set(self.active_transactions)
-        self.active_transactions.add(txid)
-        return txid, snapshot
+    def begin(self) -> Tuple[int, set]:
+        txid = self.next_txid; self.next_txid += 1
+        snap = set(self.active)
+        self.active.add(txid)
+        return txid, snap
 
     def commit(self, txid: int):
-        self.active_transactions.remove(txid)
-        self.committed_transactions.add(txid)
+        self.active.remove(txid); self.committed.add(txid)
 
     def abort(self, txid: int):
-        self.active_transactions.remove(txid)
+        self.active.remove(txid)
 
-    def get(self, key: str, txid: int, snapshot: set) -> Optional[Any]:
-        """Evaluates MVCC visibility rules for key at transaction snapshot."""
-        versions = self.storage.get(key, [])
-        for version in reversed(versions):
-            # Rule 1: xmin must be committed before our snapshot began (or created by ourself)
-            xmin_valid = (version.xmin == txid) or (
-                version.xmin in self.committed_transactions and version.xmin not in snapshot
-            )
-            if not xmin_valid:
-                continue
-
-            # Rule 2: xmax must be unassigned, aborted, or committed AFTER our snapshot
-            xmax_deleted = (
-                version.xmax != 0 and
-                version.xmax != txid and
-                version.xmax in self.committed_transactions and
-                version.xmax not in snapshot
-            )
-            if not xmax_deleted:
-                return version.value
-
+    def get(self, key: str, txid: int, snap: set) -> Optional[Any]:
+        for v in reversed(self.storage.get(key, [])):
+            xmin_ok = (v.xmin == txid) or (v.xmin in self.committed and v.xmin not in snap)
+            if not xmin_ok: continue
+            xmax_deleted = (v.xmax != 0 and v.xmax != txid and v.xmax in self.committed and v.xmax not in snap)
+            if not xmax_deleted: return v.value
         return None
 
     def put(self, key: str, value: Any, txid: int):
-        """Appends a new row version, marking previous active version as superseded."""
-        versions = self.storage.setdefault(key, [])
-        # Mark current active version's xmax with current txid
-        for version in versions:
-            if version.xmax == 0:
-                version.xmax = txid
-
-        # Insert new version with xmin = current txid
-        versions.append(RowVersion(value=value, xmin=txid, xmax=0))
+        vs = self.storage.setdefault(key, [])
+        for v in vs:
+            if v.xmax == 0: v.xmax = txid
+        vs.append(RowVersion(value, txid, 0))
 ```
 
----
-
-### 4.3 Production Implementation: Two-Phase Commit (2PC) Coordinator
+### 4.3 Production Implementation: 2PC + XA-Style Recovery + Heuristic
 
 ```python
 import uuid
-from typing import List, Dict, Any
+from typing import Dict, List
 
-class ParticipantNode:
+class Participant:
     def __init__(self, name: str):
-        self.name = name
-        self.in_doubt = False
-        self.locked_records: Dict[str, Any] = {}
+        self.name = name; self.prepared: Dict[str, dict] = {}; self.data: Dict[str, int] = {}
+    def prepare(self, tx: str, writes: dict) -> bool:
+        for v in writes.values():
+            if isinstance(v, (int, float)) and v < 0: return False
+        self.prepared[tx] = writes  # fsync + locks in real engine
+        return True
+    def commit(self, tx: str):
+        self.data.update(self.prepared.pop(tx, {}))
+    def abort(self, tx: str):
+        self.prepared.pop(tx, None)
+    # Emergency hatch: heuristic — breaks atomicity!
+    def heuristic_abort(self, tx: str): self.prepared.pop(tx, None)
 
-    def prepare(self, tx_id: str, write_data: Dict[str, Any]) -> bool:
-        """Phase 1: Validate invariants, write WAL, acquire locks."""
-        # Simulated invariant check: reject negative balances
-        for k, v in write_data.items():
-            if isinstance(v, (int, float)) and v < 0:
-                return False  # Vote NO
-        self.locked_records[tx_id] = write_data
-        self.in_doubt = True
-        return True  # Vote YES (irrevocable promise)
-
-    def commit(self, tx_id: str):
-        """Phase 2: Commit mutations and release locks."""
-        if tx_id in self.locked_records:
-            del self.locked_records[tx_id]
-        self.in_doubt = False
-
-    def abort(self, tx_id: str):
-        """Phase 2: Discard staged mutations and release locks."""
-        if tx_id in self.locked_records:
-            del self.locked_records[tx_id]
-        self.in_doubt = False
-
-class TwoPhaseCommitCoordinator:
-    """Orchestrates atomic distributed transactions across participants."""
-    def __init__(self, participants: List[ParticipantNode]):
-        self.participants = participants
-        self.coordinator_log: Dict[str, str] = {}
-
-    def execute_transaction(self, multi_node_writes: Dict[ParticipantNode, Dict[str, Any]]) -> bool:
-        tx_id = str(uuid.uuid4())
-        
-        # --- PHASE 1: PREPARE ---
-        votes = {}
-        for participant, data in multi_node_writes.items():
-            votes[participant] = participant.prepare(tx_id, data)
-
-        # Decide: Commit only if ALL participants vote YES
-        all_yes = all(votes.values()) and len(votes) == len(self.participants)
-
-        # --- PHASE 2: COMMIT OR ABORT ---
-        if all_yes:
-            # Irrevocably record decision to coordinator WAL
-            self.coordinator_log[tx_id] = "COMMIT"
-            for participant in multi_node_writes.keys():
-                participant.commit(tx_id)
-            return True
-        else:
-            self.coordinator_log[tx_id] = "ABORT"
-            for participant in multi_node_writes.keys():
-                participant.abort(tx_id)
-            return False
+class Coordinator:  # Narayana/JOTM/BTM analogue: log on local disk
+    def __init__(self, parts: List[Participant]):
+        self.parts = parts; self.log: Dict[str, str] = {}
+    def execute(self, writes: Dict[Participant, dict]) -> bool:
+        tx = str(uuid.uuid4())
+        votes = {p: p.prepare(tx, w) for p, w in writes.items()}
+        ok = all(votes.values()) and len(votes) == len(self.parts)
+        self.log[tx] = "COMMIT" if ok else "ABORT"  # commit point: must fsync
+        for p in writes:
+            (p.commit if ok else p.abort)(tx)  # retry forever on timeout in prod
+        return ok
+    def recover(self, participants: List[Participant]):
+        # After crash: read log; no record → abort; else re-send decision
+        for tx, dec in self.log.items():
+            for p in participants:
+                if tx in p.prepared: (p.commit if dec == "COMMIT" else p.abort)(tx)
 ```
 
----
+JTA/XA sketch: `XAResource.prepare(xid)->XA_OK`, `commit(xid, false)`, `rollback(xid)`; coordinator `UserTransaction.begin/commit`; driver joins via `enlistResource`.
 
-### 4.4 Production War Story: The Silent Write-Skew Overbooking Outage
-- **The Context:** A hotel booking platform operated on PostgreSQL under its default configuration. The reservation flow allowed guests to reserve suites. Business rules mandated that Presidential Suite #1 could never be booked by more than one customer for the same date.
-- **The Architecture:** The engineering team wrapped reservations in transactions:
-  ```sql
-  BEGIN TRANSACTION ISOLATION LEVEL REPEATABLE READ;
-  SELECT count(*) FROM bookings WHERE room_id = 101 AND date = '2026-12-31';
-  -- If count == 0:
-  INSERT INTO bookings (room_id, date, customer_id) VALUES (101, '2026-12-31', 42);
-  COMMIT;
-  ```
-- **The Catastrophe:** On New Year's Eve, two users concurrently clicked "Book Suite" for room 101 within 20 milliseconds of each other. 
-  - Both transactions evaluated the `SELECT count(*)` under their respective snapshots; both observed count `0`.
-  - Both transactions inserted their reservation rows.
-  - Because each transaction inserted a *new* row rather than updating an existing row, PostgreSQL's lost-update detection was **not triggered**.
-  - Both transactions committed successfully (**Write Skew / Phantom**).
-- **The Fallout:** Two high-profile VIP guests arrived at the resort demanding the same suite. The platform had to pay \$15,000 in relocation accommodations and suffered severe brand embarrassment.
-- **Remediation & Architecture Lessons:**
-  1. *Relational Unique Constraints:* Added a unique composite constraint: `ALTER TABLE bookings ADD CONSTRAINT uq_room_date UNIQUE (room_id, date);`. Unique constraints enforce physical index uniqueness regardless of transaction isolation level.
-  2. *Upgrade to True Serializability:* Upgraded critical booking workflows to `TRANSACTION ISOLATION LEVEL SERIALIZABLE` (activating PostgreSQL's SSI engine), which automatically aborts the second transaction with a serialization failure.
+### 4.4 Production Implementation: Idempotent Exactly-Once (No XA)
+
+```python
+def process_message(db, broker, msg_id: str, payload: dict):
+    with db.transaction() as tx:  # single-node txn only
+        if tx.exists("processed_ids", msg_id):
+            broker.ack(msg_id); return  # duplicate → drop
+        tx.insert("processed_ids", msg_id)  # UNIQUE constraint guards races
+        tx.apply(payload)  # business writes, same txn
+        tx.commit()
+    broker.ack(msg_id)  # crash before ack → retry sees ID
+    # separate txn: db.delete("processed_ids", msg_id)
+```
+
+### 4.5 Production War Story: New-Year Overbooking (Write-Skew Phantom)
+
+PostgreSQL `REPEATABLE READ`: `SELECT COUNT(*) WHERE room=101 AND date='2026-12-31'` → 0 → `INSERT booking`. Two concurrent both see 0 (different rows → no lost-update fire) → both commit → same suite twice, $15k relocation. Fix: `UNIQUE(room_id,date)` (physical) + `SERIALIZABLE` (SSI aborts second) or materialized slot locks.
 
 ---
 
 ## 5. Architectural Trade-Off Matrix
 
-| Isolation Level / Concurrency Architecture | Dirty Reads Prevented | Dirty Writes Prevented | Read Skew Prevented | Lost Updates Prevented | Write Skew & Phantoms Prevented | Throughput & Contention Profile | Catastrophic Failure Mode |
+| Isolation / Protocol | Dirty reads | Dirty writes | Read skew | Lost update | Write skew / Phantoms | Throughput | Catastrophic mode |
 | :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- |
-| **Read Committed** | **YES** (Reads committed versions only) | **YES** (Row-level exclusive write locks) | **NO** (Consecutive reads return different values) | **NO** (Overwrites concurrent updates) | **NO** (Phantoms alter query results) | **High** (Readers never block writers; lock-free reads) | Non-repeatable reads during financial audits |
-| **Snapshot Isolation (Repeatable Read)** | **YES** | **YES** | **YES** (Point-in-time snapshot view) | **YES** (In Postgres/Oracle; NO in MySQL InnoDB) | **NO** (Concurrent transactions mutate disjoint rows) | **High** (MVCC eliminates read locks; zero read blocking) | Silent write skew (on-call schedule / overbooking bugs) |
-| **Two-Phase Locking (2PL)** | **YES** | **YES** | **YES** | **YES** | **YES** (Via next-key index-range locks) | **Severe Collapse** (Readers block writers; writers block readers) | Cascading deadlock aborts; tail latency explosion |
-| **Actual Serial Execution (VoltDB, Redis)** | **YES** | **YES** | **YES** | **YES** | **YES** (Single-threaded total order) | **Extreme Single-Core Throughput** ($>100\text{k}\ \text{QPS}$); zero concurrency | Long-running stored procedure freezes entire database |
-| **Serializable Snapshot Isolation (SSI)** | **YES** | **YES** | **YES** | **YES** | **YES** (Optimistic SIREAD conflict tracking) | **High** (Near Snapshot Isolation speed under low contention) | High abort/retry rates under intense write contention |
-| **Two-Phase Commit (2PC / XA)** | N/A (Guarantees Atomic Commit across nodes) | N/A | N/A | N/A | N/A | **Very Poor** (Multiple network RTTs + disk fsync per phase) | Coordinator crash leaves participants in-doubt holding locks |
+| **Read Uncommitted** | ❌ | Protected (writes locked) | ❌ | ❌ | ❌ | Highest (no versions) | Cascading aborts on dirty reads |
+| **Read Committed** | Protected | Protected | ❌ | ❌ | ❌ | High (readers don't block writers for versions) | Audit skew, Fig 8-1 race |
+| **Snapshot Isolation** | Protected | Protected | Protected | Depends (PG/Oracle yes, MySQL no) | ❌ | High (MVCC, no read locks) | Silent write skew (Fig 8-8) |
+| **Serial 1-thread** | Protected | Protected | Protected | Protected | Protected | Extreme/core, zero concurrency | One slow proc stalls all; cross-shard 1k/s |
+| **2PL** | Protected | Protected | Protected | Protected | Protected (next-key) | Collapse under contention | Deadlocks, table-lock backup stall |
+| **SSI** | Protected | Protected | Protected | Protected | Protected (SIREAD cycle) | Near-SI if low contention | Abort storms if long R/W |
+| **2PC / XA** | Atomic commit, not isolation | — | — | — | — | Poor (2 RTT + fsyncs) | In-doubt locks, orphaned XA, heuristic split |
 
----
-
-### Concrete Decision Heuristics
+Table 8-1 (book p.335): Read uncommitted all possible; Read committed only dirty prevented; SI prevents dirty+skew+phantoms (straight), lost update depends; Serializable prevents all. Dirty writes prevented by almost all (omitted from table).
 
 ```text
-Decision Tree for Transactional Concurrency Strategy:
-1. Does the transaction span multiple physical database shards or heterogeneous systems (DB + Message Queue)?
-   ├── YES:
-   │    ├── Requires absolute atomic commitment? -> Use Two-Phase Commit (2PC) with Raft-replicated coordinator.
-   │    └── Can business logic tolerate eventual consistency? -> Use Saga Pattern with Compensating Transactions.
-   └── NO (Single-node or Distributed SQL with co-located data):
-        ├── Is the entire active working set small enough to fit entirely in server RAM?
-        │    └── YES and transactions can be written as short stored procedures? -> Use In-Memory Serial Execution (VoltDB).
-        └── NO (Standard persistent disk-backed storage):
-             ├── Does the application require absolute protection against Write Skew and Phantoms?
-             │    ├── Database supports SSI (PostgreSQL / CockroachDB)? -> Use SERIALIZABLE (SSI).
-             │    └── Database only supports 2PL for serializability (MySQL InnoDB)? -> Use Snapshot Isolation + explicit UNIQUE constraints / SELECT FOR UPDATE.
-             └── Read-heavy analytics and standard CRUD dominate? -> Use Snapshot Isolation (Repeatable Read via MVCC).
+Decision Tree:
+1. Multi-shard / heterogeneous (DB+MQ)?
+   YES → Need atomic? → Internal DB: consensus 2PC (Spanner/Cockroach). Heterogeneous high-TPS → Saga + idempotent outbox, avoid XA. Low-TPS admin → XA/Narayana + manual runbook.
+   NO → RAM-fit + short procs + single-shardable? → Serial (VoltDB). Else need skew/phantom proof? → SSI if available else SI + UNIQUE + FOR UPDATE. Else SI.
 ```
 
 ---
 
 ## 6. Jargon Buster & Key Terminology
 
-- **Atomicity:** The ability of a transaction to abort on failure and completely discard all partial writes, returning state to the pre-transaction baseline.
-- **Dirty Read:** A concurrency anomaly where a transaction observes uncommitted data written by another in-flight transaction that may ultimately abort.
-- **Dirty Write:** A concurrency anomaly where a transaction overwrites uncommitted data previously written by another active transaction.
-- **Read Skew (Non-Repeatable Read):** A concurrency anomaly where a transaction reads different values for the same record at different points in time due to concurrent committed updates.
-- **Write Skew:** A concurrency anomaly where two transactions concurrently read the same data, observe an invariant is satisfied, and write to *disjoint* sets of rows, causing the combined state to violate the invariant.
-- **Phantom:** A condition where a write in one transaction changes the set of rows returned by a search query in another transaction.
-- **Multi-Version Concurrency Control (MVCC):** A database architecture where multiple physical versions of each row are maintained simultaneously, allowing readers to query consistent point-in-time snapshots without locking writers.
-- **Two-Phase Locking (2PL):** A pessimistic concurrency control algorithm where transactions acquire shared locks for reads and exclusive locks for writes, holding all locks until commit or abort.
-- **Serializable Snapshot Isolation (SSI):** An optimistic concurrency control algorithm that executes transactions under Snapshot Isolation while tracking read-write conflicts in memory, aborting transactions that form dependency cycles.
-- **Two-Phase Commit (2PC):** A distributed atomic commitment protocol where a coordinator collects prepare votes from participants before issuing an irrevocable global commit.
-- **In-Doubt Transaction:** A state in 2PC where a participant has voted `YES` in Phase 1, but the coordinator crashes before Phase 2, forcing the participant to hold locks indefinitely.
+- **Atomicity / Abortability:** Abort discards all partial writes; safe retry.
+- **Consistency (ACID):** App invariants (balanced books, ≥1 doctor); DB enforces only declared constraints.
+- **Isolation / Serializability:** Concurrent ≡ some serial order.
+- **Durability:** Committed never forgotten (WAL+fsync+checksums+replication+backups).
+- **Dirty Read/Write:** See uncommitted / overwrite uncommitted.
+- **Read Skew / Nonrepeatable:** Different times see different commits; fixed by snapshot.
+- **Lost Update:** RMW clobber same object.
+- **Write Skew:** Read same, write disjoint, break invariant.
+- **Phantom:** Write changes another's search set; absence can't be `FOR UPDATE`-locked.
+- **MVCC / xmin/xmax:** Multi-version + txid visibility; readers never block writers.
+- **Predicate / Index-Range (Next-Key):** Lock search condition / index gap vs phantom.
+- **SSI / SIREAD:** Optimistic SI + tripwire + cycle abort.
+- **2PL / SS2PL / two-phase locking:** S/X held to commit; growing then shrinking phases; two-phase locking deadlocks need waits-for detection + retry.
+- **Compare-and-set:** Conditional `UPDATE ... WHERE value=old` / `version=old`; compare-and-set succeeds only if unchanged, else row-count 0 → re-read + retry; CPU `CMPXCHG` analogue for lock-free lost-update prevention.
+- **Stored Procedure Serial:** One thread, no interactive waits.
+- **2PC / two-phase commit / Coordinator / Commit Point / In-Doubt / Orphaned / Heuristic:** Two-phase commit prepare promise, coordinator two-phase commit log decision, wait on two-phase commit coordinator crash, manual if two-phase commit log lost, unilateral heuristic breaks two-phase commit atomicity.
+- **XA / JTA / Narayana / JOTM / BTM / MSDTC / WS-AtomicTransaction:** Heterogeneous two-phase commit via drivers; app-local two-phase commit log.
+- **Materializing Conflicts:** Fake lock rows to turn phantom concrete.
+- **Idempotent Exactly-Once:** `processed_ids` + UNIQUE + ack-after-commit; no cross-system atomicity needed.
 
 ---
 
 ## 7. System Design & Practical Engineering Takeaways
 
 ### 7.1 Production Engineering Checklist
-1. **Never Rely on Application Code for Uniqueness Invariants:** Always enforce uniqueness via database-level `UNIQUE` constraints or unique secondary indexes. Application-level `SELECT count(*) == 0` checks under Snapshot Isolation are vulnerable to phantoms and write skew.
-2. **Set Aggressive Statement Timeouts on 2PL Databases:** If using `SERIALIZABLE` in MySQL InnoDB, enforce `innodb_lock_wait_timeout = 5` (seconds) to prevent deadlock queues from saturating connection pools.
-3. **Budget for Vacuuming Overhead in MVCC Engines:** In PostgreSQL, ensure `autovacuum` is aggressively tuned (e.g., lower `autovacuum_vacuum_scale_factor = 0.05`). Heavy update workloads generate dead tuple bloat, degrading table scan performance and exhausting disk space.
-4. **Implement Exponential Backoff Retries for SSI and CAS:** Because Serializable Snapshot Isolation (SSI) and Compare-and-Swap (CAS) abort on conflict, wrap client-side transaction executions in an automated retry harness with jittered exponential backoff.
-5. **Avoid Heterogeneous XA Two-Phase Commit in High-Throughput Paths:** Never use 2PC across microservices for high-volume pipelines ($>1,000\ \text{tx/sec}$). Coordinator crashes freeze locks; replace 2PC with asynchronous **Sagas** and idempotent message queues.
-
----
+1. **UNIQUE for uniqueness:** Never `SELECT COUNT==0 → INSERT` under SI; add `UNIQUE(room,date)`, `UNIQUE(username)`.
+2. **Default to SSI for invariants:** Booking, on-call, ledger, double-spend → `SERIALIZABLE`; harness `SerializationFailure` retry with jittered backoff.
+3. **Tune vacuum:** `autovacuum_vacuum_scale_factor=0.05` on hot tables; offload 20-min reports to replica (else 20k/s×1200s×200B≈4.8GB + indexes≈6.2GB bloat, horizon pinned).
+4. **2PL timeouts:** `innodb_lock_wait_timeout=5`, statement timeouts, slow-query kill; avoid full-table S-lock analytics on primary.
+5. **No XA on hot path:** >1k TPS heterogeneous → Saga/outbox/idempotence; keep XA manual runbook (`XA RECOVER`, compare with peer, `XA COMMIT/ROLLBACK xid`), monitor `prepared` count, alert orphaned.
 
 ### 7.2 System Design Interview Strategy
-- **Dissect "ACID" Immediately:** When an interviewer asks *"How do you guarantee ACID?"*, demonstrate Staff-level depth: *"ACID is not a single feature. We will implement Atomicity via WAL undo logging, Durability via synchronous WAL fsync, and Isolation via MVCC Snapshot Isolation. For critical invariants subject to write skew, we will enforce database-level unique constraints or upgrade to Serializable Snapshot Isolation."*
-- **Explain Why MySQL and PostgreSQL Behave Differently under Repeatable Read:** Show deep engine knowledge: *"PostgreSQL's Repeatable Read uses pure MVCC and aborts concurrent updates to prevent lost updates, whereas MySQL InnoDB uses locking reads (`SELECT FOR UPDATE`) and does not detect write skew."*
-- **Capacity Sketching for MVCC Table Bloat:**
-  $$\text{Disk Write Bandwidth} = \text{Write QPS} \times \text{Avg Row Bytes} \times (1 + \text{WAL Write Factor}) \times \text{Replication Factor}$$
-  $$\text{MVCC Storage Overhead} = \text{Updates/sec} \times \text{Avg Row Bytes} \times \text{Max Transaction Duration (sec)}$$
-
----
+- Dissect ACID: "Atomicity via WAL undo, Durability via fsync+quorum, Isolation via MVCC SI, skew via SSI/UNIQUE." Note CAP-C ≠ ACID-C.
+- Explain PG RR vs MySQL RR: PG auto lost-update abort; MySQL needs `FOR UPDATE`.
+- Sketch MVCC bloat: `WriteBW=QPS×RowB×(1+WAL)×RF`; `Bloat=Upd/s×RowB×OldestTxnAge`; 2PC latency = 2 RTT + 2 fsyncs; serial scale by shard.
 
 ### 7.3 Mastery Self-Assessment Questions
 
 #### Question 1 (Conceptual Depth)
-*Why does Two-Phase Locking (2PL) provide complete serializability while decimating throughput under write contention, and how does Serializable Snapshot Isolation (SSI) deliver the exact same serializable guarantee with the throughput profile of MVCC?*
-- **Answer:** 
-  **Two-Phase Locking (2PL)** is a pessimistic algorithm enforcing a strict invariant: *readers block writers, and writers block readers*. When a transaction executes a read, it acquires a shared ($S$) lock; when it executes a write, it acquires an exclusive ($X$) lock. To prevent phantoms, it must acquire index-range (next-key) locks across entire ranges of the B-tree. If Transaction A holds an $X$-lock on a row or range, all concurrent transactions attempting to read or write that data are placed into operating system sleep queues. Under write contention, lock queues cascade, deadlocks multiply, and throughput collapses.
-  **Serializable Snapshot Isolation (SSI)** achieves true serializability **optimistically** using MVCC: *readers never block writers, and writers never block readers*. Transactions read consistent historical snapshots without acquiring physical locks. To prevent write skew and phantoms, SSI tracks causal dependencies in memory using lightweight tracking locks ("SIREAD" locks) that merely record who read what. If a transaction writes to an index range that was read by another active transaction, the engine notes an anti-dependency edge ($T_1 \xrightarrow{rw} T_2$). Only if the engine detects a **cycle of dependencies** ($T_1 \xrightarrow{rw} T_2 \xrightarrow{rw} T_1$) at commit time does it abort a transaction. In typical workloads where conflicts are rare, SSI incurs almost zero locking overhead, achieving orders of magnitude higher throughput than 2PL.
+*Why does 2PL guarantee serializability but collapse throughput, while SSI gives same guarantee at MVCC speed?*
+- **Answer:** 2PL pessimistic: `S` on read blocks `X`, `X` blocks `S/X`, range locks gaps; queues cascade, deadlocks, table scans stall writes. SSI optimistic MVCC: no physical read locks, `SIREAD` tripwires record read predicates; only rw-antidependency cycle at commit aborts. Rare conflicts → near-zero overhead; contended long R/W → aborts/retries.
 
-#### Question 2 (Failure Scenario & Edge Cases)
-*A fintech payments cluster uses Two-Phase Commit (2PC) to transfer funds between a relational database and a legacy mainframe ledger. During Phase 2 of a $10 million corporate transfer, after both participants have voted YES, the coordinator server suffers an unrecoverable motherboard failure. Simultaneously, a network administrator disconnects the cross-datacenter switch. Describe the state of the database participant, explain why the database administrator cannot simply abort the transaction, and specify the recovery procedure.*
-- **Answer:**
-  - *State of the Participant:* The database participant is stuck in an **In-Doubt (Uncertain)** state. In Phase 1, it wrote a `VOTE_COMMIT` record to its local WAL, promising to obey the coordinator. It holds exclusive row locks on the corporate sender's account.
-  - *Why the DBA Cannot Unilaterally Abort:* The database administrator cannot manually issue a `ROLLBACK` command. Because all participants voted `YES`, the coordinator may have written `COMMIT` to its local WAL and transmitted a commit message to the mainframe ledger before the motherboard failed. If the DBA aborts the database transaction while the mainframe commits, \$10 million will be deposited into the recipient's account without being deducted from the sender's account, creating an immediate \$10 million financial deficit. Conversely, if the DBA manually commits and the mainframe aborted, the sender loses \$10 million.
-  - *Recovery Procedure:*
-    1. The DBA must perform **transaction recovery surgery** by inspecting the coordinator's durable transaction log on disk (or mounting the failed coordinator's disk volume to a spare machine) to determine whether the coordinator decided to `COMMIT` or `ABORT` before crashing.
-    2. If the coordinator disk is destroyed, the DBA must manually communicate out-of-band with the mainframe ledger administrator, compare local transaction IDs, determine whether the mainframe committed or aborted, and force the database participant to commit or abort manually using XA recovery commands (`XA COMMIT 'tx_id'` or `XA ROLLBACK 'tx_id'`).
+#### Question 2 (Failure Scenario)
+*$10M 2PC DB+mainframe, both YES, coordinator mobo dies + WAN cut. State? Why can't DBA abort? Recovery?*
+- **Answer:** DB in-doubt (YES logged, X-locks held). Unilateral abort risks DB-abort vs mainframe-commit → $10M created; unilateral commit risks opposite. Recovery: mount coordinator disk, read log commit/abort, re-send; if disk gone out-of-band compare IDs with mainframe admin, `XA COMMIT/ROLLBACK`; heuristic only to unblock at atomicity cost.
 
-#### Question 3 (Trade-Off & Capacity Estimation)
-*A high-frequency cryptocurrency exchange executes 20,000 order cancellations and matching trades per second. The system is deployed on PostgreSQL using MVCC. Each order row occupies 200 bytes. The average transaction commits within 50 milliseconds, but a background financial reconciliation report runs every hour, taking 20 minutes to complete under Snapshot Isolation. Calculate: (A) The rate of dead tuple generation per second, and (B) The minimum additional disk bloat accumulated during the 20-minute reporting window before autovacuum can reclaim space. Show exact derivations.*
-- **Answer:**
-  - *Dead Tuple Generation Rate:*
-    - Update/Cancel Rate = $20,000\ \text{mutations/sec}$.
-    - In PostgreSQL MVCC, an `UPDATE` marks the old row version with `xmax` and appends a new row version; a `DELETE` marks `xmax`.
-    - Every mutation produces exactly one dead tuple version.
-    - Generation Rate = $\mathbf{20,000\ \text{dead tuples/sec}}$.
-    - Data Churn Rate:
-      $$\text{Churn} = 20,000\ \text{tuples/sec} \times 200\ \text{bytes} = 4,000,000\ \text{bytes/sec} = \mathbf{4\ \text{MB/s}}$$
-  - *MVCC Horizon & Bloat Accumulation:*
-    - *The MVCC Invariant:* Autovacuum **cannot** remove any dead tuple whose `xmax` is greater than or equal to the `xmin` of the **oldest active transaction** in the entire database.
-    - The background reporting transaction began at time $T_0$ and runs for 20 minutes ($1,200$ seconds).
-    - Throughout these 20 minutes, the reporting transaction's snapshot horizon remains pinned at $T_0$.
-    - Consequently, **autovacuum is completely blocked from reclaiming any dead tuple generated during this 20-minute window**, because those tuples might still be visible to the reporting query!
-  - *Quantitative Disk Bloat Calculation:*
-    - Window Duration: $20\ \text{minutes} \times 60\ \text{seconds/minute} = 1,200\ \text{seconds}$.
-    - Total Dead Tuples Accumulated:
-      $$\text{Total Dead Tuples} = 20,000\ \text{tuples/sec} \times 1,200\ \text{seconds} = \mathbf{24,000,000\ \text{dead tuples}}$$
-    - Disk Space Bloat (Raw Tuples):
-      $$\text{Tuple Bloat} = 24,000,000 \times 200\ \text{bytes} = 4,800,000,000\ \text{bytes} \approx \mathbf{4.8\ \text{GB}}$$
-    - Accounting for line pointer arrays (4 bytes per tuple) and B-tree secondary index entries (assuming 2 secondary indexes on the orders table, each adding $\sim 30$ bytes per index tuple):
-      $$\text{Index Bloat} = 24,000,000 \times (2 \times 30\ \text{bytes}) = 1,440,000,000\ \text{bytes} \approx 1.44\ \text{GB}$$
-      $$\text{Total Minimum Bloat} = 4.8\ \text{GB} + 1.44\ \text{GB} = \mathbf{6.24\ \text{GB}}$$
-    - *Architectural Lesson:* Long-running read queries on high-throughput OLTP systems induce massive table and index bloat, degrading buffer pool hit ratios and forcing disk page fragmentation. Long analytical queries must be offloaded to dedicated read replicas.
-
+#### Question 3 (Capacity)
+*20k cancels/s, 200B rows, 50ms txns, 20-min SI report. Dead-tuple rate? Bloat?*
+- **Answer:** 20k dead/s (UPDATE=delete+insert), churn 4MB/s. Horizon pinned at report start → vacuum blocked 1200s → 24M dead tuples → 4.8GB tuples + 2 indexes×30B≈1.44GB → **≥6.24GB** + pointers/fragmentation. Offload analytics.
 
 ---
 > [!NAV] **Chapter Navigation**

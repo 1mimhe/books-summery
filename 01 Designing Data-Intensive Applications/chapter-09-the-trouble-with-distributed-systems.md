@@ -5,172 +5,219 @@
 > [!NAV] **Chapter Navigation**
 > ⬅️ **Previous:** [[chapter-08-transactions|Chapter 08: Transactions]] | 🏠 **Index:** [[00-Master-Reading-Dashboard|Master Dashboard]] | ➡️ **Next:** [[chapter-10-consistency-and-consensus|Chapter 10: Consistency and Consensus]]
 
-
 ---
 
 ## 1. Executive Summary & Core Engineering Problem
 
-- **Core Thesis:** Writing software for distributed systems is fundamentally different from writing software on a single computer. On a single machine, the hardware operates deterministically: if internal components fail, the entire system crashes completely (fail-stop). In a distributed system, engineers face the brutal reality of **partial failures**: some components, network switches, or nodes will fail unpredictably while the rest of the system continues executing. Because networks have **unbounded latency**, physical clocks exhibit **unbounded drift**, and processes experience **unbounded pauses** (e.g., GC stops-the-world), a distributed system cannot distinguish between a dead node, an unresponsive network switch, a severe garbage collection pause, or a delayed message. Correct distributed algorithms cannot rely on physical time or single-node assumptions; they must be built on explicit system models, quorum consensus, and monotonic fencing mechanisms.
-- **Problem Statement:** Relying on physical time or un-fenced distributed locks guarantees silent data corruption. A classic distributed systems catastrophe occurs when using Redis or Apache ZooKeeper for distributed locking (Figure 9-4): Client 1 acquires a 10-second lease to write exclusively to shared storage. Suddenly, Client 1's JVM triggers an unexpected Stop-the-World garbage collection pause lasting 15 seconds. While Client 1 is frozen, its lease expires in ZooKeeper. Client 2 queries ZooKeeper, observes the lease is free, acquires it, and safely writes File $X$. Client 1's GC pause concludes; its application thread wakes up, naively assumes it still holds the valid lock, and writes File $X$, permanently overwriting and corrupting Client 2's data. Because Client 1 had no hardware awareness of its own temporal freeze and storage lacked **fencing tokens**, distributed locking collapsed.
-- **Historical & Industry Context:** In the 1980s and 1990s, supercomputing relied on massive parallel processing (MPP) mainframes with specialized interconnects (Infiniband) where any component failure halted the entire compute job. The emergence of web-scale commodity cloud infrastructure in the 2000s forced a paradigm shift: assembling reliable distributed data systems out of cheap, unreliable commodity hardware connected via asynchronous Ethernet. In 2012, Google published Spanner, proving that specialized hardware (GPS receivers and atomic clocks) could bound physical clock drift to $<7\ \text{ms}$ (TrueTime API), enabling globally distributed serializability. However, for systems on standard cloud infrastructure (AWS, Azure, GCP), the late 2010s and 2020s (2nd Edition inflection) established that formal verification (TLA+) and randomized fault-injection testing (Jepsen) are non-negotiable requirements for distributed correctness.
+> *"They're funny things, Accidents. You never have them till you're having them."*
+> — **A.A. Milne**, *The House at Pooh Corner* (1928)
+
+- **The Big Picture:** On one computer behaviour is deterministic: same op → same result; hardware fault → total crash (fail-stop, blue-screen, kernel panic). Computers hide fuzzy physics behind idealised perfection. In shared-nothing distributed systems (each machine own memory/disk, only network connects, even object storage over network) faults are **partial and nondeterministic**: one switch drops, two servers leak, 98 run fine; you cannot tell crashed vs GC-paused vs cut cable. Anything that can go wrong will — one-in-a-million happens daily at scale. Paranoia pays; test faults deliberately.
+- **Core Thesis:** Networks have **unbounded delay**, clocks have **unbounded drift**, processes have **unbounded pauses**. Sender cannot distinguish lost request vs dead node vs lost reply vs delayed reply (Fig 9-1). Wall clocks jump backward (NTP step, leap second, DST) and drift 10–500ms; monotonic clocks can't be compared across nodes. Threads freeze seconds–minutes (GC, hypervisor steal, swap, SIGSTOP) without noticing. Correct algorithms therefore cannot rely on physical time or single-node judgement; they need **quorums, fencing tokens, partially-synchronous models, safety/liveness separation, formal verification + fault injection**.
+- **Problem Statement:** Trusting lease checks or wall-clock LWW corrupts data. Classic: Client 1 holds ZooKeeper 10s lease on `orders.csv`, enters 15s JVM stop-the-world GC; lease expires; Client 2 acquires, writes Order #99; Client 1 wakes, thinks lock valid, overwrites → corruption (Fig 9-4). Same with delayed network write after crash (Fig 9-5). Without storage-side **fencing tokens** (33→34, reject ≤max) mutual exclusion is impossible. Similarly 4ms NTP skew + LWW silently drops causally-later `x=2` (Fig 9-3).
+- **Historical & Industry Context:** 1980s MPP/Infiniband: any fault halted job. 2000s commodity Ethernet + cloud → reliable from unreliable (TCP over IP, ECC, Raft/Paxos). Telephone circuits (ISDN 4000 frames/s, 16 bits/250µs reserved) gave bounded delay at low utilisation; packet Ethernet/IP gives high utilisation at unbounded delay — cost/benefit, not law of nature. 2012 Spanner TrueTime (GPS+atomic, ε≤7ms, 2ε commit-wait) proved bounded clocks possible with hardware. 2010s–2020s standard: HLC (CockroachDB), phi-accrual detectors (Cassandra/Akka), TLA+/Elle/Jepsen/DST (AWS, FoundationDB, TigerBeetle, CockroachDB, TiDB, Kafka) non-negotiable. Coda Hale anecdote (partitions, PDU/switch/rack/DC/backbone/power failures, truck into HVAC) sets tone.
 
 ---
 
 ## 2. In-Depth Technical Concepts & Internal Mechanics
 
-### 2.1 Faults and Partial Failures: The Distributed Reality
-- **Foundational Theory:** A single machine is deterministic: operations either complete according to CPU instruction specs or the machine halts completely. In distributed systems, **partial failure** is the defining characteristic:
-  - Some components fail while others remain healthy.
-  - The healthy components cannot determine whether the failed component crashed, is running slowly, or is cut off by a severed network cable.
-- **The Philosophy of Building Reliable Systems from Unreliable Hardware:**
-  - Distributed computing does not attempt to eliminate faults; it treats faults as statistical certainties.
-  - *Analogies in Computing:*
-    1. *IP over Ethernet:* IP packets are unreliable (dropped, reordered, duplicated). TCP constructs an abstraction of a reliable, ordered, deduplicated stream on top of unreliable IP.
-    2. *DRAM & ECC:* DRAM chips suffer from cosmic-ray bit flips. Error-Correcting Code (ECC) memory detects and corrects single-bit errors in hardware.
-    3. *Consensus Protocols:* Raft and Paxos provide linearizable state machines on top of nodes that crash and networks that partition.
+### 2.1 Faults and Partial Failures — Why Distributed ≠ Single-Computer
 
----
+| Single computer | Distributed shared-nothing |
+| :--- | :--- |
+| Deterministic; good software fully functional or entirely broken | Nondeterministic partial failure: some parts broken, rest fine; op sometimes works, sometimes fails |
+| Crash preferred over wrong result (fail-stop) | No fail-stop: can't tell dead vs slow vs partitioned |
+| ECC, TCP already hide some faults | Must build reliability from unreliable parts: IP→TCP stream, ECC bits, Raft/Paxos survival |
 
-### 2.2 Unreliable Networks & The Asynchronous Model
-- **The Fundamental Network Dilemma (Figure 9-1):**
-  - Node A sends a message to Node B over an asynchronous network. Node A waits, but receives no response.
-  - *Indistinguishable Failure States:*
-    1. The request message was lost on the wire (cable severed / switch buffer dropped packet).
-    2. The request is queued in an OS buffer or network switch and has not yet reached Node B.
-    3. Node B crashed while processing the request.
-    4. Node B processed the request successfully, but the return response was lost on the wire.
-    5. Node B processed the request, but the response packet is delayed in a buffer and will arrive minutes later.
-  - *The Mathematical Impossibility:* **The sender cannot distinguish between a dead node and a delayed network.**
-- **Network Queueing Delays & Bufferbloat (Figure 9-2):**
-  - Why is network delay variable and unbounded?
-    1. *Switch Buffer Queueing:* When multiple network ports send packets to the same destination switch port simultaneously, packets queue in switch memory buffers. If the buffer fills, packets are dropped (tail drop).
-    2. *Operating System Socket Buffers:* When a packet hits the destination host, the OS places it in a TCP receive queue. If the application CPU is saturated, the packet sits in kernel memory.
-    3. *TCP Flow Control & Congestion Control:* TCP enforces congestion avoidance (slow start, AIMD). If packet loss occurs, TCP throttles transmission rates, multiplying application-observed latency.
-- **Fault Detection & Dynamic Timeouts:**
-  - Systems use **heartbeats** (periodic pings) to detect failed nodes.
-  - *The Timeout Dilemma:*
-    - *Short Timeout (e.g., 100 ms):* Fast failure recovery; but high probability of **false positives** (declaring a healthy node dead due to a transient network spike or GC pause), triggering unnecessary, expensive failovers.
-    - *Long Timeout (e.g., 30 sec):* Zero false positives; but the system takes 30 seconds to detect a genuine node crash, degrading availability SLAs.
-  - *Phi-Accrual Failure Detectors (Hayashibara et al., implemented in Cassandra and Akka):*
-    - Instead of a static timeout, the system continuously measures the historical distribution of heartbeat inter-arrival times ($RTT$).
-    - Computes a dynamic probability metric ($\Phi$):
-      $$\Phi = - \log_{10} \left( P_{\text{later}}(t - t_{\text{last}}) \right)$$
-    - If $\Phi = 8$, the probability of seeing a delay this large from a living node is $10^{-8}$. Applications adjust actions dynamically: $\Phi \ge 8 \implies$ throttle traffic; $\Phi \ge 12 \implies$ declare node dead and trigger failover.
+Power: tolerate partial → rolling upgrades (reboot one node, service continues) → more reliable than single node. But must enumerate unlikely faults and inject them in test.
 
----
+### 2.2 Unreliable Networks — Sender's Dilemma (Fig 9-1)
 
-### 2.3 Unreliable Physical Clocks & The Danger of Wall Time
-Modern computers have two distinct types of internal clocks:
+Client A → B, no response. Indistinguishable:
 
-#### 1. Time-of-Day Clocks (Wall Clocks)
-- Returns the current calendar date and time (e.g., `System.currentTimeMillis()` in Java, `clock_gettime(CLOCK_REALTIME)` in Linux).
-- Measures time since the Unix Epoch (January 1, 1970 UTC).
-- Periodically synchronized with Network Time Protocol (NTP) servers.
-- *The Fatal Flaw for Distributed Systems:* **Time-of-day clocks can jump backward or forward unexpectedly.**
-  - If the local quartz oscillator runs fast, NTP steps the clock backward, or slews it.
-  - If an NTP server reports a leap second, clocks can freeze, jump, or desynchronize.
-  - *Never use Time-of-Day clocks to measure elapsed time or duration!*
+| # | Possibility | Example |
+| :--- | :--- | :--- |
+| 1 | Request lost | Cable unplugged, full switch buffer, misconfigured switch |
+| 2 | Request queued/delayed | Overloaded network/recipient, VM pause, TCP backoff |
+| 3 | Remote crashed | Power down, kernel panic |
+| 4 | Remote paused but alive | Long GC (Ch.9 p.366), VM suspend/migrate |
+| 5 | Reply lost | Switch misconfig, asymmetric fault (A→B ok, B→A drops [20–22]) |
+| 6 | Reply delayed | Congestion, overloaded sender, noisy neighbour |
 
-#### 2. Monotonic Clocks
-- Returns an arbitrary elapsed time counter (e.g., `System.nanoTime()`, `clock_gettime(CLOCK_MONOTONIC)`).
-- Guaranteed to **never jump backward** and strictly moves forward at a constant rate.
-- Ideal for measuring durations, timeouts, and p99 response latencies on a single machine.
-- *Constraint:* Absolute values are completely meaningless across machines (cannot compare monotonic clocks of Node A and Node B).
+Only info: no response yet. Timeout = give up waiting, still don't know if request will still arrive. Retry may duplicate.
 
-#### 3. Clock Skew and the Failure of Last-Write-Wins (LWW - Figure 9-3)
-- Consider two nodes in a multi-leader or leaderless cluster with unsynchronized clocks (Figure 9-3):
-  - Node 1 clock is at $t = 42.004\ \text{sec}$. Client A writes $x = 1$.
-  - Node 2 clock has drifted backward; it is at $t = 42.000\ \text{sec}$.
-  - Client B reads $x = 1$, and subsequently writes $x = 2$ on Node 2.
-  - Node 2 assigns its local timestamp: $42.000\ \text{sec}$.
-  - *The Catastrophe:* Under Last-Write-Wins (LWW), Node 1's write carries timestamp $42.004$, while Client B's subsequent write carries $42.000$. The database compares timestamps, concludes that $42.004 > 42.000$, and **discards Client B's write as "older"**, even though Client B's write causally happened *after* Client A's write!
-  - LWW silently corrupts causal mutations whenever clock drift exceeds mutation interval.
+**TCP limits (why "reliable" isn't enough):**
+- Packets ≤KB; TCP breaks streams, retransmits on ACK timeout, reorders, checksums, does congestion/flow/backpressure [5]. Socket write → OS buffer → congestion window → switches/routers → receiver OS buffer → ACK → app notify [6]. Same for QUIC/SCTP/uTP.
+- Can't tell outbound vs ACK loss; can't plug cable; configurable timeout then error to app. Dedup+retransmit per-connection only — app reconnect+resend duplicates.
+- Closed with error (crash/partition): unknowable how much remote processed [6]. Kernel ACK ≠ app handled (app may crash after recv). Need app-level positive response (end-to-end argument [7]).
+- Useful framing: length-header + message (HTTP/RPC, Ch.5 p.180).
 
----
+**Network faults in practice [8–23]:**
+- Medium DC: ~12 faults/month (½ single machine, ½ whole rack) [9]. Redundant gear doesn't stop human misconfig [10].
+- WAN fibre cut by cows [11], beavers [12], sharks [13–14], scavenging/sabotage/misconfig [15–17].
+- Cross-region RTT minutes at p99 [18 Table 3]; intra-DC >1 min during switch upgrade reconfig [19]. Assume arbitrary delay.
+- Partial: A↔B, B↔C ok but A↔C not [20,21]; NIC drops inbound but sends outbound [22]; one direction working ⇏ opposite.
+- Brief interruption → long repercussions [8,20,23]; untested handling → deadlock after recovery [24] or data deletion [25]. At least know recovery path; ideally chaos-test (p.385).
+- "Partition/netsplit" = cut off part; same as other interruptions; unrelated to sharding-partition (Ch.7).
 
-### 2.4 Google Spanner's TrueTime API
-- **Foundational Theory:** In standard distributed systems, you cannot determine if Timestamp $A$ happened before Timestamp $B$ if $|t_A - t_B| < \text{NTP drift}$.
-- **Google Spanner's Architecture:**
-  - Installs dedicated **atomic clocks (rubidium oscillators)** and **GPS receivers** in every Google datacenter.
-  - Replaces scalar clock queries with an explicit **confidence interval**:
-    $$\text{TrueTime.now}() = [t_{\text{earliest}}, t_{\text{latest}}]$$
-    Where the true physical time is mathematically guaranteed to fall within the interval, bounded by maximum uncertainty $\epsilon$:
-    $$\epsilon = \frac{t_{\text{latest}} - t_{\text{earliest}}}{2} \quad (\text{typically } 1\ \text{ms to } 7\ \text{ms})$$
-- **The TrueTime Wait Rule (Linearizable Commit Wait):**
-  - When Transaction A commits, Spanner assigns it a commit timestamp $t_A = t_{\text{latest}}$.
-  - The transaction intentionally **sleeps for $2\epsilon$** before releasing its locks and acknowledging the client!
-  - By waiting $2\epsilon$, Spanner guarantees that any future transaction $B$ will receive a timestamp $t_B > t_A$.
-  - Achieves globally distributed linearizable transactions without a single central timestamp oracle.
+**Fault detection:**
+- Fast paths (unreliable): RST/FIN if port closed (process crashed); crash-notification script (HBase [26]); switch management query (no internet/shared-DC); ICMP unreachable (router also limited).
+- Generally assume **no response**. Retry few times, timeout, declare dead. Too short → false positives (alive deemed dead); too long → outage wait. Balance.
 
----
+### 2.3 Timeouts, Queueing and Sync vs Async
 
-### 2.5 Process Pauses & The Stop-the-World Hazard
-- **The Process Pause Phenomenon:**
-  - A thread executing application code can be suspended at any arbitrary instruction for an unbounded duration without the thread's knowledge.
-  - *Causes of Process Freezes in Production:*
-    1. *Garbage Collection (GC):* JVM "Stop-the-World" pauses where all execution threads are halted to compact the heap (frequently lasting several seconds, sometimes minutes).
-    2. *Hypervisor CPU Stealing:* In virtualized cloud environments (AWS EC2, GCP Compute), the hypervisor suspends a virtual machine to run another VM on the same core ("steal time").
-    3. *Operating System Paging:* If memory is over-allocated, a thread accessing a memory address triggers a page fault, blocking the process while the OS reads memory off disk.
-    4. *POSIX Signals:* Sending `SIGSTOP` (e.g., via `docker pause` or debugging) suspends execution until `SIGCONT`.
-- **The Distributed Lock Collapse (Figure 9-4 & 9-5):**
-  - *Flawed Pattern:*
-    ```python
-    lease = zookeeper.acquire_lock("my_resource", timeout_sec=10)
-    if lease.is_valid():
-        # DANGER: What if a 15-second GC pause happens right here?
-        write_critical_file_to_storage()
-    ```
-  - When the thread awakens after a 15-second GC pause, `lease.is_valid()` was evaluated *before* the pause! The lease has expired in ZooKeeper, another node owns the lock, and the write corrupts storage.
-  - *Core Invariant:* **A node cannot assume its lock or lease is valid simply because local code checked the clock.**
+**How long timeout?** Fictitious bounded network (packet ≤d or lost) + bounded handler (≤r) → `2d+r` perfect timeout. Real async networks unbounded + handlers unbounded (GC/queue) → no correct value. Low timeout: transient spike → false failover, double-execution (e.g. send email twice, Ch.10/12), load transfer → cascading failure (overloaded node slow → declared dead → load to others → all declare each other dead, Ch.2 p.38). High timeout: users wait/errors during real crash.
 
----
+**Queueing = main variability [27]:**
+- Switch: N senders → same egress port → buffer queues one-by-one (Fig 9-2); full → drop → resend though network fine.
+- Host: all cores/threads busy → OS queues; VM paused tens ms for other VM → hypervisor buffers [29]; TCP rate-limit queues at sender.
+- TCP loss hidden as delay (timeout + retransmit ACK wait).
+- **UDP trade-off:** VoIP/video use UDP — no flow/retransmit, still queued/scheduling delay, but avoids retransmit jitter. Delayed data worthless → fill silence, human retries ("repeat please?").
+- Near capacity queues explode; spare capacity drains. Public cloud multitenant shares links/switches/NIC/CPU → noisy neighbour saturates → highly variable [30,31]. Choose timeouts experimentally (measure RTT distribution across machines/time); better auto-adjust by jitter (phi-accrual [32,33], TCP RTO [5]).
 
-### 2.6 The Solution to Leases: Monotonic Fencing Tokens
-- **Foundational Theory:** Because a client cannot prevent process pauses or delayed network packets, **the storage service itself must enforce access rights** using monotonically increasing tokens.
-- **Under-the-Hood Fencing Mechanics (Figure 9-6):**
-  1. The lock server (ZooKeeper / etcd) grants a lock along with a **Fencing Token**: a strictly monotonically increasing integer counter ($33, 34, 35, \dots$) incremented on every grant.
-  2. Client 1 acquires the lock and receives Token **33**.
-  3. Client 1 enters an unexpected 20-second GC pause. Its lease expires.
-  4. Client 2 acquires the lock and receives Token **34**.
-  5. Client 2 writes to storage, including its token: `PUT /data, token=34`. Storage records: `highest_token_seen = 34`. Storage commits the write.
-  6. Client 1 wakes up from its GC pause. Believing it still owns the lock, it sends: `PUT /data, token=33`.
-  7. Storage inspects the token:
-     $$\text{Token 33} < \text{Highest Token Seen (34)}$$
-     Storage **unconditionally rejects the write**, returning `403 Forbidden (StaleToken)`.
-  8. Data corruption is completely averted.
-- **Fencing Tokens in Leaderless Datastores (Figure 9-7):**
-  - In Cassandra or Dynamo, the fencing token can be packed into the high-order bits of the write timestamp: `(fencing_token << 32) | physical_time`. Any write from a superseded leaseholder is rejected because its high bits are lower than the incumbent's tokens.
+**Synchronous vs asynchronous networks (book pp.379–381):**
+- **Synchronous network model:** Phone circuit ISDN 4000 fps, 16 bits/250µs each direction [35]; fixed bandwidth reserved end-to-end for call duration [34]; no queueing → bounded delay (every packet delivered within known bound `d` or lost). Different from TCP connection (opportunistic, idle uses ~0). In a synchronous network a `2d+r` timeout is provably correct — no response within `2d+r` means the remote is faulty.
+- **Asynchronous network model (our reality):** Ethernet/IP packet switching optimised for bursty traffic (web/email/file want ASAP, no fixed rate). An asynchronous network tries to deliver as quickly as possible but offers no upper bound — an asynchronous network packet may arrive in 100µs or 60s (cross-region p99 minutes [18], intra-DC >1 min during reconfig [19]). File over circuit needs bandwidth guess: too low slow + waste, too high setup fails; by contrast TCP on an asynchronous network dynamically adapts to available capacity. The book's core claim (p.379): datacenter + internet are asynchronous networks by cost choice, not by nature — static reservation would give bounded delay but waste idle capacity.
+- **Why the asynchronous network breaks timeouts:** Because an asynchronous network has unbounded delay, no timeout value is correct. Low timeout on an asynchronous network: transient queue spike → false failover, double-execution, cascading failure. High timeout on an asynchronous network: real crashes take minutes to detect. Hence timeouts on an asynchronous network must be chosen experimentally from RTT distributions, never derived from spec.
+- **Asynchronous network failure detectors — from static timeout to phi-accrual:** A failure detector on an asynchronous network cannot distinguish crashed vs slow vs partitioned (Fig 9-1 sender's dilemma). Static timeout (`3 × 1s ping misses → dead`) is brittle on an asynchronous network with jitter. The phi-accrual failure detector [32,33] (Cassandra `dynamic_snitch`, Akka `akka.cluster.failure-detector`) models inter-arrival times on the asynchronous network as a normal distribution, computes suspicion `Φ = -log10(P(later arrival))`, and thresholds adaptively (Φ≥8 suspect, Φ≥12 dead). On a quiet asynchronous network Φ stays ~0; on a degraded asynchronous network Φ ramps smoothly; TCP RTO [5] does the same exponential-weighted adaptation. Rule: use phi-accrual (or equivalent adaptive detector) for any asynchronous network spanning AZs/regions or multitenant cloud; reserve static timeouts for a tightly-controlled synchronous-like LAN with bounded delay.
+- **Latency vs utilisation on an asynchronous network:** wire 10k call slots statically split: alone still 1 slot (expensive, predictable). Internet as asynchronous network dynamically jostles per-moment (cheap, queued). CPU same: dynamic sharing → run-queue waits [36] but better use; static → guarantees but waste (Ch.9 p.369 RT). Cloud VMs same. Guarantees possible with static partition (dedicated HW/bandwidth) but costly. Variable delay on an asynchronous network = cost choice.
+- Hybrids for taming the asynchronous network: ATM (1980s vs Ethernet, phone cores), InfiniBand link-layer flow control (less queue, still congestion [37,38]), QoS prioritisation/admission, L4S, Linux `tc`. Not enabled in multitenant clouds/internet → assume the asynchronous network with unbounded delay. BGP/peering = circuit-like at network level, long timescale, buyable bandwidth — but per-packet path is still an asynchronous network.
 
----
+### 2.4 Clocks — Monotonic vs Time-of-Day, Sync and Accuracy
 
-### 2.7 Knowledge, Truth, and Quorums: The Majority Rules
-- **The Concept of Truth in Distributed Systems:**
-  - A node cannot trust its own internal state. A node might believe it is the primary leader, but if the rest of the cluster has declared it dead, it is effectively dead.
-  - **Truth is defined by quorum consent.** A node has authority if and only if a **majority (quorum)** of nodes agree.
-- **Why Majority Quorums?**
-  - In a cluster of $N$ nodes, a majority is defined as $\lfloor N/2 \rfloor + 1$.
-  - *Invariant:* Any two majorities **must overlap in at least one node**.
-  - If $N = 5$, a majority is 3. Two concurrent majorities of 3 nodes cannot exist in a 5-node cluster (since $3 + 3 = 6 > 5$).
-  - Prevents split-brain by guaranteeing that only one candidate can ever be elected leader at any given term or epoch.
+Apps ask durations (timed out? p99? QPS/5min? dwell?) vs points (published? reminder? TTL? log timestamp?). Network transit makes ordering hard; quartz per-machine drifts.
 
----
+| Type | API | Meaning | Jumps back? | Use / Danger |
+| :--- | :--- | :--- | :--- | :--- |
+| **Time-of-day / wall** | `CLOCK_REALTIME`, `System.currentTimeMillis`, epoch ms since 1970 UTC (no leap) | Calendar; NTP-synced ideally same across nodes | **YES:** NTP step if far ahead, leap 59/61s minute [49], DST (use UTC) | Human display, expiry, logs. **Never for elapsed:** negative durations [40]. Coarse on old Windows (10ms [41]) |
+| **Monotonic clock** | `CLOCK_MONOTONIC/BOOTTIME`, `System.nanoTime`, `time.monotonic` | Stopwatch since boot (arbitrary); per-CPU timers reconciled by OS (pinch of salt [44]) | NO jump; NTP may *slew* a monotonic clock rate ≤0.05% | Timeouts, benchmarks with a monotonic clock. **Meaningless cross-node.** Good resolution (µs) |
+| **TrueTime / ClockBound** | `TrueTime.now()->[earliest,latest]` | Confidence interval, GPS+atomic | NO (monotonic window) | Global snapshots if ε small |
+| **Logical** | Lamport/HLC counters (Ch.10) | Causality, not seconds | NO | Ordering (see §2.5, Ch.10) |
 
-### 2.8 Byzantine Faults vs. Crash-Recovery Models
-- **System Models Defined:**
-  1. *Timing Models:*
-     - *Synchronous Model:* Network delay, process pauses, and clock drift are bounded by known constants. (Unrealistic for production cloud systems).
-     - *Asynchronous Model:* No timing assumptions. No clocks, unbounded network delay, unbounded process pauses. (Algorithms cannot use timeouts).
-     - *Partially Synchronous Model (Production Standard):* The system behaves synchronously *most of the time*, but experiences periods of unbounded network delay, packet drops, and process pauses. Algorithms must guarantee safety under all conditions, and liveness once the network returns to synchronous behavior.
-  2. *Node Failure Models:*
-     - *Crash-Stop:* A node executes correctly until it fails, after which it never recovers.
-     - *Crash-Recovery:* Nodes can crash at any time and resume execution later. Nodes possess durable non-volatile storage (WAL) that survives reboots.
-     - *Byzantine Fault Model:* Nodes may deliberately lie, forge messages, compute corrupt values, or actively collude maliciously.
-- **Weak Byzantine Faults in Production:**
-  - While enterprise datacenters assume non-Byzantine behavior (nodes are not controlled by malicious hackers), "weak" Byzantine faults happen routinely in production:
-    - Faulty network cards generating corrupt packets that slip past weak TCP 16-bit checksums.
-    - Bit flips in non-ECC memory corrupting in-memory data structures.
-    - Misconfigured NTP servers leaping clocks by 50 years.
-  - *Defensive Mitigations:* End-to-end cryptographic checksums (CRC32, SHA-256), TLS on all internal RPCs, and sanity checking inputs.
+- **`System.nanoTime` (monotonic clock) vs `System.currentTimeMillis` (wall) — book pp.383–384:** Use the monotonic clock (`System.nanoTime`, `CLOCK_MONOTONIC`, `time.monotonic`) for durations — timeouts, p99 latency, retry deadlines — because a monotonic clock never jumps backward. Use wall time (`System.currentTimeMillis`, `CLOCK_REALTIME`) only for points — calendar display, log timestamps, TTL expiry. Mixing them is the classic bug: `elapsed = System.currentTimeMillis()-start` goes negative on NTP step or leap-second jump [40], while a monotonic clock difference is always ≥0 (modulo the per-CPU reconciliation caveat [43,44] — take the monotonic clock guarantee with a pinch of salt on multi-socket servers). A monotonic clock value is meaningless across nodes (different boot epochs), so never compare a monotonic clock reading from node A with a monotonic clock reading from node B for ordering — that needs wall + bounds or logical clocks.
+- **NTP slew vs step for the monotonic clock and wall (pp.383–385):** NTP disciplines both clocks but differently. If offset is small, NTP *slews* the monotonic clock — speeds/slows its rate by up to 0.05% until aligned; the monotonic clock never jumps, only its frequency wobbles. If offset is large (far-ahead clock, long firewall partition), NTP *steps* the wall clock — forcibly resets `CLOCK_REALTIME` forward/backward [39]; observers see time jump. The monotonic clock still does not step, which is why all elapsed-time code must use the monotonic clock. Operational fallout of ignoring this: lease-expiry checks against wall time (`lease.expiry - currentTimeMillis`) inherit step jumps; the same check against a monotonic clock (`nanoTime` deadline) survives steps but still needs cross-node sync for the expiry origin.
+- **Leap seconds, DST, and the monotonic clock (pp.384–385):** A leap second makes a UTC minute 59 or 61 s [49]; POSIX `CLOCK_REALTIME` either repeats a second (step back) or smears it. Either way wall time jumps or stalls — 2012/2017 leap-second steps sent Java `parkNanos`/futex/hrtimer into 100% busy-loop (Cloudflare/Reddit/LinkedIn/Qantas [40,50]). A monotonic clock is immune to leap jumps (it counts SI seconds since boot, not calendar), so sleeps/deadlines on a monotonic clock ride through the leap safely. Fix stack: (1) all timers on a monotonic clock, (2) NTP servers smearing the leap over 24 h [51–53] so wall observers see gradual slew not a step, (3) UTC everywhere (no DST jumps), (4) monitor offset and alert >100 ms. Leap seconds abolished from 2035, but the monotonic-clock-vs-wall discipline remains because NTP steps can still jump wall time at any deploy.
+
+**Sync/accuracy pitfalls:**
+- Quartz drift temp-dependent; Google assumes 200ppm → 6ms/30s, 17s/day [45]. Best possible bound.
+- Far-ahead → refuse sync or forcibly reset → forward/back jump [39].
+- Firewalled NTP unnoticed → large skew.
+- Internet NTP ≥35ms min error [46], spikes ~1s; congested → give up. Single stranger time risky; query several, drop outliers, but hours-off servers seen [47,48].
+- Leap seconds crash systems [40,50]; fix smearing (lie gradually over day) [51–53]; leap abolished 2035. Cloudflare 2012/2017 leap → futex/hrtimer busy-loop 100% [40].
+- VMs: virtualized clock + steal-time jumps forward on resume [29]; NTP unaware → false accuracy [55]; shared core pauses.
+- Untrusted devices (mobile/embedded): user sets wrong time to cheat [56].
+- High accuracy possible with cost: MiFID II 100µs UTC for HFT [57], GPS+atomic+PTP+monitoring [58,59]; GPS jammable (military zones [60]); cloud microsecond clocks emerging [61] but misconfig/firewall still balloons error.
+
+### 2.5 Relying on Sync — LWW Hazard (Fig 9-3), Confidence, Spanner Snapshots
+
+Incorrect clocks go unnoticed (CPU/net fail obviously; clock drifts silently → subtle loss [62,63]). If requiring sync, monitor offsets, evict far-drifters.
+
+**Timestamps for ordering (dangerous):** Multi-leader DB tags replicate writes with origin wall time. Example Fig 9-3 (skew <3ms, better than practical): A writes `x=1` on node1 ts 42.004 → replicate node3; B reads 1, increments to `x=2` on node3 ts 42.003 (lagging clock). Causally `2` after `1` but timestamp earlier. LWW keeps max ts → node2 drops `2`, increment lost. Fix needs read-before-write for max ts (extra RTT) — Cassandra/ScyllaDB skip for speed [62].
+
+| LWW-clock problem | Effect |
+| :--- | :--- |
+| Lagging node | Cannot overwrite until skew elapsed → silent drops, unbounded [63,65] |
+| Sequential vs concurrent | Indistinguishable; need version vectors (Ch.6 p.237) |
+| Same-ms collision | Needs random tiebreaker → causality violation [62] |
+
+"Recent" = local clock, may be wrong. Packet sent at 100ms can arrive at 99ms by clocks — impossible ordering. NTP accuracy limited by RTT itself → error never << delay → can't guarantee order. Use logical counters for order (Ch.6 p.237, Ch.10 p.417).
+
+**Confidence intervals:** µs resolution ≠ accuracy (ms drift even LAN NTP per minute; tens ms internet, 100ms spikes). Think range, not point (e.g. 95% 10.3–10.5s [67]). Width from GPS/atomic quality or quartz-since-sync + server uncertainty + RTT. Most APIs hide it (`clock_gettime` no error bar: 5ms or 5 years?). TrueTime/ClockBound return `[earliest,latest]`; width grows since sync.
+
+**Global snapshots (Spanner [68,69]):** MVCC needs monotonic txn ID reflecting causality (B overwriting A ⇒ ID_B>ID_A, Ch.8 p.293); distributed counter bottleneck (Ch.10 p.417). Use wall timestamps if sync good? Uncertainty problem. Spanner: if intervals `A=[Ae,Al]`, `B=[Be,Bl]` disjoint (`Ae<Al<Be<Bl`) then B definitely after A. Deliberately waits confidence length before committing R/W so readers' intervals don't overlap → causality. Needs small ε → GPS/atomic per DC (~7ms [45]). Not strictly required — interval matters, HW just shrinks wait; YugabyteDB+ClockBound on AWS [70], others [71,72].
+
+### 2.6 Process Pauses — Leases, GC and Zombie Writes (Figs 9-4/9-5)
+
+Single-leader per shard: how know still leader? **Lease** (lock with timeout [73]): only holder writes; renew periodically; fail stops renew → other takes over. Every process pause analysis starts from this lease loop — a process pause between check and use breaks it.
+
+```text
+while (true) {
+  req = getIncomingRequest();
+  // Ensure that the lease always has at least 10 seconds remaining
+  if (lease.expiryTimeMillis - System.currentTimeMillis() < 10000) lease = lease.renew();
+  if (lease.isValid()) process(req);
+}
+```
+
+Wrong: (1) compares remote-set lease expiry with local wall (needs sync); (2) even local monotonic fails — an arbitrary process pause between `isValid()` check and `process()` defeats the 10s buffer (a 15s process pause means the lease expires mid-`process`). Thread gets no notice of the process pause; it checks the clock only on the next loop — by then the process pause has already caused unsafe work. Book p.390–391: no in-code gap is safe because a process pause can strike at any instruction.
+
+**Process pause causes (book pp.390–394 — every one is a real process pause source):** lock/queue contention (worse many cores [74] — a process pause waiting on a mutex); JVM stop-the-world GC process pause (minutes historically [75], still noticeable — see GC paragraph below); VM suspend/resume/migrate process pause (arbitrary length [76]); laptop-lid process pause; OS/hypervisor context-switch + steal-time process pause under load; synchronous disk process pause (classloader fault, EBS variability [31]), page-fault/swap/thrash process pause (often disable paging on servers to bound the process pause); `SIGSTOP`/`Ctrl-Z` process pause (even accidental ops stops the process cold). A process pause preempts the thread without notification — the paused thread does not know a process pause happened until it next reads a clock.
+
+> Node must assume a process pause anywhere; rest declares it dead during the process pause, then it wakes unaware. Like single-machine threading (mutexes/atomics/queues) but no shared memory — only unreliable messages. This process pause rule is the distributed analogue of "assume arbitrary thread interleaving".
+
+**Real-time guarantees vs process pause?** Hard RT (aircraft/rockets/robots/cars, airbag vs GC) needs RTOS, WCET libs, no dynamic alloc (or RT GC + bounded work), massive testing — expensive, lower throughput (timeliness > speed), not economical for data systems. So data systems must suffer the process pause and clock instability that come from non-real-time environments (p.393).
+
+**Taming the GC process pause [79–82]:** modern collectors shrink the GC process pause to ms (CMS/G1/ZGC/Epsilon/Shenandoah; Go concurrent MAS); Swift ARC, Rust/Mojo lifetimes avoid the GC process pause entirely; pool/reuse, off-heap; treat a GC process pause like a brief planned outage (drain → GC → resume [80,81]); short-lived only + rolling restarts before old-gen fills (LMAX [82]). Every technique reduces the GC process pause, never eliminates the process pause — a 50 ms GC process pause still exceeds a 10 ms lease buffer if timed adversarially, so fencing (§2.7) remains mandatory.
+
+**Fig 9-4 GC process pause vs Fig 9-5 delayed-write-after-crash (both p.398, both break lease expiry):**
+
+| Fig | Trigger | Sequence |
+| :--- | :--- | :--- |
+| 9-4 incorrect lock from GC process pause (HBase [85,86]) | 15s GC stop-the-world process pause | C1 holds 10s lease → GC process pause freezes heartbeats → lease expiry passes → C2 acquires → writes file → C1's process pause ends, C1 wakes thinking lease valid, overwrites → corruption. The process pause outlived the lease. |
+| 9-5 delayed message, no process pause | No process pause; C1 crash + asynchronous network delay (minutes [19]) | C1 sends write just before crash, packet delayed in network → lease expiry passes → C2 acquires lease + writes → old delayed write arrives late → same corruption as the process pause case, proving lease expiry alone never suffices. |
+
+Lesson spanning both figures: lease expiry without fencing is unsafe against either a process pause (Fig 9-4) or a delayed packet (Fig 9-5). A new holder must fence the old holder with a token (§2.7); STONITH alone cannot fix the Fig 9-5 delayed write because the zombie is already dead. Any design review must ask "what if a 60s process pause hits here?" and "what if this packet is delayed past lease expiry?" — if the answer is corruption, add fencing.
+
+### 2.7 Fencing Tokens — Making Leases Safe (Figs 9-6/9-7)
+
+Zombie = former holder unaware it lost lease. Can't prevent zombies → **fence** them (ensure harmless). STONITH/shoot-head (disconnect/VM kill/power off [9,87]) ineffective vs delays (Fig 9-5), can kill each other [19], too late after corruption.
+
+Robust: **fencing token** (Chubby sequencer [88], Kafka epoch, Paxos ballot/Raft term — Ch.10) — increasing number per grant; client includes on every storage write.
+
+| Step (Fig 9-6) | C1 token 33 | C2 token 34 |
+| :--- | :--- | :--- |
+| Grant | 33, then GC pause | 34 after expiry |
+| Write | Late write token 33 | Immediate write token 34 → store `max=34`, OK |
+| Check | `33 ≤ 34` → **403 StaleToken** rejected | — |
+
+Similar to OCC (Ch.8 p.318) but permanent, not retryable. ZooKeeper `zxid/cversion` [85], etcd `revision+leaseID` [89], Hazelcast `FencedLock` [90] serve as tokens. Storage needs conditional/CAS check (S3 conditional writes, Azure conditional headers, GCS preconditions). Redlock debate [91,92] vs S3-leader-election [93]: single conditional store can replace lock service, but token reuses across replicas/services.
+
+**With replicas (Fig 9-7):** leaderless LWW store: client writes each replica with client timestamp. Put token in high bits: `34… > 33…` regardless of low-bit clock. C2 quorum-misses replica3; zombie C1 later succeeds there, ignored on 1+2. Quorum read prefers C2, repair overwrites C1. Old holder fenced everywhere.
+
+### 2.8 Knowledge, Truth, Lies — Majority, Byzantine, Models, Verification
+
+Node knows others only via messages; no shared memory/variable/common knowledge [83]; can't even agree time. State assumptions as **system model**, prove algorithm within it — reliable from few guarantees, but nontrivial.
+
+**Majority rules:** asymmetric fault (receives all, sends none [22]) → others declare dead though alive ("I'm not dead!" unheard); self-detects via missing ACKs but helpless. Pause 1min → buried then resurrects unaware. Moral: don't trust single node — **quorum voting** (Ch.6 p.231, Ch.10). Quorum-dead = dead even if feels alive; step down. Usually majority (>½): 3 tolerates 1, 5 tolerates 2; only one majority → no conflicting majorities.
+
+**Distributed locks/leases misuse [84]:** need single holder for leader/shard, exclusive object, de-dup work. Pause → simultaneous holders: wasted work ok, but split-brain leader / corrupted object catastrophic.
+
+**Byzantine faults:** fencing stops inadvertent zombies, not deliberate fake token. Book assumes unreliable but honest (slow/dead/stale, but truthful to knowledge). Byzantine = lie: contradictory votes, forged msgs. Generals problem [94] (two-generals impossibility [95] → consensus Ch.10). Name from "excessively complicated/bureaucratic" Byzantium, not history [96,97]; Albanian avoided [97].
+
+| Byzantine relevant? | Example |
+| :--- | :--- |
+| YES | Aerospace radiation bit-flips (plane/rocket/ISS [98,99] need HW support); multi-party cheating (Bitcoin/blockchain agree without centre [100]); P2P no authority [103,104] |
+| NO (this book) | Single-org DC (trusted, low radiation; orbit DCs considered [101]); tenants isolated by firewall/virt/ACL, not BFT; BFT expensive [102], needs HW [98]; same software everywhere → bug hits all (need 4 independent impls for 1 fault: >⅔ honest, e.g. 4 nodes tolerate 1); attacker compromising one likely all → use auth/ACL/TLS/firewall. Browser clients malicious → validate/sanitize/escape (SQLi/XSS), server authoritative, not BFT |
+
+**Weak lying guards (non-BFT pragmatics):** app checksums (TCP/UDP miss corruptions [105–107]; TLS helps); sanitize/range/size checks even internal (parsers [105]); NTP multi-server majority outlier exclusion [39].
+
+**System models:**
+
+| Timing | Assumption | Realistic? |
+| :--- | :--- | :--- |
+| Synchronous | Bounded net/pause/clock error (not zero, just known bound [108]) | No — unbounded occurs |
+| Partially synchronous | Sync mostly, sometimes unbounded | **YES — most useful** |
+| Asynchronous | No timing, no clock/timeouts | Too restrictive, but for impossibility (FLP) |
+
+| Node | Assumption |
+| :--- | :--- |
+| Crash-stop / fail-stop [109] | Crash → gone forever |
+| Crash-recovery | Crash → restart after unknown time; stable disk survives, RAM lost |
+| Limping / gray / fail-slow [110–114] | Slow but alive: 1Gb→1Kb driver bug, GC-bound, worn SSD, heat/vibration/PSU/firmware; health-check ok but useless; partial thread death |
+| Byzantine | Anything including deception |
+
+Partial-sync + crash-recovery + stable storage = workhorse (allows unbounded delay/pause/slow).
+
+**Correctness: safety vs liveness [115,116]:** e.g. fencing tokens: uniqueness + monotonic sequence (safety) + availability (liveness, "eventually"). Safety violated at point (duplicate token operation — irreversible). Liveness may be pending (sent but no reply — hopeful). Require safety always even if all crash/network dead (never wrong); liveness caveated (majority alive, network eventually recovers; partial-sync eventually synchronous). Sorting invariant analogy.
+
+**Model→reality gap:** stable storage may corrupt/wipe [117] or firmware miss disks [118] → quorum amnesia breaks correctness; need "mostly survives but sometimes lost" model — harder. Theory declares some things impossible; impl still handles (`printf+s exit`, human cleanup [119] — CS vs engineering [Kreps]). Models distil manageable faults.
+
+**Formal methods & randomized testing:**
+- Prove mathematically, but impl may diverge; still catches timing-hidden bugs. Combine with empirical: property/fuzz/deterministic sim (AWS, FoundationDB, TigerBeetle [120–123]).
+- **Model checking (TLA+, Gallina, FizzBee):** spec core ideas, checker explores states/invariants. Infinite states → approximate/bound messages; longer-run bugs missed. Used CockroachDB/TiDB/Kafka [124–126]; TLA+ found VR data-loss ambiguity [127]. Risk spec↔code drift [128]; equivalence needs instrumentation [129].
+- **Fault injection:** pause/kill (`kill`), unmount, firewall partition in prod-like (or prod — Chaos Monkey [130], chaos engineering Ch.3 p.43). Coordinators+scripts decide/trigger; inspect. Cumbersome → frameworks (Jepsen [131] integrations+injectors) remarkably effective [132,133]; analyses [Jepsen site]. Detects deadlock-after-recovery, data wipe cases.
+- **Deterministic simulation testing (DST):** like model checker but on real code. Mocks net/I/O/clocks, controls order/timing/failures, explores randomized executions, replays exact failure order (vs fault injection). Requires determinism via: *app-level* (FoundationDB Flow [134], TigerBeetle event-loop+mock clocks [135]), *runtime-level* (single-thread async: FrostDB patched Go [136], Rust MadSim Tokio/S3/Kafka), *machine-level* (custom hypervisor: Antithesis all clocks/net/storage deterministic, containers inside). Benefits: branch subexecutions, faster-than-wall (mock timeouts), broad path cover.
+- **Power of determinism:** nondeterminism = concurrency/delay/pause/jump/crash. Determinism simplifies: event-source replay (Ch.4 p.101), durable workflows need deterministic definitions (Ch.5 p.187), SMR same deterministic txn sequence (statement replication Ch.6 p.206, serial procs Ch.8 p.311, Ch.10 p.433).
 
 ---
 
@@ -180,477 +227,367 @@ Modern computers have two distinct types of internal clocks:
 >
 > | Book Fig | PDF page | What to compare |
 > |---|---|---|
-> | Fig 9-1 | PDF p.372 | Timeout ambiguity |
-> | Fig 9-2 | PDF p.378 | Switch congestion |
-> | Fig 9-3 | PDF p.387 | Clock timestamp 42.004 |
-> | Fig 9-4 | PDF p.398 | Broken distributed lock |
-> | Fig 9-5 | — (not located) |  |
-> | Fig 9-6 | PDF p.399 | Monotonic seq writes |
-> | Fig 9-7 | PDF p.401 | Fencing tokens |
+> | Fig 9-1 | PDF p.372 | Timeout ambiguity (lost req/dead/lost reply) |
+> | Fig 9-2 | PDF p.378 | Switch queue ports 1,2,4→3 |
+> | Fig 9-3 | PDF p.387 | Clock 42.004 vs 42.003 LWW drops x=2 |
+> | Fig 9-4 | PDF p.398 | GC pause lock corruption |
+> | Fig 9-5 | PDF p.398 | Delayed write after crash (lease expiry) |
+> | Fig 9-6 | PDF p.399 | Fencing tokens 33→34 |
+> | Fig 9-7 | PDF p.401 | Token in high bits, leaderless quorum |
 
-
-### Figure 9-1: The Fundamental Network Ambiguity
-- **Figure Reference:** `Figure 9-1: If you send a request and don't get a response, it's impossible to distinguish why (reconstructed from text p. 327)`
-- **Original PDF:** Fig 9-1 → PDF p.372 — open the PDF at page 372 to compare with the Mermaid reconstruction below.
-- **Visual Flow & Description:** Tracks a client sending a request to Node B. Shows the 4 distinct points where failure could occur, proving the mathematical impossibility of distinguishing between a dead node and a dropped network packet.
+### Figure 9-1: Sender Can't Tell Why No Response
+- **Figure Reference:** `Figure 9-1: If you send request and don't get response impossible to distinguish`
+- **Original PDF:** Fig 9-1 → PDF p.372
 - **Mermaid Flowchart:**
 
 ```mermaid
 flowchart TD
-  CLIENT["Client (Node A)"]
-  NET_OUT["Outbound Network"]
-  NODE_B[("Server (Node B)")]
-  NET_IN["Inbound Network"]
-
-  CLIENT -->|"1. Send Request"| NET_OUT
-  NET_OUT -->|"2. Packet Arrives"| NODE_B
-  NODE_B -->|"3. Process & Reply"| NET_IN
-  NET_IN -->|"4. Return Response"| CLIENT
-
-  NET_OUT -.->|"FAILURE POINT 1: Request packet lost on wire"| ERR1["Lost Request"]
-  NODE_B -.->|"FAILURE POINT 2: Node B crashed before executing"| ERR2["Node Crash"]
-  NET_IN -.->|"FAILURE POINT 3: Response packet lost on wire"| ERR3["Lost Response"]
-  NODE_B -.->|"FAILURE POINT 4: Process frozen in GC pause"| ERR4["Process Pause"]
+  C["Client A<br/>Send request"]
+  NO["Outbound net"]
+  B[("Server B")]
+  NI["Inbound net"]
+  C -->|"Send"| NO
+  NO -->|"Arrive?"| B
+  B -->|"Process+reply"| NI
+  NI -->|"Return?"| C
+  NO -.->|"FAIL 1:<br/>Request lost"| E1["Lost request"]
+  B -.->|"FAIL 2:<br/>Crashed / GC-paused"| E2["Dead or paused"]
+  NI -.->|"FAIL 3:<br/>Reply lost/delayed"| E3["Lost reply"]
+  B -.->|"FAIL 4:<br/>Processed but reply queued"| E4["Slow reply"]
 ```
 
-- **Key Takeaway:** A network timeout indicates only that no response was received; it gives zero information regarding whether the remote server executed the mutation.
+- **Key Takeaway:** Timeout only says no reply; retry risks duplication.
 
 ---
 
-### Figure 9-2: Network Queueing at Switch Buffers
-- **Figure Reference:** `Figure 9-2: Multiple machines sending traffic to the same destination switch port cause queueing delays (reconstructed from text p. 331)`
-- **Original PDF:** Fig 9-2 → PDF p.378 — open the PDF at page 378 to compare with the Mermaid reconstruction below.
-- **Visual Flow & Description:** Shows 3 application nodes transmitting line-rate traffic into a top-of-rack network switch destined for a single storage node. The switch port buffer saturates, triggering packet drops and tail latency spikes.
+### Figure 9-2: Switch Queueing — Ports 1,2,4 → 3
+- **Figure Reference:** `Figure 9-2: Several machines sending to same destination fills switch queue`
+- **Original PDF:** Fig 9-2 → PDF p.378
 - **Mermaid Flowchart:**
 
 ```mermaid
 flowchart LR
-  S1["Sender 1 (10 Gbps)"]
-  S2["Sender 2 (10 Gbps)"]
-  S3["Sender 3 (10 Gbps)"]
-
-  subgraph SWITCH["Top-of-Rack Network Switch"]
+  S1["Port 1<br/>10 Gbps"]
+  S2["Port 2<br/>10 Gbps"]
+  S4["Port 4<br/>10 Gbps"]
+  subgraph SW["Top-of-Rack Switch"]
     direction TB
-    BUF["Switch Egress Buffer (Full)
-    [P1] [P2] [P3] [P4] [P5] ...
-    DROPPING PACKETS!"]
+    BUF["Egress to port 3 buffer<br/>[P1][P2][P3]... FULL<br/>Dropping!"]
   end
-
-  DEST[("Destination Storage Node (10 Gbps Ingress Port)")]
-
-  S1 --> SWITCH
-  S2 --> SWITCH
-  S3 --> SWITCH
-  SWITCH -->|"Saturated Link (10 Gbps Max)"| DEST
-
-  SWITCH -.->|"Bufferbloat: Queueing delay increases from 10us to 200ms!"| LATENCY["Tail Latency Spikes"]
+  D[("Port 3 dest<br/>10 Gbps")]
+  S1 --> SW
+  S2 --> SW
+  S4 --> SW
+  SW -->|"Saturated<br/>10 Gbps max"| D
+  SW -.->|"Bufferbloat:<br/>10µs → 200ms"| LAT["Tail spikes<br/>+ TCP backoff"]
 ```
 
-- **Key Takeaway:** Unbounded network delays are driven primarily by buffer queueing at operating system sockets and physical network switches under traffic bursts.
+- **Key Takeaway:** Bursts → queue → drop → retransmit delay; primary unbounded-delay source.
 
 ---
 
-### Figure 9-3: Clock Skew and the Failure of Last-Write-Wins (LWW)
-- **Figure Reference:** `Figure 9-3: Relying on timestamps for ordering events causes data loss when clocks drift (reconstructed from text p. 338)`
-- **Original PDF:** Fig 9-3 → PDF p.387 — open the PDF at page 387 to compare with the Mermaid reconstruction below.
-- **Visual Flow & Description:** Shows Client A writing $x=1$ on Node 1 (timestamp 42.004). Client B reads $x=1$ and updates $x=2$ on Node 2 (clock drifted back to 42.000). The database drops Client B's write because its timestamp is lower.
+### Figure 9-3: LWW Loses Causally-Later Write (42.004 vs 42.003)
+- **Figure Reference:** `Figure 9-3: Relying on timestamps for ordering causes loss`
+- **Original PDF:** Fig 9-3 → PDF p.387
 - **Mermaid Sequence Diagram:**
 
 ```mermaid
 sequenceDiagram
   autonumber
-  actor CA as Client A
-  participant N1 as Node 1 (Clock = 42.004s)
-  participant N2 as Node 2 (Clock = 42.000s - Skewed!)
-  actor CB as Client B
-
-  CA->>N1: 1. PUT x = 1
-  activate N1
-  N1->>N1: Assigns Timestamp: 42.004s
-  N1-->>CA: 200 OK
-  deactivate N1
-
-  N1->>N2: Replicate x=1 (ts=42.004s)
-  
-  CB->>N2: 2. GET x
-  N2-->>CB: Returns x = 1 (Observed!)
-
-  CB->>N2: 3. PUT x = 2 (Causally depends on x=1!)
-  activate N2
-  N2->>N2: Assigns local clock timestamp: 42.000s!
-  Note over N2: Compares timestamps: 42.000s < 42.004s
-  Note over N2: LWW RULE: 42.004s WINS! DISCARDS x = 2!
-  N2-->>CB: 200 OK (Write acknowledged, but DROPPED!)
-  deactivate N2
-
-  Note over N1,N2: SILENT DATA LOSS: x = 2 vanished due to 4ms clock skew!
+  actor A as Client A
+  participant N1 as Node 1 (clock 42.004)
+  participant N3 as Node 3 (clock 42.003)
+  actor B as Client B
+  A->>N1: PUT x=1
+  N1->>N1: ts=42.004
+  N1->>N3: Replicate x=1 ts 42.004
+  B->>N3: GET x → 1 (causal read!)
+  B->>N3: PUT x=2 (increment)
+  N3->>N3: ts=42.003 (slow clock!)
+  Note over N3: LWW: 42.004 > 42.003<br/>Keeps x=1, drops x=2!
+  N3->>N1: Replicate x=2 ts 42.003
+  Note over N1,N3: SILENT LOSS:<br/>Increment vanished<br/>3ms skew!
 ```
 
-- **Key Takeaway:** Last-Write-Wins turns microscopic clock drift into silent, irrecoverable causal data loss; physical wall-clock timestamps cannot order distributed events.
+- **Key Takeaway:** Wall-clock "recent" ≠ causal; need version vectors or HLC/TrueTime.
 
 ---
 
-### Figure 9-4: Distributed Lock Corruption via Process Pause (GC Pause)
-- **Figure Reference:** `Figure 9-4: An incorrect distributed lock: Client 1 pauses in GC, lease expires, Client 2 writes, Client 1 wakes up and corrupts (reconstructed from text p. 347)`
-- **Original PDF:** Fig 9-4 → PDF p.398 — open the PDF at page 398 to compare with the Mermaid reconstruction below.
-- **Visual Flow & Description:** Client 1 acquires a 10-second lease from ZooKeeper, then enters an unexpected 15-second GC pause. Client 2 acquires the expired lease and writes. Client 1 wakes up and overwrites Client 2's data.
+### Figure 9-4: Broken Lock — GC Pause (No Fencing)
+- **Figure Reference:** `Figure 9-4: Incorrect lock: client 1 pauses, lease expires, corrupts file`
+- **Original PDF:** Fig 9-4 → PDF p.398
 - **Mermaid Sequence Diagram:**
 
 ```mermaid
 sequenceDiagram
   autonumber
   actor C1 as Client 1
-  participant ZK as Lock Service (ZooKeeper)
-  participant Storage as Shared Storage (S3 / File)
+  participant ZK as Lock Service
+  participant ST as Storage File
   actor C2 as Client 2
-
-  C1->>ZK: 1. Acquire Lock (Lease=10s)
-  ZK-->>C1: Lock Granted (Lease expires at t=10s)
-  
-  Note over C1: JVM Stop-The-World GC Pause (15 seconds)!
-  Note over ZK: t=10s: Lease expires in ZooKeeper!
-
-  C2->>ZK: 2. Acquire Lock (Lease=10s)
-  ZK-->>C2: Lock Granted to Client 2!
-  C2->>Storage: 3. Write File X (Valid Lock)
-  Storage-->>C2: 200 OK
-
-  Note over C1: t=15s: GC finishes! Thread resumes!
-  Note over C1: Naively assumes lock is still valid!
-  C1->>Storage: 4. Write File X (UNAUTHORIZED!)
-  Storage-->>C1: 200 OK
-
-  Note over Storage: CATASTROPHIC CORRUPTION: Client 1 overwrote Client 2!
+  C1->>ZK: Acquire lease 10s
+  ZK-->>C1: Granted
+  Note over C1: STOP-THE-WORLD GC 15s!<br/>No heartbeats
+  Note over ZK: t=10s expires
+  C2->>ZK: Acquire lease
+  ZK-->>C2: Granted
+  C2->>ST: Write file (valid)
+  ST-->>C2: OK
+  Note over C1: GC ends t=15s<br/>Thinks valid!
+  C1->>ST: Write file (stale!)
+  ST-->>C1: OK (no check)
+  Note over ST: CORRUPTION:<br/>C1 clobbered C2!
 ```
 
-- **Key Takeaway:** Applications cannot verify their own temporal lease validity; code execution can be preempted for arbitrary durations between checking a lock and executing a write.
+- **Key Takeaway:** Lease check→use gap + pause = split-brain; storage must enforce.
 
 ---
 
-### Figure 9-6: Enforcing Correctness via Monotonic Fencing Tokens
-- **Figure Reference:** `Figure 9-6: Making access to storage safe by allowing writes only in the order of increasing fencing tokens (reconstructed from text p. 349)`
-- **Original PDF:** Fig 9-6 → PDF p.399 — open the PDF at page 399 to compare with the Mermaid reconstruction below.
-- **Visual Flow & Description:** Shows ZooKeeper assigning monotonically increasing tokens (33 and 34). Storage tracks the highest token seen. When Client 1 attempts to write with stale Token 33, storage rejects it.
+### Figure 9-5: Delayed Write After Crash — Same Corruption, No Pause
+- **Figure Reference:** `Figure 9-5: Delayed message from former leaseholder arrives after takeover`
+- **Original PDF:** Fig 9-5 → PDF p.398 (dashboard omits — added here; text p.374)
 - **Mermaid Sequence Diagram:**
 
 ```mermaid
 sequenceDiagram
   autonumber
   actor C1 as Client 1
-  participant ZK as Lock Service (ZooKeeper)
-  participant Storage as Storage Node (Tracks highest_token)
+  participant NET as Network (minute delay)
+  participant ZK as Lock Service
+  participant ST as Storage
   actor C2 as Client 2
-
-  C1->>ZK: 1. Acquire Lock
-  ZK-->>C1: Lock Granted + Fencing Token = 33
-  
-  Note over C1: Client 1 enters 20-second GC Pause!
-  Note over ZK: Lease expires in ZooKeeper
-
-  C2->>ZK: 2. Acquire Lock
-  ZK-->>C2: Lock Granted + Fencing Token = 34
-  
-  C2->>Storage: 3. PUT /data (Fencing Token = 34)
-  activate Storage
-  Note over Storage: highest_token was 0. 34 > 0 -> ACCEPT!
-  Note over Storage: Sets highest_token = 34
-  Storage-->>C2: 200 OK (Write Committed)
-  deactivate Storage
-
-  Note over C1: GC Pause ends; Client 1 resumes!
-  C1->>Storage: 4. PUT /data (Fencing Token = 33)
-  activate Storage
-  Note over Storage: Token 33 < highest_token (34)!
-  Storage-->>C1: 403 FORBIDDEN (Stale Fencing Token!)
-  deactivate Storage
-
-  Note over Storage: SUCCESS: Data protected from stale write!
+  C1->>NET: Write file (before crash)
+  Note over NET: Packet stuck<br/>60s delay!
+  Note over C1: Crashes!
+  Note over ZK: Lease times out
+  C2->>ZK: Acquire lease
+  ZK-->>C2: Granted
+  C2->>ST: Write file (valid)
+  ST-->>C2: OK
+  NET->>ST: Late C1 write arrives!
+  ST-->>NET: OK (no fencing)<br/>CORRUPTION!
+  Note over ST: STONITH would not help<br/>Need token check
 ```
 
-- **Key Takeaway:** Fencing tokens shift authorization enforcement to the storage service itself, converting timing bugs into deterministic rejection of stale tokens.
+- **Key Takeaway:** Even without pause, network delay alone breaks lease; fencing required (renumber check: 9-5 is delay case, 9-6 fix, 9-7 quorum fix).
 
 ---
 
-### Figure 9-7: Fencing Tokens in Leaderless Datastores
-- **Figure Reference:** `Figure 9-7: Using fencing tokens to protect writes in a leaderless replicated datastore (reconstructed from text p. 350)`
-- **Original PDF:** Fig 9-7 → PDF p.401 — open the PDF at page 401 to compare with the Mermaid reconstruction below.
-- **Visual Flow & Description:** Demonstrates packing fencing tokens into the most significant bits of Cassandra/Dynamo write timestamps. A write with Token 34 automatically overrides and rejects all writes tagged with Token 33.
+### Figure 9-6: Fencing Tokens Fix (33→34)
+- **Figure Reference:** `Figure 9-6: Making storage safe by increasing fencing tokens`
+- **Original PDF:** Fig 9-6 → PDF p.399
+- **Mermaid Sequence Diagram:**
+
+```mermaid
+sequenceDiagram
+  autonumber
+  actor C1 as Client 1
+  participant ZK as Lock Service
+  participant ST as Storage (max_token)
+  actor C2 as Client 2
+  C1->>ZK: Acquire
+  ZK-->>C1: Token 33
+  Note over C1: Pause/crash/delay
+  C2->>ZK: Acquire
+  ZK-->>C2: Token 34
+  C2->>ST: PUT + token 34
+  ST-->>C2: max 0→34 ACCEPT
+  C1->>ST: PUT + token 33
+  ST-->>C1: 33 ≤ 34 REJECT<br/>Zombie fenced!
+  Note over ST: New holder must write<br/>promptly to fence old
+```
+
+- **Key Takeaway:** Monotonic token + storage `max` check converts timing bug to deterministic reject. `zxid/cversion`, etcd `revision`, Hazelcast `FencedLock`, Chubby sequencer, Kafka/Raft epoch same idea.
+
+---
+
+### Figure 9-7: Fencing in Leaderless Quorums (High Bits)
+- **Figure Reference:** `Figure 9-7: Using fencing tokens to protect leaderless writes`
+- **Original PDF:** Fig 9-7 → PDF p.401
 - **Mermaid Flowchart:**
 
 ```mermaid
 flowchart TD
-  subgraph T33["Client 1 Write Format (Token 33)"]
+  subgraph W33["C1 token 33"]
     direction LR
-    B1["[ Fencing Token: 33 (32 bits) ]"]
-    B2["[ Physical Time: 1711000000 (32 bits) ]"]
-    B1 --- B2
+    H33["High 32b: 33"]
+    L33["Low 32b: phys time"]
+    H33 --- L33
   end
-
-  subgraph T34["Client 2 Write Format (Token 34)"]
+  subgraph W34["C2 token 34"]
     direction LR
-    C1["[ Fencing Token: 34 (32 bits) ]"]
-    C2["[ Physical Time: 1711000005 (32 bits) ]"]
-    C1 --- C2
+    H34["High 32b: 34"]
+    L34["Low 32b: phys time"]
+    H34 --- L34
   end
-
-  subgraph REPLICAS["Dynamo Replicas (Bitwise Timestamp Comparison)"]
+  subgraph RPL["Replicas 1,2,3 (LWW by 64b)"]
     direction TB
-    CMP["Compare 64-bit integer values:
-    Token 34 (0x00000022...) > Token 33 (0x00000021...)
-    Regardless of physical clock drift in lower 32 bits,
-    Token 34 ALWAYS WINS!"]
+    CMP["34xx > 33xx always<br/>Regardless of clock drift"]
   end
-
-  T33 --> REPLICAS
-  T34 --> REPLICAS
+  W33 --> RPL
+  W34 --> RPL
+  RPL -.->|"C2 misses R3<br/>C1 zombie hits R3<br/>Quorum read still picks C2<br/>Repair overwrites"| OK["Safe!"]
 ```
 
-- **Key Takeaway:** Embedding monotonic fencing tokens into high-order timestamp bits eliminates physical clock drift vulnerability in leaderless LWW stores.
+- **Key Takeaway:** Token in MSB makes new holder win even with clock skew and partial quorum.
 
 ---
 
 ## 4. Real-World Systems, Case Studies & Code Examples
 
-### 4.1 Industry Implementations & Architectural Divergence
-- **Google Spanner (TrueTime & Atomic Clocks):** Eliminates distributed time ambiguity by outfitting datacenters with GPS receivers and Rubidium atomic clocks. Provides the `TrueTime.now()` API returning $[t_{\text{earliest}}, t_{\text{latest}}]$ with bounded uncertainty ($\epsilon \le 7\ \text{ms}$). Enforces a $2\epsilon$ commit wait to guarantee external consistency (linearizability) globally.
-- **CockroachDB & YugabyteDB (Hybrid Logical Clocks - HLC):** Because standard cloud providers lack GPS/atomic clock hardware, CockroachDB implements Hybrid Logical Clocks (HLC). Combines physical time with Lamport logical counters. If clock drift between nodes exceeds a configured maximum (e.g., $500\ \text{ms}$), nodes crash themselves deliberately to prevent data corruption.
-- **Apache ZooKeeper & etcd (Linearizable Coordination & Fencing):** Use consensus (Zab in ZooKeeper, Raft in etcd) to maintain linearizable state. ZooKeeper assigns a monotonically increasing `zxid` to every state change, and provides a 64-bit `cversion` and sequential node counters that serve directly as production fencing tokens.
-- **Cassandra & Akka (Phi-Accrual Failure Detectors):** Instead of fragile static heartbeat timeouts, Cassandra implements the Hayashibara $\Phi$-accrual failure detector, continuously calculating failure probabilities based on network inter-arrival time distributions to adapt to transient network load.
+### 4.1 Industry Implementations
 
----
+- **Spanner TrueTime:** GPS+atomic per DC, `[earliest,latest]` ε≤7ms, 2ε commit-wait → external consistency globally; needs antenna monitoring (ε balloons on failure → stall).
+- **CockroachDB/YugabyteDB HLC:** NTP+Lamport hybrid; fail-fast if drift >500ms (deliberate crash to avoid poisoning); Yugabyte+ClockBound on AWS.
+- **ZooKeeper (Zab) / etcd (Raft):** Linearizable coordination, `zxid/cversion` or `revision` as fencing, ephemeral nodes + watches for membership; observers (non-voting) for stale-fast reads.
+- **Cassandra/Akka phi-accrual:** Adaptive suspicion from inter-arrival distribution, not static timeout; survives elastic/inter-DC jitter.
+- **MiFID II HFT:** 100µs UTC via PTP+GPS+monitoring — proof accuracy costs.
+- **Leap-smearing (Google/AWS):** spread leap second over 24h, avoid kernel futex meltdown (Reddit/LinkedIn/Qantas 2012).
+- **Jepsen/Elle/Chaos Monkey/DST:** Jepsen partitions/kills/corrupts ([Jepsen analyses]), Elle infers isolation anomalies from histories (Kingsbury-Alvaro VLDB), Chaos Monkey prod faults, FoundationDB Flow / TigerBeetle event-loop / FrostDB Go-patch / MadSim Tokio / Antithesis hypervisor for deterministic replay.
 
-### 4.2 Production Implementation: Phi-Accrual Failure Detector
+### 4.2 Production Implementation: Phi-Accrual Detector
 
 ```python
-import math
-import time
+import math, time
 from typing import List
-
-class PhiAccrualFailureDetector:
-    """
-    Production-grade Phi-Accrual Failure Detector matching Apache Cassandra.
-    Maintains a sliding window of heartbeat inter-arrival intervals and computes
-    phi = -log10(P_later(t - t_last)) assuming normal distribution.
-    """
-    def __init__(self, threshold: float = 8.0, window_size: int = 100):
-        self.threshold = threshold
-        self.window_size = window_size
-        self.intervals: List[float] = []
-        self.last_heartbeat_timestamp: float = time.time()
-
-    def record_heartbeat(self):
-        """Called when a heartbeat ping is received from the monitored node."""
-        now = time.time()
-        interval = now - self.last_heartbeat_timestamp
-        self.last_heartbeat_timestamp = now
-        
-        self.intervals.append(interval)
-        if len(self.intervals) > self.window_size:
-            self.intervals.pop(0)
-
-    def phi(self) -> float:
-        """Computes current suspicion level phi based on elapsed time since last ping."""
-        if len(self.intervals) < 2:
-            return 0.0  # Insufficient data to determine failure
-
-        now = time.time()
-        time_diff = now - self.last_heartbeat_timestamp
-        
-        # Calculate mean and standard deviation of historical intervals
-        mean = sum(self.intervals) / len(self.intervals)
-        variance = sum((x - mean) ** 2 for x in self.intervals) / len(self.intervals)
-        std_dev = math.sqrt(variance) if variance > 0 else 0.001
-
-        # Cumulative distribution function (CDF) for normal distribution
-        # y = (time_diff - mean) / std_dev
-        y = (time_diff - mean) / std_dev
-        # Error function approximation for P_later (probability of seeing delay >= time_diff)
-        e = math.exp(-y * (1.5976 + 0.070566 * (y ** 2))) if y > -3 else 1.0
-        p_later = e / (1.0 + e)
-        p_later = max(p_later, 1e-12)  # Avoid math domain error
-
-        return -math.log10(p_later)
-
-    def is_available(self) -> bool:
-        """Returns False if suspicion level breaches threshold (node presumed dead)."""
-        return self.phi() < self.threshold
+class PhiAccrual:
+    def __init__(self, threshold=8.0, window=100):
+        self.th=threshold; self.win=window; self.iv:List[float]=[]; self.last=time.time()
+    def heartbeat(self):
+        now=time.time(); self.iv.append(now-self.last); self.last=now
+        if len(self.iv)>self.win: self.iv.pop(0)
+    def phi(self)->float:
+        if len(self.iv)<2: return 0.0
+        diff=time.time()-self.last
+        mean=sum(self.iv)/len(self.iv)
+        var=sum((x-mean)**2 for x in self.iv)/len(self.iv)
+        sd=math.sqrt(var) if var>0 else 1e-3
+        y=(diff-mean)/sd
+        e=math.exp(-y*(1.5976+0.070566*y*y)) if y>-3 else 1.0
+        p=max(e/(1+e),1e-12)
+        return -math.log10(p)
+    def alive(self)->bool: return self.phi()<self.th
 ```
 
----
+Cassandra: Φ≥8 route elsewhere, Φ≥12 failover. TCP RTO same adaptive idea.
 
-### 4.3 Production Implementation: Monotonic Fencing Storage Target
+### 4.3 Production Implementation: Fenced Store + Quorum Vote
 
 ```python
 from typing import Dict, Any, Tuple
+class FencedStore:
+    def __init__(self): self.data:Dict[str,Any]={}; self.max_token=0
+    def put(self,key:str,val:Any,tok:int)->Tuple[bool,str]:
+        if tok<=self.max_token: return False, f"STALE {tok} ≤ {self.max_token}"
+        self.max_token=tok; self.data[key]=val; return True,"COMMITTED"
 
-class FencedStorageService:
-    """
-    Storage service that protects against zombie writers, delayed network packets,
-    and post-GC pause overwrites by validating monotonic fencing tokens.
-    """
-    def __init__(self):
-        self.data_store: Dict[str, Any] = {}
-        self.highest_token_seen: int = 0
-
-    def put(self, key: str, value: Any, fencing_token: int) -> Tuple[bool, str]:
-        """
-        Executes a write only if the provided fencing token is strictly greater
-        than any fencing token previously processed by this storage engine.
-        """
-        if fencing_token <= self.highest_token_seen:
-            # Stale writer detected! Reject mutation to prevent data corruption.
-            return False, (
-                f"REJECTED: Stale fencing token {fencing_token}. "
-                f"Storage has already committed mutations with token {self.highest_token_seen}."
-            )
-
-        # Token is valid and monotonic; commit write and update state
-        self.highest_token_seen = fencing_token
-        self.data_store[key] = value
-        return True, "COMMITTED"
+class Quorum:
+    @staticmethod
+    def majority(n:int)->int: return n//2+1
+    @staticmethod
+    def is_dead(votes:int,n:int)->bool: return votes>=n//2+1
+    # 3 nodes tolerate 1, 5 tolerate 2; overlapping majorities prevent split decisions
 ```
 
----
+Leaderless 64-bit stamp: `(token<<32)|phys_ms`; compare as int.
 
-### 4.4 Production War Story: The Leap Second Cluster Meltdown
-- **The Context:** On June 30, 2012, international time authorities scheduled a **Leap Second** at 23:59:59 UTC to keep astronomical time aligned with atomic clocks. Across the tech industry, major web services operated large Java and Python clusters on Linux running NTP daemon synchronization.
-- **The Incident:** When 23:59:60 occurred, the standard Linux kernel received the leap second notification from NTP. Because POSIX standards mandate that time cannot represent 60 seconds in a minute, the Linux kernel handled the leap second by abruptly **stepping the system clock backward by 1 second** (`23:59:59` repeated twice).
-- **The Cascade:** 
-  - In Java applications, threads sleeping on `futex` system calls or high-resolution timers (`LockSupport.parkNanos()`) were scheduled to awaken at a specific absolute timestamp.
-  - When the kernel clock stepped backward by 1 second, the kernel calculated that the timer deadline was now in the past. Due to a critical bug in the Linux kernel timer subsystem (specifically `hrtimer`), the kernel entered an infinite busy-wait loop attempting to process the expired timer.
-- **The Disaster:** Within seconds of the clock jump, every CPU core across thousands of Linux servers spiked to $100\%$ utilization in kernel space. Cassandra nodes, Elasticsearch clusters, Hadoop workers, and MySQL databases stopped processing queries. In-flight transactions timed out, load balancers marked entire clusters dead, and major global platforms (including Reddit, LinkedIn, and Qantas Airlines) suffered catastrophic multi-hour outages.
-- **Remediation & Architecture Lessons:**
-  1. *NTP Leap Smearing:* Google and AWS introduced **Leap Smearing**: instead of stepping the clock by 1 full second at midnight, NTP servers slowly accelerate or decelerate clock ticks by tiny fractions (a few microseconds per second) across a 24-hour window, making the leap second completely invisible to operating systems and application runtimes.
-  2. *Ban Time-of-Day Clocks for Internal Logic:* Enforced strict architectural rules that all timers, thread sleeps, and deadline calculations must use `CLOCK_MONOTONIC`.
+### 4.4 TLA+ Snippet (Fencing Safety) & Jepsen Sketch
+
+```tla
+---- MODULE Fencing ----
+VARIABLES maxToken, granted
+TypeOK == maxToken \in Nat
+Safety == \A w1,w2 \in Writes: Committed(w1) /\ Committed(w2) /\ w1#w2 => Token(w1)#Token(w2)
+Monotonic == \A r1,r2 \in Grants: CompletesBefore(r1,r2) => Token(r1)<Token(r2)
+====
+```
+
+Jepsen (Clojure): `nemesis partition-random-halves`, `checker linearizable`, `workload cas-register`; Elle: infer `read-skew/lost-update` from observed histories without code access. DST: mock clock/net, explore interleavings, replay seed on failure.
+
+### 4.5 Production War Story: Leap-Second Meltdown (2012-06-30 23:59:60)
+
+POSIX can't represent :60 → kernel stepped back 1s → Java `parkNanos`/futex deadline in past → `hrtimer` busy-loop → all cores 100% kernel → Cassandra/ES/Hadoop/MySQL stall → LBs marked dead (Reddit/LinkedIn/Qantas hours). Fix: leap smearing + `CLOCK_MONOTONIC` for all timers/sleeps/deadlines; monitor NTP offset.
 
 ---
 
 ## 5. Architectural Trade-Off Matrix
 
-| System Component / Technique | Primary Advantage | Primary Vulnerability / Hazard | Clock Sensitivity | Network Delay Sensitivity | Best Workload Fit | Catastrophic Failure Mode |
-| :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- |
-| **NTP Wall-Clock Synchronization** | Familiar calendar timestamps; universal OS support | 10--100 ms drift; sudden backwards clock jumps | **Extreme** (Subject to leap seconds and network jitter) | Moderate (Asymmetric network delay skews clock offsets) | Human logging; metric display; coarse data retention TTL | Last-Write-Wins (LWW) silently discards causally newer writes |
-| **Google TrueTime API (Spanner)** | Bounds clock uncertainty $\epsilon \le 7\ \text{ms}$; linearizable commit wait | Proprietary hardware dependency; $2\epsilon$ latency penalty per write | High (Hardware-assisted: GPS + Rubidium atomic clocks) | Minimal (Atomic clocks tick accurately during network disconnects) | Global mission-critical Distributed SQL; financial ledgers | Hardware antenna failure on GPS receivers causes $\epsilon$ to balloon, stalling writes |
-| **Hybrid Logical Clocks (HLC)** | Zero specialized hardware; tracks causality and physical time | Nodes must abort/crash if clock drift exceeds max bound | Moderate (Combines NTP with Lamport logical counters) | Low | Multi-region Distributed SQL (CockroachDB, YugabyteDB) | Node with massive physical clock drift poisons all connected nodes |
-| **Static Heartbeat Timeouts** | Simplest failure detection; trivial configuration | High false positive rate under bursty network or GC pauses | Minimal | **Extreme** (Transient network congestion triggers false failovers) | Predictable, low-latency private LAN clusters | Cascading leader re-elections and split-brain promotions |
-| **Phi-Accrual Failure Detector** | Adapts dynamically to changing network distributions; low false positives | Requires sliding window memory; warmup phase on boot | Minimal | Low (Calculates statistical delay probabilities) | Elastic cloud clusters; inter-datacenter links (Cassandra) | Sudden pathological network disconnect takes time to build high $\Phi$ score |
-| **Monotonic Fencing Tokens** | 100% protection against zombie writers and GC pauses | Requires storage service cooperation to validate tokens | **Zero** (Completely independent of physical time) | **Zero** (Delayed network packets rejected by storage) | Distributed locking; master lease renewal; leader election | Storage engine failing to check token allows zombie write through |
+| Technique | Advantage | Hazard | Clock | Net sensitive? | Fit | Catastrophe |
+| :--- | :--- | :--- | :--- | :--- | :--- | :--- |
+| **NTP wall** | Calendar, ubiquitous | 10–100ms drift, jumps | Extreme | Moderate (asymmetric skews) | Logs, TTL display | LWW drops newer |
+| **Monotonic** | Never back, µs | Local only | Zero cross-node | Zero | Timeouts, p99 | Cross-node ordering nonsense |
+| **TrueTime** | ε≤7ms linearizable wait | HW + 2ε latency | HW GPS/atomic | Minimal | Global ledgers | Antenna fail → stall |
+| **HLC** | No HW, causal+phys | Crash if drift>bound | Moderate | Low | Cockroach multi-region | Bad clock poisons all |
+| **Static timeout** | Simple | False positives | Minimal | Extreme | Stable LAN | Split-brain flapping |
+| **Phi-accrual** | Adaptive, low FP | Window+warmup | Minimal | Low | Elastic/WD (Cassandra) | Slow ramp on hard cut |
+| **Fencing token** | Zombie-proof | Needs store check | Zero | Zero | Locks/leader | Missing check = corrupt |
+| **Majority quorum** | One decision, F=(N-1)/2 | Minority halts | Zero | Needs partial sync | Election/commit | 4 nodes = 3-node tolerance, more failure surface |
+| **TLA+/Jepsen/DST** | Finds deep bugs pre-prod | Spec-drift, harness cost | Mocked | Controlled | Infra | Untested path → outage |
 
----
-
-### Concrete Decision Heuristics
+Odd nodes only (3/5/7): 4 needs 3 same as 3 but higher failure prob.
 
 ```text
-Decision Tree for Distributed Correctness & Timing:
-1. Does the distributed algorithm require establishing a causal or linearizable order of events?
-   ├── Can you deploy dedicated atomic clocks and GPS receivers in every datacenter?
-   │    └── YES: Use TrueTime with linearizable commit-wait (Google Spanner model).
-   └── NO (Standard public cloud VMs: AWS, GCP, Azure):
-        ├── Is physical time required, or is logical causality sufficient?
-        │    ├── Physical Time Required: Use Hybrid Logical Clocks (HLC) with strict drift bounds (fail-fast if drift > 500ms).
-        │    └── Logical Causality Sufficient: Use Vector Clocks, Lamport Timestamps, or Raft Epochs/Terms.
-2. For Distributed Locking & Leases:
-   ├── CRITICAL INVARIANT: NEVER trust a local process lease check!
-   └── MANDATORY ARCHITECTURE: Always acquire a strictly monotonic Fencing Token from the lock service (ZooKeeper / etcd),
-       and pass the token to the storage service on every mutation. The storage service MUST reject tokens <= highest_token_seen.
+Decision Tree:
+1. Order needed? GPS/atomic feasible? → YES TrueTime+2ε. NO → phys needed? HLC+drift-crash : Lamport/vector/Raft-term.
+2. Lock/lease? NEVER trust local check! → ZK/etcd token + store max check on every mutation. Single conditional store may replace lock service.
+3. Failure detect? Static only on predictable LAN; else phi-accrual. Failover must STONITH/fence old primary before promote.
 ```
 
 ---
 
 ## 6. Jargon Buster & Key Terminology
 
-- **Partial Failure:** A characteristic condition of distributed systems where some software or hardware components fail while other components continue operating, without the system being able to deterministically identify the failure.
-- **Fail-Stop:** A hardware or process model where a component operates strictly correctly until it encounters a failure, after which it halts execution permanently and visibly.
-- **Time-of-Day Clock (Wall Clock):** A clock that measures elapsed time since a fixed historical epoch (e.g., UTC Jan 1, 1970), synchronized via NTP, and susceptible to sudden jumps backward or forward.
-- **Monotonic Clock:** An operating system clock that strictly advances forward at a constant rate, never jumping backward, designed specifically for measuring durations and timeouts on a local machine.
-- **Clock Drift:** The gradual divergence of a physical quartz clock oscillator from true physical time due to temperature variations, hardware age, and vibration.
-- **TrueTime:** Google Spanner's proprietary time API that returns an explicit confidence interval $[t_{\text{earliest}}, t_{\text{latest}}]$ guaranteed to contain true physical time, backed by atomic clocks and GPS receivers.
-- **Process Pause (Stop-The-World):** An involuntary suspension of an application process's execution threads caused by garbage collection, hypervisor scheduling, or memory swapping.
-- **Fencing Token:** A strictly monotonically increasing integer counter issued by a distributed coordination service alongside a lock grant, used by storage targets to reject requests from expired zombie leaseholders.
-- **Phi-Accrual Failure Detector:** An adaptive failure detector that calculates a continuous suspicion metric ($\Phi$) from historical heartbeat inter-arrival distributions, avoiding fragile static timeouts.
-- **Byzantine Fault:** A failure mode where a node exhibits arbitrary, erratic, or malicious behavior—transmitting forged messages, corrupting state, or lying about its execution.
-- **Partially Synchronous Model:** A distributed system timing model that assumes the system behaves synchronously most of the time, but allows for unpredictable periods of unbounded network delay and process pauses.
+- **Partial Failure:** Some parts broken, rest fine, nondeterministic; defining distributed trait.
+- **Fail-Stop / Crash-Stop / Crash-Recovery / Limping (gray/fail-slow):** Never returns / returns with disk / slow-but-alive (1Kb NIC, GC-bound, worn SSD).
+- **Wall vs Monotonic clock:** Calendar wall clock (jumps) vs monotonic clock stopwatch (forward, local); never use wall for elapsed, never compare a monotonic clock across nodes.
+- **Monotonic clock API:** A monotonic clock is `CLOCK_MONOTONIC/BOOTTIME`, `System.nanoTime`, `time.monotonic`; reading a monotonic clock twice gives elapsed time immune to NTP steps and leap jumps.
+- **Monotonic clock slew:** NTP may slew a monotonic clock rate ±0.05% but never steps a monotonic clock; wall steps while a monotonic clock only changes frequency.
+- **Monotonic clock limit:** A monotonic clock is meaningless cross-node (different epochs); ordering across nodes needs wall+confidence or logical clocks, not a monotonic clock comparison.
+- **Monotonic clock rule:** Every timeout, deadline, and p99 measurement must use a monotonic clock; every timestamp shown to humans may use wall.
+- **Asynchronous network:** An asynchronous network offers no bounded delay — packets arrive whenever capacity allows; all cloud/internet paths are an asynchronous network, so timeouts must be measured not specified.
+- **Asynchronous network detector:** Failure detection on an asynchronous network needs adaptive phi-accrual, not a fixed timeout, because an asynchronous network conflates slow with dead.
+- **Drift/Skew/Slew/Smear:** Rate error / offset between nodes / gradual rate adjust / spread leap over day.
+- **TrueTime/ClockBound/HLC:** Interval clock / AWS interval / phys+Lamport hybrid.
+- **Sender's Dilemma / Timeout / Phi (Φ):** Can't distinguish loss/dead/delay on an asynchronous network; only sure detector; `-log10(P_later)` suspicion.
+- **Circuit vs Packet / Bufferbloat / Noisy Neighbour:** Reserved synchronous vs contention asynchronous network; queue delay explosion; shared-tenant interference.
+- **Process pause / Steal Time / Thrashing:** A process pause from GC/hypervisor/swap freeze; other-VM CPU causes a process pause; paging collapse is a prolonged process pause.
+- **Process pause lease rule:** A process pause can outlive any lease — never trust a pre-process-pause lease check; every mutation after a possible process pause must be fenced.
+- **Lease / Zombie / Fencing Token / STONITH:** Timed lock / unaware ex-holder after a process pause / monotonic grant number / shoot-to-fence (insufficient alone against a process pause or delay).
+- **Quorum / Majority:** Votes to reduce single-node trust; >½ gives one decision.
+- **Byzantine / Generals:** Arbitrary lying; agreement with traitors; needs >⅔ honest, costly.
+- **Sync / Partial-Sync / Async:** Bounded / mostly-bounded / no timing.
+- **Safety ("nothing bad", point violation) vs Liveness ("eventually good", hopeful):** Uniqueness vs availability; safety always, liveness caveated.
+- **TLA+/Model Checking / Jepsen / Elle / Fault Injection / DST / Determinism:** Spec exhaustive search / partition fault framework / isolation inference / prod chaos / mock-order replay / remove nondeterminism to simplify.
 
 ---
 
 ## 7. System Design & Practical Engineering Takeaways
 
 ### 7.1 Production Engineering Checklist
-1. **Never Use `System.currentTimeMillis()` for Timeouts or Benchmarks:** Always use monotonic clocks (`System.nanoTime()` in Java, `time.monotonic()` in Python, `CLOCK_MONOTONIC` in C/Go) to calculate timeouts and elapsed execution latencies.
-2. **Implement Fencing Tokens on Every Distributed Lock Target:** Never assume an acquired distributed lock (Redis Redlock, ZooKeeper znode) protects storage. Storage systems must validate an incrementing fencing token on every write to block zombie processes post-GC.
-3. **Configure NTP with Leap Smearing:** Configure internal NTP servers across all cluster nodes to smear leap seconds across 24 hours, preventing abrupt 1-second backward clock steps that crash JVM and Linux kernel timer loops.
-4. **Tune Garbage Collection to Bound STW Pauses Below Lock Timeouts:** If using distributed leases with a 10-second expiration, tune your JVM garbage collector (e.g., ZGC or Shenandoah) to guarantee maximum Stop-the-World pauses remain $< 50\ \text{ms}$. A single 12-second pause breaks lease validity.
-5. **Always Use Odd Node Counts for Consensus Clusters:** Deploy consensus groups (ZooKeeper, Raft, etcd) with odd node counts ($3, 5, \text{or } 7$). A 4-node cluster requires 3 nodes for a majority, offering the exact same fault tolerance as a 3-node cluster ($F=1$) while doubling failure probability.
-
----
+1. **Monotonic clock for durations:** `nanoTime/monotonic/CLOCK_MONOTONIC` monotonic clock for timeouts/latency; wall only for display/TTL with UTC; never compute elapsed with wall, always with a monotonic clock.
+2. **Fence every lock target:** ZK `zxid`/etcd `revision` → `PUT key,val,token`, reject `≤max`; new holder writes promptly; S3 conditional writes for leader election.
+3. **Smear + monitor NTP:** Internal smearing NTP, alert offset>100ms, evict far-drifters; PTP/GPS where MiFID-like needs.
+4. **Bound pauses below leases:** ZGC/Shenandoah <50ms if lease 10s; drain-before-GC/rolling restarts; disable swap on servers; handle SIGSTOP drills.
+5. **Odd quorums + STONITH:** 3/5/7 voters, observers for scale; power-off/isolate old primary before promote; `min-replicas-to-write` guards.
 
 ### 7.2 System Design Interview Strategy
-- **Demonstrate Distributed Realism:** When asked to design a distributed cache or master election, never say *"The master checks its lease and writes."* Immediately call out: *"Because of GC pauses and network delays, a master cannot know if its lease expired. We must implement monotonic fencing tokens generated by etcd/ZooKeeper, and validate them at the storage layer."*
-- **Attack Last-Write-Wins (LWW):** If an interviewer suggests using physical timestamps to resolve conflicts in Cassandra or Dynamo, explain the fatal flaw: *"Physical clocks drift by 10--100 ms under NTP. LWW with wall clocks silently overwrites causally newer writes. We should either use Hybrid Logical Clocks or preserve siblings via version vectors."*
-- **Capacity Sketching for Heartbeat Failure Detectors:**
-  $$\text{Heartbeat Bandwidth} = \frac{\text{Cluster Nodes} \times (\text{Cluster Nodes} - 1) \times \text{Ping Packet Bytes}}{\text{Heartbeat Interval (sec)}}$$
-  $$\text{False Failover Risk} = 1 - (1 - P(\text{transient delay} > \text{timeout}))^{\text{Total Nodes}}$$
-
----
+- Start: "Dead vs slow indistinguishable on an asynchronous network → timeouts + quorum + fencing with a monotonic clock for measurement, not wall time." Redlock critique: validity−elapsed−drift fails on process pause/jump, no store token → unsafe; fix with consensus + fencing.
+- Kill LWW: "10–100ms drift → newer dropped; use HLC/vector/siblings or linearizable CAS."
+- Sketch: `HeartbeatBW=N(N-1)B/interval`; `P(false)=1-(1-P(delay>timeout))^N`; `F=(N-1)/2`; Spanner London example 140ms central 2PL vs 82ms local-Paxos+12ms 2ε (41% cut).
 
 ### 7.3 Mastery Self-Assessment Questions
 
 #### Question 1 (Conceptual Depth)
-*Why is the Redlock algorithm (distributed locking over multiple independent Redis instances) considered vulnerable to safety violations in partially synchronous networks without hardware fencing tokens?*
-- **Answer:** 
-  The Redlock algorithm attempts to implement a distributed lock over $N$ independent Redis nodes without a consensus algorithm (like Raft or Paxos). A client acquires the lock by requesting it from all $N$ nodes sequentially. If it acquires a majority within a timeout, it calculates the remaining validity time:
-  $$\text{Validity Time} = \text{Initial Lease Duration} - \text{Elapsed Acquisition Time} - \text{Clock Drift}$$
-  This algorithm fails under real-world conditions (as famously analyzed by Martin Kleppmann) because it relies on **synchronous timing assumptions**:
-  1. *Unbounded Process Pauses:* A client can acquire the lock, verify its validity time, and immediately enter an unexpected 15-second GC pause or OS thread preemption. During the pause, the lease expires across the Redis nodes. Another client acquires the lock and begins mutating shared storage. When the first client wakes up, its local variables tell it the lock is valid, and it issues a concurrent write to storage, corrupting data.
-  2. *Unbounded Clock Jumps:* If one of the independent Redis nodes experiences an NTP clock jump forward (or an operator steps the clock), its local lease expires prematurely, allowing a second client to acquire the lock while the first client is still executing within its promised validity window.
-  3. *Lack of Fencing Tokens:* Redis simply returns a boolean success or random string. It does **not** generate a strictly monotonically increasing fencing token that storage can validate. Without storage-side fencing token enforcement, no distributed locking protocol can guarantee mutual exclusion against zombie writers.
+*Why is Redlock unsafe in partial-sync without fencing?*
+- **Answer:** Sequential majority in N independents, `validity=lease−elapsed−drift`. Pause after validating (15s GC) → expiry → other acquires → both write (local var stale). Clock jump expires early. No monotonic token storage can check → zombie writes through. Needs Raft/Zab + store `max` enforcement.
 
-#### Question 2 (Failure Scenario & Edge Cases)
-*An engineering team implements an active-passive PostgreSQL cluster with automated failover managed by a Python daemon. The daemon pings the primary master every 1 second over the corporate LAN. If 3 consecutive pings fail (timeout = 3 seconds), the daemon initiates an API call to promote the passive standby to primary. During a database backup, the primary host initiates an aggressive memory page writeback, causing the Linux kernel to stall all application I/O and network processing for 4.2 seconds. Analyze the chain of failures that occurs.*
-- **Answer:**
-  - *Chain of Failure Events:*
-    1. *Transient Kernel Stall:* The 4.2-second memory writeback freeze prevents the primary host's kernel from processing incoming network packets.
-    2. *False Failure Detection:* The monitoring daemon sends pings at seconds 1, 2, and 3. All three pings time out because the host is stalled. The daemon reaches its 3-second threshold and presumes the primary master is dead.
-    3. *Split-Brain Leader Promotion:* The daemon issues an automated promotion command to the passive standby. The standby replays its remaining WAL and opens its port for read-write client transactions as the new primary.
-    4. *Incumbent Recovery:* At second 4.3, the original primary's kernel stall ends. The primary is completely unaware that it was declared dead. Its local PostgreSQL process continues running normally.
-    5. *Dual Write Disaster:* Clients with cached DNS records or existing connection pools continue submitting write transactions to the old primary, while clients obtaining new DNS records submit write transactions to the new primary.
-    6. *Permanent Divergence:* Both database instances commit disjoint transactions, issuing identical primary keys to different records. When the split-brain is discovered, the WAL streams cannot be reconciled, forcing the engineering team to halt the business and manually audit divergent data.
-  - *Architectural Lessons:*
-    - A 3-second static timeout on commodity networks is dangerously aggressive and guarantees false positives.
-    - Automated failover must enforce **STONITH (fencing)**: the orchestrator must forcefully power off or isolate the old primary before promoting the standby.
+#### Question 2 (Failure Scenario)
+*1s ping, 3 misses → promote standby; 4.2s page-writeback stall. Chain?*
+- **Answer:** Stall → 3 timeouts → false dead → promote → original unaware (no clock notice) → dual primaries (DNS/pool split) → divergent PKs/WAL irreconcilable → halt+audit. Lessons: 3s too aggressive, need phi-accrual, STONITH old primary, `synchronous_commit` + fencing.
 
-#### Question 3 (Trade-Off & Capacity Estimation)
-*A globally distributed database cluster spans 3 datacenters: New York, London, and Tokyo. The network round-trip times (RTT) are: NY--London = 70 ms, London--Tokyo = 150 ms, NY--Tokyo = 180 ms. An architect must choose between two distributed commit strategies for a multi-region serializable banking service: (A) A centralized leader in New York executing Two-Phase Locking (2PL) requiring synchronous replication to a majority (NY + London), vs. (B) Google Spanner's TrueTime architecture with local consensus and a commit wait duration of $2\epsilon$, where $\epsilon = 6\ \text{ms}$. Calculate the minimum latency penalty imposed on a transaction originating in London under both approaches. Show exact step-by-step network round-trips.*
-- **Answer:**
-  - *Scenario A: Centralized Leader in New York with 2PL*
-    - The transaction originates from a client in **London**.
-    - The centralized primary leader is located in **New York**.
-    - *Step 1 (Client to Leader):* London client transmits transaction commands (`BEGIN`, `UPDATE`, `COMMIT`) to New York leader.
-      $$\text{Hop 1 (London } \to \text{ NY)} = \frac{70\ \text{ms RTT}}{2} = 35\ \text{ms}$$
-    - *Step 2 (Leader Synchronous Replication):* To achieve durability and lock consensus across a majority, the New York leader must replicate the write to a majority of nodes (itself + London).
-      $$\text{Replication RTT (NY } \to \text{ London } \to \text{ NY)} = \mathbf{70\ \text{ms}}$$
-    - *Step 3 (Leader to Client Ack):* New York leader acknowledges the commit back to the London client.
-      $$\text{Hop 3 (NY } \to \text{ London)} = \frac{70\ \text{ms RTT}}{2} = 35\ \text{ms}$$
-    - *Total Minimum Latency for Approach A:*
-      $$\text{Total Latency}_A = 35\ \text{ms} + 70\ \text{ms} + 35\ \text{ms} = \mathbf{140\ \text{ms}}$$
-      (Assuming zero lock contention and a single round-trip batched transaction).
-  - *Scenario B: Google Spanner TrueTime Model*
-    - In Spanner, each shard (split) runs an independent Paxos consensus group. The leader for the European customer's account shard is hosted locally in **London**.
-    - *Step 1 (Client to Local Leader):* London client connects to local London leader.
-      $$\text{Latency} \approx 0\ \text{ms} \ (<1\ \text{ms in local region})$$
-    - *Step 2 (Paxos Consensus across Majority):* The London leader executes Paxos across a majority of replicas (e.g., London + New York).
-      $$\text{Paxos Round-Trip (London } \to \text{ NY } \to \text{ London)} = \mathbf{70\ \text{ms}}$$
-    - *Step 3 (TrueTime Commit Wait):* To guarantee external consistency (linearizability) without global lock coordination, the leader must wait out the physical clock uncertainty interval ($2\epsilon$):
-      $$\text{Wait Duration} = 2 \times \epsilon = 2 \times 6\ \text{ms} = \mathbf{12\ \text{ms}}$$
-    - *Step 4 (Acknowledge Local Client):* Local client in London is acknowledged.
-      $$\text{Latency} \approx 0\ \text{ms}$$
-    - *Total Minimum Latency for Approach B:*
-      $$\text{Total Latency}_B = 70\ \text{ms (Paxos RTT)} + 12\ \text{ms (TrueTime Wait)} = \mathbf{82\ \text{ms}}$$
-  - *Quantitative Comparison:*
-    - Approach A: **140 ms** (severely degraded by client-to-leader WAN hops).
-    - Approach B: **82 ms** (a **$41.4\%$ latency reduction**).
-    - Spanner's localized leaders combined with TrueTime commit-wait eliminate cross-oceanic client routing hops while maintaining absolute linearizable serializability.
-
+#### Question 3 (Capacity)
+*NY-London 70ms, London-Tokyo 150ms, NY-Tokyo 180ms. London txn: (A) NY leader 2PL majority NY+London vs (B) Spanner local London + Paxos + 2ε ε=6ms.*
+- **Answer:** A: London→NY 35ms + NY↔London 70ms + NY→London 35ms = **140ms**. B: local ~0 + London↔NY Paxos 70ms + 12ms wait = **82ms** (41.4% less). Local leaders avoid WAN hops while linearizable.
 
 ---
 > [!NAV] **Chapter Navigation**
