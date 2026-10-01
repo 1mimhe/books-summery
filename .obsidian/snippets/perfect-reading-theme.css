@@ -46,6 +46,28 @@
   --text-accent-hover: var(--reading-accent-lavender);
   --interactive-accent: var(--reading-accent-blue);
   --hr-color: var(--reading-border-subtle);
+
+  /* Mermaid Native Obsidian Variables (Dark) */
+  --mermaid-font-family: 'Plus Jakarta Sans', 'Vazirmatn', -apple-system, BlinkMacSystemFont, sans-serif;
+  --mermaid-bg: #181924;
+  --mermaid-edge: #94a3b8;
+  --mermaid-edge-text: #f1f5f9;
+  --mermaid-edge-bg: #141622;
+  --mermaid-node-bg: #222638;
+  --mermaid-node-border: #7aa2f7;
+  --mermaid-node-text: #f8fafc;
+  --mermaid-cluster-bg: rgba(138, 173, 244, 0.06);
+  --mermaid-cluster-border: rgba(138, 173, 244, 0.45);
+  --mermaid-label-bg: #141622;
+  --mermaid-label-text: #f1f5f9;
+  --mermaid-actor-bg: #222638;
+  --mermaid-actor-border: #7aa2f7;
+  --mermaid-actor-text: #f8fafc;
+  --mermaid-note-bg: #2e2619;
+  --mermaid-note-border: #d97706;
+  --mermaid-note-text: #fef08a;
+  --mermaid-activation-bg: #333a56;
+  --mermaid-activation-border: #7aa2f7;
 }
 
 /* LIGHT MODE: Warm paper, soft charcoal, muted accents */
@@ -83,6 +105,28 @@
   --text-accent-hover: var(--reading-accent-lavender);
   --interactive-accent: var(--reading-accent-blue);
   --hr-color: var(--reading-border-subtle);
+
+  /* Mermaid Native Obsidian Variables (Light) */
+  --mermaid-font-family: 'Plus Jakarta Sans', 'Vazirmatn', -apple-system, BlinkMacSystemFont, sans-serif;
+  --mermaid-bg: #f8fafc;
+  --mermaid-edge: #475569;
+  --mermaid-edge-text: #0f172a;
+  --mermaid-edge-bg: #ffffff;
+  --mermaid-node-bg: #ffffff;
+  --mermaid-node-border: #2563eb;
+  --mermaid-node-text: #0f172a;
+  --mermaid-cluster-bg: rgba(37, 99, 235, 0.04);
+  --mermaid-cluster-border: rgba(37, 99, 235, 0.35);
+  --mermaid-label-bg: #ffffff;
+  --mermaid-label-text: #0f172a;
+  --mermaid-actor-bg: #ffffff;
+  --mermaid-actor-border: #2563eb;
+  --mermaid-actor-text: #0f172a;
+  --mermaid-note-bg: #fef9c3;
+  --mermaid-note-border: #ca8a04;
+  --mermaid-note-text: #713f12;
+  --mermaid-activation-bg: #dbeafe;
+  --mermaid-activation-border: #2563eb;
 }
 
 /* --------------------------------------------------------------------------
@@ -367,17 +411,20 @@
 }
 
 /* --------------------------------------------------------------------------
-   7. MERMAID FIGURES: READABLE IN DARK + LIGHT (fixes black/yellow boxes)
-   Why: Mermaid ships its own dark palette (near-black clusters, dim text,
-   black edge-label chips) that clashes with our calm theme and clips long
-   subgraph titles. These overrides force matching surfaces + real contrast.
+/* --------------------------------------------------------------------------
+   7. MERMAID FIGURES: HIGH CONTRAST & LEGIBILITY (DARK + LIGHT MODES)
+   Guarantees:
+   - High contrast text on all nodes, clusters, edge labels, and notes.
+   - Distinct translucent subgraphs (clusters) that never overpower inner nodes.
+   - Solid pill backgrounds for edge labels so arrows never cross through text.
+   - Pure readability in both dark and light modes (zero dark-on-dark, zero light-on-light).
    -------------------------------------------------------------------------- */
 
 .mermaid {
-  background: var(--reading-bg-secondary) !important;
+  background: var(--mermaid-bg, var(--reading-bg-secondary)) !important;
   border: 1px solid var(--reading-border-subtle) !important;
-  border-radius: 10px !important;
-  padding: 1.4rem 1rem !important;
+  border-radius: 12px !important;
+  padding: 1.5rem 1rem !important;
   margin: 1.8rem 0 !important;
   box-shadow: none !important;
   display: block !important;
@@ -389,223 +436,360 @@
   max-width: 100% !important;
   height: auto !important;
   min-width: min(480px, 100%);
-  font-family: 'Plus Jakarta Sans', 'Vazirmatn', sans-serif !important;
+  font-family: var(--mermaid-font-family, 'Plus Jakarta Sans', 'Vazirmatn', sans-serif) !important;
 }
 
-/* --- Shared: arrows, markers, wrapping -------------------------------- */
-.mermaid svg .flowchart-link,
-.mermaid svg .edgePaths path,
-.mermaid svg .messageLine,
-.mermaid svg .transition {
-  stroke-width: 1.6px !important;
-}
-.mermaid svg .marker path,
-.mermaid svg marker path {
-  stroke: none !important;
-}
+/* --- Shared: typography, wrapping, paths ------------------------------- */
+/* Tight typography inside Mermaid nodes so text NEVER overflows or clips */
+.mermaid p,
+.mermaid svg foreignObject p,
 .mermaid svg foreignObject div,
+.mermaid svg foreignObject span,
 .mermaid svg .nodeLabel,
-.mermaid svg .edgeLabel span,
-.mermaid svg .cluster span {
+.mermaid svg .label,
+.mermaid svg text,
+.mermaid svg tspan {
+  margin: 0 !important;
+  margin-block-start: 0 !important;
+  margin-block-end: 0 !important;
+  padding: 0 !important;
+  font-size: 13.5px !important;
+  line-height: 1.32 !important;
+  letter-spacing: 0.01em !important;
   white-space: normal !important;
   overflow-wrap: anywhere !important;
   word-break: break-word !important;
   text-align: center !important;
-  line-height: 1.45 !important;
-}
-.mermaid svg .cluster div {
-  max-width: 240px !important;
-  margin: 0 auto !important;
 }
 
-/* --- DARK: every label light, every surface midnight-matched -------------
-   Rule 1 (hard guarantee): ALL text inside any diagram is light.
-   Rule 2: shapes get distinguishable slate fills (beats inline `style=`
-   statements and Mermaid's own black/yellow defaults via !important). */
-.theme-dark .mermaid svg text,
-.theme-dark .mermaid svg tspan,
-.theme-dark .mermaid svg foreignObject,
-.theme-dark .mermaid svg foreignObject div,
-.theme-dark .mermaid svg foreignObject span,
-.theme-dark .mermaid svg foreignObject p {
-  fill: #e8ebf7 !important;
-  color: #e8ebf7 !important;
+.mermaid svg foreignObject {
+  overflow: visible !important;
 }
-/* muted-but-readable for small edge/cluster captions */
-.theme-dark .mermaid svg .edgeLabel div,
-.theme-dark .mermaid svg .edgeLabel span,
-.theme-dark .mermaid svg .cluster-label div,
-.theme-dark .mermaid svg .cluster-label span {
-  fill: #c6cde6 !important;
-  color: #c6cde6 !important;
+
+/* Base edge paths and markers */
+.mermaid svg .flowchart-link,
+.mermaid svg .edgePaths path,
+.mermaid svg .messageLine,
+.mermaid svg .transition,
+.mermaid svg line.edge,
+.mermaid svg path.edge {
+  stroke-width: 1.8px !important;
 }
-/* generic fallback: any shape not matched below still gets slate fill */
-.theme-dark .mermaid svg g rect,
-.theme-dark .mermaid svg g polygon,
-.theme-dark .mermaid svg g circle,
-.theme-dark .mermaid svg g ellipse,
-.theme-dark .mermaid svg g path.label-container {
-  fill: #262a3d !important;
-  stroke: #8aadf4 !important;
-  stroke-width: 1.3px !important;
+.mermaid svg .marker path,
+.mermaid svg marker path,
+.mermaid svg defs marker path {
+  stroke: none !important;
 }
-/* flowchart nodes (incl. cylinder/db/stadium paths) */
+
+/* --- DARK MODE RULES: High-Contrast Midnight Slate + Radiant Text --- */
+.theme-dark .mermaid {
+  background: #181924 !important;
+  border-color: rgba(205, 211, 234, 0.12) !important;
+}
+
+/* 1. Clusters / Subgraphs */
+.theme-dark .mermaid svg g.cluster rect,
+.theme-dark .mermaid svg g.cluster > rect,
+.theme-dark .mermaid svg rect.cluster {
+  fill: rgba(138, 173, 244, 0.06) !important;
+  stroke: rgba(138, 173, 244, 0.45) !important;
+  stroke-width: 1.5px !important;
+  stroke-dasharray: 5, 5 !important;
+  rx: 8px !important;
+  ry: 8px !important;
+}
+/* Subgraph / Cluster Title in Dark Mode — Bright, Readable, Never Dark-on-Dark */
+.theme-dark .mermaid svg g.cluster text,
+.theme-dark .mermaid svg g.cluster tspan,
+.theme-dark .mermaid svg g.cluster foreignObject,
+.theme-dark .mermaid svg g.cluster foreignObject *,
+.theme-dark .mermaid svg .cluster-label,
+.theme-dark .mermaid svg .cluster-label *,
+.theme-dark .mermaid svg .cluster-title,
+.theme-dark .mermaid svg .clusterTitle,
+.theme-dark .mermaid svg .cluster span,
+.theme-dark .mermaid svg g.cluster span {
+  fill: #93c5fd !important;
+  color: #93c5fd !important;
+  font-weight: 750 !important;
+  font-size: 14.5px !important;
+  letter-spacing: 0.02em !important;
+  max-width: none !important;
+}
+
+/* 2. Nodes (Rectangles, Cylinders, Diamonds, Circles) */
 .theme-dark .mermaid svg g.node rect,
 .theme-dark .mermaid svg g.node polygon,
 .theme-dark .mermaid svg g.node circle,
 .theme-dark .mermaid svg g.node ellipse,
 .theme-dark .mermaid svg g.node path {
-  fill: #2a2f45 !important;
-  stroke: #8aadf4 !important;
+  fill: #222638 !important;
+  stroke: #7aa2f7 !important;
+  stroke-width: 1.5px !important;
+  rx: 6px !important;
+  ry: 6px !important;
 }
-/* subgraph clusters: translucent tint, soft blue border (never black/yellow) */
-.theme-dark .mermaid svg g.cluster rect {
-  fill: rgba(138, 173, 244, 0.07) !important;
-  stroke: rgba(138, 173, 244, 0.5) !important;
-  stroke-width: 1.2px !important;
-  stroke-dasharray: none !important;
+.theme-dark .mermaid svg g.node text,
+.theme-dark .mermaid svg g.node tspan,
+.theme-dark .mermaid svg g.node foreignObject,
+.theme-dark .mermaid svg g.node foreignObject div,
+.theme-dark .mermaid svg g.node foreignObject span,
+.theme-dark .mermaid svg g.node foreignObject p,
+.theme-dark .mermaid svg g.node .nodeLabel {
+  fill: #f8fafc !important;
+  color: #f8fafc !important;
+  font-weight: 550 !important;
 }
-/* edge-label chips: solid chip so text never sits on bare background */
+
+/* 3. Edge Labels (Always high-contrast chip) */
+.theme-dark .mermaid svg .edgeLabel,
+.theme-dark .mermaid svg .edgeLabel span,
+.theme-dark .mermaid svg .edgeLabel p,
+.theme-dark .mermaid svg .edgeLabel div,
+.theme-dark .mermaid svg span.edgeLabel {
+  background-color: #141622 !important;
+  color: #f1f5f9 !important;
+  fill: #f1f5f9 !important;
+  font-size: 0.85rem !important;
+  font-weight: 550 !important;
+  padding: 3px 8px !important;
+  border-radius: 5px !important;
+  border: 1px solid rgba(148, 163, 184, 0.35) !important;
+}
 .theme-dark .mermaid svg g.edgeLabel rect {
-  fill: #20233a !important;
-  stroke: rgba(205, 211, 234, 0.25) !important;
-  stroke-width: 1px !important;
+  fill: #141622 !important;
+  stroke: rgba(148, 163, 184, 0.35) !important;
 }
-/* sequence diagrams: actors, lifelines, messages, notes, activations */
-.theme-dark .mermaid svg g.actor rect,
-.theme-dark .mermaid svg rect.actor-box {
-  fill: #2a2f45 !important;
-  stroke: #8aadf4 !important;
-}
-.theme-dark .mermaid svg g.actor line,
-.theme-dark .mermaid svg line.actor-line {
-  stroke: #7c86a8 !important;
-}
+
+/* 4. Edge Paths & Arrows */
 .theme-dark .mermaid svg .flowchart-link,
 .theme-dark .mermaid svg .edgePaths path,
 .theme-dark .mermaid svg .messageLine,
-.theme-dark .mermaid svg line,
+.theme-dark .mermaid svg line.edge,
 .theme-dark .mermaid svg path.edge {
-  stroke: #9aa6c8 !important;
-  stroke-width: 1.6px !important;
+  stroke: #94a3b8 !important;
 }
 .theme-dark .mermaid svg .marker path,
 .theme-dark .mermaid svg marker path,
 .theme-dark .mermaid svg defs marker path {
-  fill: #9aa6c8 !important;
-  stroke: none !important;
+  fill: #94a3b8 !important;
+}
+
+/* 5. Sequence Diagrams */
+.theme-dark .mermaid svg g.actor rect,
+.theme-dark .mermaid svg rect.actor-box {
+  fill: #222638 !important;
+  stroke: #7aa2f7 !important;
+  stroke-width: 1.5px !important;
+}
+.theme-dark .mermaid svg g.actor text,
+.theme-dark .mermaid svg text.actor {
+  fill: #f8fafc !important;
+  color: #f8fafc !important;
+  font-weight: 650 !important;
+}
+.theme-dark .mermaid svg g.actor line,
+.theme-dark .mermaid svg line.actor-line {
+  stroke: #64748b !important;
+  stroke-dasharray: 4, 4 !important;
 }
 .theme-dark .mermaid svg rect.activation {
-  fill: #3a4060 !important;
-  stroke: #8aadf4 !important;
+  fill: #333a56 !important;
+  stroke: #7aa2f7 !important;
 }
+/* Sequence Diagram Notes in Dark Mode — Rich Amber Card with Bright Gold Text (Never White-on-Peach) */
 .theme-dark .mermaid svg g.note rect,
-.theme-dark .mermaid svg rect.note {
-  fill: #2a2f45 !important;
-  stroke: #d9c48f !important;
+.theme-dark .mermaid svg rect.note,
+.theme-dark .mermaid svg g.note path {
+  fill: #2b2214 !important;
+  stroke: #f59e0b !important;
+  stroke-width: 1.5px !important;
+}
+.theme-dark .mermaid svg g.note text,
+.theme-dark .mermaid svg g.note tspan,
+.theme-dark .mermaid svg g.note foreignObject,
+.theme-dark .mermaid svg g.note foreignObject *,
+.theme-dark .mermaid svg text.note,
+.theme-dark .mermaid svg .noteText,
+.theme-dark .mermaid svg .noteText *,
+.theme-dark .mermaid svg [class*="note"] text,
+.theme-dark .mermaid svg [class*="note"] tspan,
+.theme-dark .mermaid svg [class*="note"] foreignObject * {
+  fill: #fef08a !important;
+  color: #fef08a !important;
+  font-weight: 600 !important;
+  font-size: 13.5px !important;
 }
 .theme-dark .mermaid svg rect.labelBox,
 .theme-dark .mermaid svg rect.loopBox {
-  fill: rgba(138, 173, 244, 0.07) !important;
-  stroke: rgba(138, 173, 244, 0.5) !important;
+  fill: rgba(138, 173, 244, 0.08) !important;
+  stroke: rgba(138, 173, 244, 0.45) !important;
 }
-/* state / class / ER diagrams */
+
+/* 6. State, Class & ER Diagrams */
 .theme-dark .mermaid svg g.state rect,
 .theme-dark .mermaid svg g.state circle,
 .theme-dark .mermaid svg rect.classBox,
 .theme-dark .mermaid svg rect.entityBox {
-  fill: #2a2f45 !important;
-  stroke: #8aadf4 !important;
+  fill: #222638 !important;
+  stroke: #7aa2f7 !important;
+}
+.theme-dark .mermaid svg .statediagram-state text,
+.theme-dark .mermaid svg .entityLabel text {
+  fill: #f8fafc !important;
+  color: #f8fafc !important;
 }
 
-/* --- LIGHT: every label dark ink, every surface paper-matched ------------- */
-.theme-light .mermaid svg text,
-.theme-light .mermaid svg tspan,
-.theme-light .mermaid svg foreignObject,
-.theme-light .mermaid svg foreignObject div,
-.theme-light .mermaid svg foreignObject span,
-.theme-light .mermaid svg foreignObject p {
-  fill: #2b2f38 !important;
-  color: #2b2f38 !important;
+/* --- LIGHT MODE RULES: Crisp Paper White + Deep Charcoal Ink --- */
+.theme-light .mermaid {
+  background: #f8fafc !important;
+  border-color: rgba(51, 55, 63, 0.12) !important;
 }
-.theme-light .mermaid svg .edgeLabel div,
-.theme-light .mermaid svg .edgeLabel span,
-.theme-light .mermaid svg .cluster-label div,
-.theme-light .mermaid svg .cluster-label span {
-  fill: #4a4f5c !important;
-  color: #4a4f5c !important;
+
+/* 1. Clusters / Subgraphs */
+.theme-light .mermaid svg g.cluster rect,
+.theme-light .mermaid svg g.cluster > rect,
+.theme-light .mermaid svg rect.cluster {
+  fill: rgba(37, 99, 235, 0.04) !important;
+  stroke: rgba(37, 99, 235, 0.35) !important;
+  stroke-width: 1.5px !important;
+  stroke-dasharray: 5, 5 !important;
+  rx: 8px !important;
+  ry: 8px !important;
 }
-.theme-light .mermaid svg g rect,
-.theme-light .mermaid svg g polygon,
-.theme-light .mermaid svg g circle,
-.theme-light .mermaid svg g ellipse,
-.theme-light .mermaid svg g path.label-container {
-  fill: #ffffff !important;
-  stroke: #2f5fd0 !important;
-  stroke-width: 1.3px !important;
+/* Subgraph / Cluster Title in Light Mode */
+.theme-light .mermaid svg g.cluster text,
+.theme-light .mermaid svg g.cluster tspan,
+.theme-light .mermaid svg g.cluster foreignObject,
+.theme-light .mermaid svg g.cluster foreignObject *,
+.theme-light .mermaid svg .cluster-label,
+.theme-light .mermaid svg .cluster-label *,
+.theme-light .mermaid svg .cluster-title,
+.theme-light .mermaid svg .clusterTitle,
+.theme-light .mermaid svg .cluster span,
+.theme-light .mermaid svg g.cluster span {
+  fill: #1d4ed8 !important;
+  color: #1d4ed8 !important;
+  font-weight: 750 !important;
+  font-size: 14.5px !important;
+  letter-spacing: 0.02em !important;
+  max-width: none !important;
 }
+
+/* 2. Nodes (Solid White Card on Light Gray/Blue Canvas) */
 .theme-light .mermaid svg g.node rect,
 .theme-light .mermaid svg g.node polygon,
 .theme-light .mermaid svg g.node circle,
 .theme-light .mermaid svg g.node ellipse,
 .theme-light .mermaid svg g.node path {
   fill: #ffffff !important;
-  stroke: #2f5fd0 !important;
+  stroke: #2563eb !important;
+  stroke-width: 1.5px !important;
+  rx: 6px !important;
+  ry: 6px !important;
 }
-.theme-light .mermaid svg g.cluster rect {
-  fill: rgba(47, 95, 208, 0.05) !important;
-  stroke: rgba(47, 95, 208, 0.4) !important;
-  stroke-width: 1.2px !important;
-  stroke-dasharray: none !important;
+.theme-light .mermaid svg g.node text,
+.theme-light .mermaid svg g.node tspan,
+.theme-light .mermaid svg g.node foreignObject,
+.theme-light .mermaid svg g.node foreignObject div,
+.theme-light .mermaid svg g.node foreignObject span,
+.theme-light .mermaid svg g.node foreignObject p,
+.theme-light .mermaid svg g.node .nodeLabel {
+  fill: #0f172a !important;
+  color: #0f172a !important;
+  font-weight: 600 !important;
+}
+
+/* 3. Edge Labels (Always clean white chip with dark ink) */
+.theme-light .mermaid svg .edgeLabel,
+.theme-light .mermaid svg .edgeLabel span,
+.theme-light .mermaid svg .edgeLabel p,
+.theme-light .mermaid svg .edgeLabel div,
+.theme-light .mermaid svg span.edgeLabel {
+  background-color: #ffffff !important;
+  color: #0f172a !important;
+  fill: #0f172a !important;
+  font-size: 0.85rem !important;
+  font-weight: 600 !important;
+  padding: 3px 8px !important;
+  border-radius: 5px !important;
+  border: 1px solid rgba(100, 116, 139, 0.35) !important;
 }
 .theme-light .mermaid svg g.edgeLabel rect {
-  fill: #f1ede3 !important;
-  stroke: rgba(51, 55, 63, 0.2) !important;
-  stroke-width: 1px !important;
-}
-.theme-light .mermaid svg g.actor rect,
-.theme-light .mermaid svg rect.actor-box {
   fill: #ffffff !important;
-  stroke: #2f5fd0 !important;
+  stroke: rgba(100, 116, 139, 0.35) !important;
 }
-.theme-light .mermaid svg g.actor line,
-.theme-light .mermaid svg line.actor-line {
-  stroke: #9aa0b0 !important;
-}
+
+/* 4. Edge Paths & Arrows */
 .theme-light .mermaid svg .flowchart-link,
 .theme-light .mermaid svg .edgePaths path,
 .theme-light .mermaid svg .messageLine,
-.theme-light .mermaid svg line,
+.theme-light .mermaid svg line.edge,
 .theme-light .mermaid svg path.edge {
-  stroke: #6b7280 !important;
-  stroke-width: 1.6px !important;
+  stroke: #475569 !important;
 }
 .theme-light .mermaid svg .marker path,
 .theme-light .mermaid svg marker path,
 .theme-light .mermaid svg defs marker path {
-  fill: #6b7280 !important;
-  stroke: none !important;
+  fill: #475569 !important;
+}
+
+/* 5. Sequence Diagrams */
+.theme-light .mermaid svg g.actor rect,
+.theme-light .mermaid svg rect.actor-box {
+  fill: #ffffff !important;
+  stroke: #2563eb !important;
+  stroke-width: 1.5px !important;
+}
+.theme-light .mermaid svg g.actor text,
+.theme-light .mermaid svg text.actor {
+  fill: #0f172a !important;
+  color: #0f172a !important;
+  font-weight: 650 !important;
+}
+.theme-light .mermaid svg g.actor line,
+.theme-light .mermaid svg line.actor-line {
+  stroke: #94a3b8 !important;
+  stroke-dasharray: 4, 4 !important;
 }
 .theme-light .mermaid svg rect.activation {
-  fill: #e3e7f2 !important;
-  stroke: #2f5fd0 !important;
+  fill: #dbeafe !important;
+  stroke: #2563eb !important;
 }
 .theme-light .mermaid svg g.note rect,
 .theme-light .mermaid svg rect.note {
-  fill: #fff8e6 !important;
-  stroke: #8a5e00 !important;
+  fill: #fef9c3 !important;
+  stroke: #ca8a04 !important;
+  stroke-width: 1.3px !important;
+}
+.theme-light .mermaid svg g.note text,
+.theme-light .mermaid svg text.note,
+.theme-light .mermaid svg g.note foreignObject,
+.theme-light .mermaid svg g.note foreignObject div,
+.theme-light .mermaid svg g.note foreignObject span,
+.theme-light .mermaid svg g.note foreignObject p {
+  fill: #713f12 !important;
+  color: #713f12 !important;
+  font-weight: 550 !important;
 }
 .theme-light .mermaid svg rect.labelBox,
 .theme-light .mermaid svg rect.loopBox {
-  fill: rgba(47, 95, 208, 0.05) !important;
-  stroke: rgba(47, 95, 208, 0.4) !important;
+  fill: rgba(37, 99, 235, 0.05) !important;
+  stroke: rgba(37, 99, 235, 0.35) !important;
 }
+
+/* 6. State, Class & ER Diagrams */
 .theme-light .mermaid svg g.state rect,
 .theme-light .mermaid svg g.state circle,
 .theme-light .mermaid svg rect.classBox,
 .theme-light .mermaid svg rect.entityBox {
   fill: #ffffff !important;
-  stroke: #2f5fd0 !important;
+  stroke: #2563eb !important;
+}
+.theme-light .mermaid svg .statediagram-state text,
+.theme-light .mermaid svg .entityLabel text {
+  fill: #0f172a !important;
+  color: #0f172a !important;
 }
 
 /* Figure caption line under diagrams */
@@ -648,23 +832,78 @@
 }
 
 /* --------------------------------------------------------------------------
-   9. MATH: MINIMAL
+   9. MATH: MINIMAL & CLEAN (NO GHOST PILLS OR COPY BUTTONS)
    -------------------------------------------------------------------------- */
 
 .math-block {
-  background: var(--reading-bg-secondary) !important;
-  border: 1px solid var(--reading-border-subtle) !important;
-  border-radius: 8px !important;
-  padding: 0.9rem 1.2rem !important;
-  margin: 1.4rem 0 !important;
+  background: transparent !important;
+  border: none !important;
+  border-radius: 0 !important;
+  padding: 0.5rem 0 !important;
+  margin: 1.2rem 0 !important;
   overflow-x: auto !important;
   box-shadow: none !important;
   text-align: center !important;
 }
+
+.math-block > mjx-container[jax="CHTML"],
+.markdown-rendered mjx-container[jax="CHTML"][display="true"] {
+  display: block !important;
+  margin: 0.6rem auto !important;
+  text-align: center !important;
+}
+
 .math-inline {
   color: inherit !important;
   font-size: 1em !important;
   padding: 0 0.1rem !important;
+}
+
+/* Suppress any code-block copy buttons or ghost widget tabs on math elements */
+.copy-code-button:has(~ mjx-container),
+.copy-code-button:has(~ .math-block),
+.cm-line:has(mjx-container) .copy-code-button,
+.cm-line:has(.math-block) .copy-code-button,
+.cm-line:has(.math) .copy-code-button,
+.cm-embed-block:has(mjx-container) .copy-code-button,
+.cm-embed-block:has(.math) .copy-code-button,
+.HyperMD-codeblock:has(mjx-container) .copy-code-button,
+.HyperMD-codeblock:has(.math) .copy-code-button,
+.math-block .copy-code-button,
+.math .copy-code-button,
+.cm-math-widget .copy-code-button,
+pre:has(mjx-container) .copy-code-button,
+pre:has(.math-block) .copy-code-button,
+.cm-embed-block .code-block-flair {
+  display: none !important;
+  visibility: hidden !important;
+  opacity: 0 !important;
+  pointer-events: none !important;
+  width: 0 !important;
+  height: 0 !important;
+  padding: 0 !important;
+  margin: 0 !important;
+  border: none !important;
+}
+
+/* Ensure all math containers, widgets, and lines render 100% borderless & transparent */
+.math,
+.math-block,
+.cm-math,
+.cm-math-widget,
+.cm-embed-block:has(.math),
+.cm-embed-block:has(mjx-container),
+.cm-embed-block:has(.math-block),
+.cm-line:has(.math),
+.cm-line:has(mjx-container),
+.cm-line:has(.math-block),
+.HyperMD-codeblock:has(.math),
+.HyperMD-codeblock:has(mjx-container),
+pre:has(mjx-container),
+pre:has(.math-block) {
+  background: transparent !important;
+  border: none !important;
+  box-shadow: none !important;
 }
 
 /* --------------------------------------------------------------------------
@@ -780,6 +1019,36 @@
     animation: none !important;
     scroll-behavior: auto !important;
   }
+}
+
+/* --------------------------------------------------------------------------
+   14. BOOK FOLDER COLORS: distinct accent per book in file explorer
+   Book 01 = blue, Book 02 = teal, Book 03 = peach (dark) / matching muted
+   tones in light mode. Calm: tinted title + 3px left bar only.
+   -------------------------------------------------------------------------- */
+.nav-folder-title[data-path="01 Designing Data-Intensive Applications"] {
+  border-left: 3px solid var(--reading-accent-blue);
+}
+.nav-folder-title[data-path="01 Designing Data-Intensive Applications"] .nav-folder-title-content {
+  color: var(--reading-accent-blue);
+  font-weight: 600;
+}
+.nav-folder-title[data-path="02 Fundamentals of Software Engineering From Coder to Engineer"] {
+  border-left: 3px solid var(--reading-accent-teal);
+}
+.nav-folder-title[data-path="02 Fundamentals of Software Engineering From Coder to Engineer"] .nav-folder-title-content {
+  color: var(--reading-accent-teal);
+  font-weight: 600;
+}
+.nav-folder-title[data-path="03 Fundamentals of Software Architecture An Engineering Approach"] {
+  border-left: 3px solid var(--reading-accent-peach);
+}
+.nav-folder-title[data-path="03 Fundamentals of Software Architecture An Engineering Approach"] .nav-folder-title-content {
+  color: var(--reading-accent-peach);
+  font-weight: 600;
+}
+.theme-light .nav-folder-title[data-path="03 Fundamentals of Software Architecture An Engineering Approach"] .nav-folder-title-content {
+  color: #b3742f;
 }
 
 @media print {

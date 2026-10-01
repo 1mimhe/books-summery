@@ -20,7 +20,7 @@
 | 06 | Replication | pp. 221–274 | Fig 6-1 (p.223), 6-2 (p.224), 6-3 (p.234), 6-4 (p.237), 6-5 (p.238), 6-6 (p.240), 6-7 (p.242), 6-8 (p.243), 6-9 (p.246), 6-10 (p.250), 6-11 (p.251), 6-12 (p.254), 6-13 (p.256), 6-14 (p.262), 6-15/6-16 (pp.264–265) | [[chapter-06-replication\|Chapter 06]] |
 | 07 | Sharding | pp. 275–300 | Fig 7-1 (p.276), 7-2 (p.280), 7-3/7-4 (p.283), 7-5 (p.285), 7-6 (p.286), 7-7 (p.290), 7-8 (p.291), 7-9 (p.293), 7-10 (p.294) | [[chapter-07-sharding\|Chapter 07]] |
 | 08 | Transactions | pp. 301–368 | Fig 8-1 (p.306), 8-2/8-3 (p.309), 8-4 (p.314), 8-5 (p.316), 8-6 (p.318), 8-7 (p.320), 8-8 (p.327), 8-9 (p.334), 8-10 (p.344), 8-11 (p.345), 8-12 (p.348), 8-13 (p.349), 8-14 (p.351) | [[chapter-08-transactions\|Chapter 08]] |
-| 09 | The Trouble with Distributed Systems | pp. 369–424 | Fig 9-1 (p.372), 9-2 (p.378), 9-3 (p.387), 9-4 (p.398), 9-6 (p.399), 9-7 (p.401) | [[chapter-09-the-trouble-with-distributed-systems\|Chapter 09]] |
+| 09 | The Trouble with Distributed Systems | pp. 369–424 | Fig 9-1 (p.372), 9-2 (p.378), 9-3 (p.387), 9-4 (p.398), 9-5 (p.398), 9-6 (p.399), 9-7 (p.401) | [[chapter-09-the-trouble-with-distributed-systems\|Chapter 09]] |
 | 10 | Consistency and Consensus | pp. 425–474 | Fig 10-1 (p.427), 10-2 (p.428), 10-3 (p.429), 10-4 (p.430), 10-5 (p.434), 10-6 (p.436), 10-7 (p.437), 10-8 (p.442), 10-9 (p.445), 10-10 (p.447) | [[chapter-10-consistency-and-consensus\|Chapter 10]] |
 | 11 | Batch Processing | pp. 475–510 | Fig 11-1 (p.494), 11-2 (p.495), 11-3 (p.496) | [[chapter-11-batch-processing\|Chapter 11]] |
 | 12 | Stream Processing | pp. 511–562 | Fig 12-1 (p.517), 12-2 (p.518), 12-3 (p.520), 12-4 (p.526), 12-5 (p.527), 12-6 (p.529), 12-7 (p.533), 12-8 (p.544) | [[chapter-12-stream-processing\|Chapter 12]] |
@@ -38,3 +38,6 @@
 
 > [!NOTE] Figure rule
 > Mermaid diagrams are **reconstructions** for study — always cross-check numbers and edge cases against the original PDF page cited under each figure.
+
+> [!AUDIT] Forensic audit status (Sep 2026)
+> All 14 chapters audited section-by-section against the 673-page PDF per `CHAPTER_REVIEW_AND_IMPROVEMENT_PROMPT.md v3.0` (6-point protocol). Term-coverage gaps closed to zero (serverless, GraphQL/DataFrames/Turtle, XA, quorum/Jepsen, workflows, backpressure, consent/legislation, etc.), all canonical figures reconstructed with `📕 PDF p.XX` cites — including Fig 3-7 (p.122), Fig 3-9 (p.130), Figs 8-2/8-3/8-5/8-9/8-10/8-12, and Fig 9-5 (p.398). Ch09 row above already lists the full 9-1…9-7 set; Ch14 has no source figures by design.
