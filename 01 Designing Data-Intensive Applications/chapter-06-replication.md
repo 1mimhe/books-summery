@@ -1,196 +1,155 @@
 # Chapter 6: Replication — Definitive Technical Summary
 *From: Designing Data-Intensive Applications (2nd Edition) by Martin Kleppmann and Chris Riccomini*
-*Source PDF: pp. 221–274 (673-page PDF) — figures below cite PDF pages.*
+*Source PDF: pp. 221–274 — figures below cite PDF pages.*
 
 > [!NAV] **Chapter Navigation**
 > ⬅️ **Previous:** [[chapter-05-encoding-and-evolution|Chapter 05: Encoding and Evolution]] | 🏠 **Index:** [[00-Master-Reading-Dashboard|Master Dashboard]] | ➡️ **Next:** [[chapter-07-sharding|Chapter 07: Sharding]]
-
 
 ---
 
 ## 1. Executive Summary & Core Engineering Problem
 
-- **Core Thesis:** Replication—maintaining copies of the same data across multiple storage nodes connected via a network—is required to achieve high availability, geographic latency minimization, and read throughput scalability. However, because networks are inherently asynchronous, physical clocks drift, and hardware nodes fail unpredictably, maintaining consistency across distributed replicas forces an unavoidable architectural choice between three primary models: **Single-Leader Replication** (which establishes a total order of writes at the cost of leader failover complexity and replication lag anomalies), **Multi-Leader Replication** (which enables multi-region write availability and offline local-first sync at the cost of concurrent write conflict resolution), and **Leaderless Replication** (which maximizes write availability via quorums and hinted handoff at the cost of non-linearizable reads and client-side vector clock reconciliation).
-- **Problem Statement:** Naive replication strategies collapse under network partitions, follower lag, and concurrent mutations. A classic production catastrophe occurs in an e-commerce platform during asynchronous single-leader failover: the primary database crashes immediately after acknowledging payment authorizations, but before the corresponding replication stream is flushed to followers. An automated failover orchestrator promotes an out-of-sync follower. The old leader reboots, rejoins the cluster, and its discarded writes collide with newly assigned primary keys in the promoted leader, resulting in split-brain data corruption, duplicate balance deductions, and orphaned records. Similarly, in leaderless quorum stores ($N=3, W=2, R=2$), relying on Last-Write-Wins (LWW) with NTP-synchronized server clocks silently overwrites concurrent updates submitted within a 10-millisecond clock-skew window, permanently destroying customer shopping cart additions without raising exceptions.
-- **Historical & Industry Context:** Relational database systems in the 1980s and 1990s pioneered primary-backup replication using synchronous physical log shipping over dedicated local-area networks. The global expansion of web applications in the 2000s made cross-datacenter WAN latency (typically 70--250 ms round-trip) incompatible with synchronous replication, popularizing asynchronous read-replica pools (MySQL master-slave). To survive entire datacenter blackouts without dropping writes, Amazon introduced the leaderless Dynamo model (2007), inspiring Apache Cassandra and Riak. In the 2010s, consensus algorithms (Raft, Paxos) and distributed transactional engines (Google Spanner) standardized automated failover. The 2020s (2nd Edition inflection) brought the rise of **Local-First Software** (collaborative apps like Figma and linear sync engines like Replicache/Automerge) and Conflict-free Replicated Data Types (CRDTs), which push multi-leader replication all the way to client web browsers and mobile edge devices.
+> *"The major difference between a thing that might go wrong and a thing that cannot possibly go wrong is that when a thing that cannot possibly go wrong goes wrong, it usually turns out to be impossible to get at or repair."*
+> — **Douglas Adams**, *Mostly Harmless (1992)*
+
+- **Core Thesis:** Replication — keeping a copy of the same data on multiple machines connected via a network — exists for four reasons: geographic proximity (lower latency), high availability (survive node/zone/region loss), durability (survive permanent loss), and read scalability (more read throughput). But the moment replicated data *changes*, you must choose one of three families: **Single-Leader** (one writer, total order, but failover + lag anomalies), **Multi-Leader** (every region/device writes locally, but concurrent conflicts need resolution), or **Leaderless / Dynamo-style** (any node accepts writes via quorums, but reads need repair and causality tracking). The 2nd edition adds two modern twists: **object-storage-backed replication with zero-disk architectures**, and **sync engines / local-first software** that push multi-leader all the way into the browser.
+- **Problem Statement:** Alice signs up on a single-leader database. The leader assigns her `user_id = 501`, acks her browser, then its power supply dies before replicating to the follower. The orchestrator promotes the follower — whose auto-increment counter is still at 500 — and Bob signs up. Bob also gets `user_id = 501`. When the old leader rejoins, Alice's private rows collide with Bob's. Meanwhile in a leaderless store with `N=3, W=2, R=2`, Carol relies on Last-Write-Wins with NTP clocks: her cart addition loses silently because another node's clock runs 80 ms fast. Both outages look "successful" to clients.
+- **Historical & Industry Context:** 1970s–1990s: primary-backup with synchronous log shipping over LANs (PostgreSQL WAL shipping, Oracle Data Guard). 2000s: async read-replica pools for geo scale (MySQL master–slave); Amazon Dynamo (2007) revives leaderless for datacenter-outage survival (→ Cassandra, Riak, ScyllaDB). 2010s: Raft/Paxos automate failover (CockroachDB, TiDB, etcd); Spanner proves strongly-consistent scale. 2020s (2nd-edition inflection): cloud object stores (S3/GCS) absorb durability with conditional-write leadership + zero-disk Kafka-compatible systems (WarpStream, Redpanda Serverless, SlateDB, Turbopuffer); collaborative apps (Google Docs, Figma, Linear) and sync engines (Firestore, Realm, Ditto, PouchDB/CouchDB, Automerge, Yjs) make every device a leader.
+- **Backups vs Replication:** Replicas reflect *current* writes fast; backups store *old* snapshots so you can go back in time. Accidentally `DELETE` a table and replication faithfully deletes it everywhere — only a backup (snapshot + archived replication log, e.g. WAL-G for Postgres/MySQL/SQL Server, Litestream for SQLite) saves you.
 
 ---
 
 ## 2. In-Depth Technical Concepts & Internal Mechanics
 
-### 2.1 Single-Leader Replication Architecture & Replication Stream Mechanics
-- **Foundational Theory:** Every write to the database must be processed by exactly one designated node: the **Leader** (master, primary). The leader writes the mutation to its local storage and streams the data change to all **Followers** (read replicas, slaves) via a replication log or change data capture (CDC) stream (Figure 6-1).
-- **Synchronous vs. Asynchronous Replication (Figure 6-2):**
-  - *Fully Synchronous:* The leader waits for confirmations from *all* followers before acknowledging the client write. 
-    - *Invariant:* Guarantees zero data loss ($RPO = 0$) and up-to-date followers.
-    - *Fatal Flaw:* If a single follower hangs (due to a GC pause, disk flush, or network glitch), the entire cluster's write pipeline halts indefinitely.
-  - *Fully Asynchronous:* The leader acknowledges the client immediately after writing to its local WAL, streaming changes to followers asynchronously.
-    - *Advantage:* High write throughput; unimpacted by slow followers.
-    - *Fatal Flaw:* Durability hazard. If the leader experiences an unrecoverable hardware failure before bytes reach the network socket, acknowledged writes are permanently lost.
-  - *Semi-Synchronous Compromise (Standard Enterprise Topology):* Exactly one follower is configured as synchronous, while remaining followers are asynchronous. If the synchronous follower becomes unresponsive, an asynchronous follower is dynamically promoted to synchronous status, guaranteeing at least two durable copies of every acknowledged write.
-- **Replication Log Implementation Mechanisms:**
-  1. *Statement-Based Replication (RDBMs Historical - MySQL < 5.1):* The leader logs every SQL statement executed (`INSERT INTO users ...`). 
-     - *Fatal Flaws:* Non-deterministic functions (`NOW()`, `RAND()`, `UUID()`) evaluate to different values on followers; statements relying on existing state (auto-incrementing IDs, `WHERE clause` without unique ordering) execute out of order; triggers and stored procedures generate diverging side effects.
-  2. *Write-Ahead Log (WAL) Shipping (PostgreSQL, Oracle):* The leader ships raw binary physical disk page byte diffs directly to followers.
-     - *Advantage:* Fast execution; identical binary bit-for-bit replica state.
-     - *Fatal Flaws:* Tightly coupled to physical storage engine internals. Followers must run the exact same DBMS version and OS architecture, making zero-downtime rolling database upgrades impossible.
-  3. *Logical (Row-Based) Log Replication (MySQL Binlog Row Format, MongoDB Oplog):* Ships logical row-level mutations decoupled from physical disk pages:
-     - `INSERT`: Full column values for the new row.
-     - `DELETE`: Primary key or unique identifier of the removed row.
-     - `UPDATE`: Primary key + old and new values of changed columns.
-     - *Advantage:* Backward and forward compatible across major database versions; easily parsed by external systems for Change Data Capture (Debezium / Kafka).
-  4. *Trigger-Based Replication (Application Layer - Bucardo, GoldenGate):* Uses relational triggers to record data changes into an audit shadow table, which an external process polls and replicates. Highly flexible, but incurs severe $2\times\text{--}3\times$ write overhead and lock contention.
+### 2.1 Single-Leader Replication, Sync vs Async, and Setting Up New Followers
+- **Plain-English Intuition:** Elect one machine the boss (**Leader**). All writes go to the boss. The boss writes to disk and streams the change log to helpers (**Followers**). Anyone can read from helpers, but only the boss takes writes. If the dataset is sharded (Chapter 7), each shard has its own leader — different shards may have leaders on different nodes.
+- **Sync vs Async (Figure 6-2):** When Alice updates her profile image, the leader forwards the change to followers. Three options:
+  1. *Fully synchronous:* Leader waits for **all** followers before acking. Follower guaranteed up-to-date; but one crashed/GC-paused follower blocks **all** writes.
+  2. *Fully asynchronous:* Leader acks after local disk write, replicates in background. Leader never blocks; but un-replicated writes are lost if the leader dies unrecoverably — a confirmed write is not durable.
+  3. *Semi-synchronous (production standard):* One follower is synchronous, rest async. Guarantees two durable copies (leader + sync follower). If the sync follower dies or lags, an async follower is promoted to sync. Variant: majority quorums (3 of 5 including leader) updated synchronously — the bridge to Chapter 10 consensus.
+- **Follower lag reality:** Normally <1 s, but can stretch to minutes under capacity pressure, recovery, or network faults. There is no bound — hence *eventual consistency*.
+- **Setting up new followers (zero-downtime):** Copying live files is incoherent (different parts at different times) and locking the DB kills availability. The protocol:
+  1. Take a consistent snapshot of the leader without full lock (built-in or Percona XtraBackup).
+  2. Copy snapshot to the new follower (or download snapshot + archived log from object store).
+  3. Follower reconnects at the snapshot's exact log position — PostgreSQL LSN, MySQL binlog coordinates/GTIDs — and replays the backlog.
+  4. Once backlog is drained it has *caught up* and streams live. Steps 1–2 double as the backup/disaster-recovery path.
+- **Databases backed by object storage (2nd-edition new):** S3/GCS/Blob for live queries, not just archives. Wins: cheap infrequent-access tiers, multi-zone/multi-region durability without inter-zone fees, conditional-write (CAS) for transactions + leader election, shared Parquet/Iceberg lakes for integration. Costs: higher latency + per-API-call fees (forces batching), immutable objects (random writes expensive), no POSIX (FUSE shims lack nonsequential writes/symlinks). Responses: tiered storage (hot on SSD/NVMe, cold on objects), WAL on low-latency devices (EBS, Neon Safekeepers), or full **zero-disk architecture** — all data on objects, disks only as cache, nodes stateless (WarpStream, Bufstream, cloud warehouses).
 
----
+### 2.2 Node Outages: Catch-Up, Failover, Fencing, and Split-Brain
+- **Follower failure (easy):** Each follower logs the last transaction applied. On restart it asks the leader for everything since that offset and replays. Pain is performance: high write throughput × long outage = heavy catch-up load on both sides. The leader must either retain un-acked logs (risk disk-full) or delete them (follower then needs a full backup restore).
+- **Leader failure (hard — failover):**
+  1. *Detect:* Heartbeats; if the leader is silent ~30 s it is declared dead (planned maintenance uses graceful handoff instead).
+  2. *Elect:* Majority election (Raft/Paxos) or controller node (ZooKeeper/Consul, `pg_auto_failover`). Best candidate = replica with the most up-to-date log (highest LSN) to minimize loss — a consensus problem (Chapter 10).
+  3. *Reconfigure:* Clients rerouted (see Chapter 7 routing); the old leader, if it returns, must rejoin as follower.
+- **What goes wrong (Alice/Bob failover story):**
+  1. Leader `L1` counter at 500. Alice signs up → `user_id=501`, acked, not yet replicated. `L1` dies.
+  2. Orchestrator promotes lagging follower `F1` (counter still 500). Bob signs up → also `user_id=501`.
+  3. `L1` returns with Alice at 501. Without discarding `L1`'s un-replicated writes, Alice's and Bob's rows share a key. GitHub's real incident reused auto-increment keys across MySQL + Redis and leaked one user's private data to another.
+  4. *Split-brain:* A partition lets both `L1` and `L2` believe they are leader and accept divergent writes with no merge process → corruption. Mitigation: **fencing** — each new leader gets a monotonically increasing fencing token; storage rejects writes with stale tokens (see "Distributed Locks and Leases" p. 373); aggressive form is STONITH (power off the old leader via PDU/IPMI). Too-short timeouts cause flapping failovers under load spikes; too-long timeouts extend outage. Some teams therefore fail over manually.
+  5. *Rule:* Prefer the follower closest to the old leader (sync follower, or highest LSN under async). A follower days behind is catastrophic.
 
-### 2.2 Leader Outages, Failover Mechanics, and the Split-Brain Hazard
-- **Follower Outages (Catch-up Recovery):**
-  - Follower stores the last Log Sequence Number (LSN) or binlog coordinate processed.
-  - Upon reboot, it connects to the leader, requests the replication stream starting at `offset = last_LSN`, and catches up sequentially.
-- **Leader Outages & Automated Failover Steps:**
-  1. *Failure Detection:* Nodes exchange heartbeats (e.g., UDP pings every 1 second). If a leader does not respond within a configured timeout (e.g., 30 seconds), it is presumed dead.
-  2. *Leader Election:* A new leader is chosen via consensus (Raft/Paxos) or designated by an external coordination service (Apache ZooKeeper / Consul). The node with the most up-to-date replication log (highest LSN) must be elected to minimize data loss.
-  3. *Cluster Reconfiguration:* Routing tiers and service discovery are updated to route writes to the new primary. The old leader (if it recovers) must be forcibly demoted to a follower.
-- **Critical Failover Hazards & Failure Modes:**
-  - *Discarded Writes & Key Collisions (The GitHub MySQL Failover Incident):*
-    - Leader 1 crashes before replicating `auto_increment` IDs 501--510 to Follower A.
-    - Follower A is promoted to Leader 2. Its local auto-increment counter is at 501.
-    - New client writes receive IDs 501--510 on Leader 2.
-    - Leader 1 reboots. Its old un-replicated records with IDs 501--510 conflict with new records on Leader 2, corrupting foreign key joins and leaking private customer data across unrelated accounts.
-  - *Split-Brain Catastrophe:*
-    - Network partition divides the cluster into two isolated network islands.
-    - Nodes on Island B believe Leader 1 is dead and elect Leader 2.
-    - Both Leader 1 and Leader 2 accept concurrent writes. Because both generate conflicting mutation streams without synchronization, data divergence becomes irrecoverable without manual forensic auditing.
-  - *Fencing Tokens:* Absolute mitigation against split-brain. The coordination service increments an epoch counter (fencing token) on each failover ($e = 101, 102, \dots$). Storage engines reject any write accompanied by an older fencing token.
+#### Concept Comparison: Replication Log Implementations
+| Method | What ships | Pros | Cons / Risks | Used in |
+| :--- | :--- | :--- | :--- | :--- |
+| **Statement-based** | SQL `INSERT/UPDATE/DELETE` text | Compact | `NOW()`, `RAND()`, auto-increment, `UPDATE…WHERE` order, triggers/UDF side effects diverge | MySQL <5.1, VoltDB (requires determinism) |
+| **WAL shipping (physical)** | Byte-level disk-block diffs | Fast, exact file copy | Tied to engine version + OS; leader/follower must match → no rolling zero-downtime upgrades | PostgreSQL, Oracle |
+| **Logical / row-based** | Row events: insert (all columns), delete (PK), update (PK + old/new), + commit marker | Version-tolerant, parseable by CDC (Debezium/Kafka → warehouse/index/cache, Chapter 12) | Heavier than WAL; needs PK or full old row | MySQL binlog, Postgres logical decoding |
+| **Trigger-based** | App-level audit rows in shadow tables | Flexible, DB-agnostic | 2–3× write overhead, lock contention | Legacy CDC shims |
 
----
+### 2.3 Problems with Replication Lag and Stronger Guarantees
+Read-scaling (many async followers absorbing reads) only works async — sync to all followers means one down node halts writes. Async followers are *eventually consistent*: stop writing, wait, and they converge. Three user-visible anomalies:
 
-### 2.3 Replication Lag Anomalies & Consistency Guarantees
-When clients read from asynchronous followers, replication lag (the duration between a write committing on the leader and applying on the follower) introduces severe consistency anomalies:
+#### 1. Reading Your Own Writes (Figure 6-3)
+- *Anomaly:* Alice posts a comment (→ leader), refreshes, hits a 2-s-lagging follower — comment missing. She reposts a duplicate.
+- *Guarantee (read-after-write / read-your-writes):* You always see your own submissions; others' may lag.
+- *Fixes:* Read user-editable objects (own profile) from leader/sync follower; route all reads to leader for N seconds after last update (or if follower lag >1 min); client remembers last-write LSN/timestamp and waits for replica to catch up; cross-device needs centralized timestamps; multi-region must route to the leader's region.
 
-#### 1. Read-After-Write Consistency (Reading Your Own Writes - Figure 6-3)
-- *The Anomaly:* A user submits a comment or updates their profile. The write commits to the leader. The user refreshes their browser; the read request is load-balanced to a lagging follower (lag = 3 seconds). The user does not see their update, assumes it was lost, and resubmits, generating duplicate mutations.
-- *Guaranteed Invariant:* A user will always see their own submitted updates, while updates from other users may be delayed.
-- *Architectural Mitigations:*
-  1. *Leader Routing for User-Editable Fields:* If querying data that the user has permission to edit (e.g., user profile), always route the query to the leader. Route other reads to followers.
-  2. *Time-Based Window Tracking:* Track the timestamp of the client's last write. For 60 seconds following a write, route all user reads to the leader or to followers whose `replication_lag < (current_time - write_time)`.
-  3. *Client-Side Logical Timestamps:* The client tracks the LSN of its last write. Replicas reject read requests until their local applied LSN catches up to the client's LSN.
+#### 2. Monotonic Reads (Figure 6-4)
+- *Anomaly:* Bob (user 2345) reads Alice's new comment from a fresh follower, refreshes, lands on a staler follower — comment vanishes. Time moves backward.
+- *Guarantee:* Once you see a value, you never see an older one.
+- *Fix:* Sticky routing — hash `user_id` to one replica (fail over only if it dies).
 
-#### 2. Monotonic Reads (Time Traveling Backward - Figure 6-4)
-- *The Anomaly:* User reads from Follower A (lag = 100 ms) and observes post $P$. User refreshes page; load balancer routes query to Follower B (lag = 4,000 ms). Post $P$ disappears. To the user, time appears to have jumped backward.
-- *Guaranteed Invariant:* If a user makes several reads in sequence, they will never observe data in a state earlier than what they observed in previous reads.
-- *Architectural Mitigation:* **Deterministic Replica Sticky Routing**. Hash the user's ID to deterministically pin their read queries to the same replica instance (`replica_idx = hash(user_id) % num_replicas`). If that replica fails, reroute to a fresh instance.
+#### 3. Consistent Prefix Reads (Figure 6-5)
+- *Anomaly:* Mr. Poons asks *"How far can you see?"* (slow shard), Mrs. Cake answers *"10 seconds"* (fast shard). An observer hears the answer *before* the question — causality inversion. Fatal in sharded DBs where each shard orders independently with no global order.
+- *Guarantee:* Causally ordered writes are observed in that order.
+- *Fix:* Co-locate causally related writes on one shard; otherwise explicitly track causal dependencies (version vectors, "happens-before" p. 238).
 
-#### 3. Consistent Prefix Reads (Causality Inversion - Figure 6-5)
-- *The Anomaly:* In a partitioned or sharded database, replication across shards is independent. User A asks: *"How many stars are in the sky?"* (Shard 1). User B answers: *"Billions."* (Shard 2). An outside observer queries Shard 2 (which is up to date) and Shard 1 (which has high lag). The observer reads the answer *"Billions"* *before* seeing the question!
-- *Guaranteed Invariant:* If a sequence of writes occurs in a causal order, anyone reading those writes will observe them in the exact same causal order.
-- *Architectural Mitigation:* Route causally dependent records to the same physical partition, or implement causal vector timestamps across shard boundaries.
+#### Concept Comparison: Lag Anomalies
+| Anomaly | User sees | Root cause | Mitigation |
+| :--- | :--- | :--- | :--- |
+| **Read-after-write violation** | Own update missing on reload | Read hit lagging follower | Leader reads for own data; LSN-gated reads |
+| **Monotonic-read violation** | Sees post, refresh loses it | Two reads hit different-lag followers | Sticky replica per user |
+| **Consistent-prefix violation** | Answer before question | Shards replicate at different speeds | Same-shard causality; dependency tracking |
 
----
+- **Solutions for lag (big picture):** If hours of lag is "no problem," eventual is fine. Otherwise enforce stronger reads in app code (leader/sync reads) — complex and error-prone — or adopt a linearizable + ACID (NewSQL) store and program as if single-node (Chapters 8, 10). Weaker models survive partitions with lower overhead, so the rest of the chapter embraces them.
+- **Regions vs AZs:** A *region* = datacenters in one geography; each datacenter = *availability zone*. Same-region zones have fast links (spread nodes across zones to survive zonal loss); cross-region survives regional loss but pays latency/throughput/billing costs.
 
-### 2.4 Multi-Leader Replication Topologies & Conflict Resolution
-- **Multi-Leader Use Cases:**
-  1. *Multi-Datacenter Deployments (Figure 6-6):* A leader resides in each geographic datacenter (e.g., US-East, EU-Central, AP-South). Local writes commit immediately with sub-5 ms latency; inter-datacenter replication occurs asynchronously over WAN.
-  2. *Offline Clients & Local-First Software:* Laptops, tablets, and phones act as local database leaders (SQLite / IndexedDB). Applications execute reads and writes locally with zero network connection. When internet connectivity is restored, local mutation logs sync bi-directionally with cloud leaders.
-  3. *Real-Time Collaborative Editing (Google Docs, Figma):* Mutations occur locally in memory and replicate concurrently across peer clients.
-- **Multi-Leader Topologies (Figure 6-7):**
-  - *Circular Topology (Figure 6-7a):* Each node forwards writes to its neighbor in a ring ($A \to B \to C \to A$). Vulnerable to a single node failure breaking the entire replication loop.
-  - *Star Topology (Figure 6-7b):* Central coordinator node forwards writes to all spoke nodes. Bottlenecked by the central node; failure isolates spokes.
-  - *All-to-All Topology (Figure 6-7c):* Every leader forwards writes directly to every other leader. Maximum fault tolerance, but susceptible to **causality inversion and message overtaking** (Figure 6-8): an update can arrive at a remote node *before* the corresponding insert due to network route latency variance.
-- **Handling Concurrent Write Conflicts (Figure 6-9):**
-  Two leaders concurrently update the title of page 42: Leader 1 sets title to `"B"`, while Leader 2 sets title to `"C"`. Because both writes were accepted locally, a conflict exists when replication messages cross.
-- **Resolution Strategies:**
-  1. *Conflict Avoidance:* Ensure all writes for a given record are routed to the exact same leader (e.g., hashing `user_id` to route all user mutations to the US-East datacenter). Breaks down if a datacenter fails and traffic must failover.
-  2. *Last Write Wins (LWW):* Assign a wall-clock timestamp to each write; the write with the highest timestamp wins; older writes are dropped silently.
-     - *Fatal Flaw:* **Physical clocks cannot be perfectly synchronized across distributed servers** (NTP clock drift is typically 10--100 ms). LWW causes silent data loss and causality violation.
-  3. *Custom Application Logic:*
-     - *On Write:* When a conflict is detected, invoke an application webhook to resolve it immediately.
-     - *On Read:* Preserve all conflicting versions as **siblings**. When the client reads the record, return all siblings, requiring the application/user to merge them (Figure 6-10).
-  4. *Conflict-free Replicated Data Types (CRDTs):* Mathematical data structures (PN-Counters, OR-Sets, LWW-Element-Sets, Tree-Doc) that merge concurrent updates deterministically across all replicas without requiring locks or central coordination.
-  5. *Operational Transformation (OT):* Algorithm used in collaborative text editing (Google Docs). Deconstructs text edits into position offsets and shifts indices concurrently to maintain intent across typing streams (Figure 6-11).
+### 2.4 Multi-Leader Replication: Geo, Topologies, and Local-First Sync Engines
+- **Why:** Single-leader forces every write through one region — inter-region RTT on the write path, write outage if that region or link dies. Multi-leader (active/active, bidirectional) lets each leader accept writes and forward to peers; each leader is also a follower of the others. Sync multi-leader ≈ single-leader (a cut link blocks writes), so the chapter means **async** multi-leader.
+- **Geo multi-leader (Figure 6-6):** A leader per region, leader–follower inside the region (across AZs), leader-to-leader across regions async. Wins: local write latency, per-region availability during partitions. Cost: much weaker consistency — two regions can concurrently overdraw an account or claim one username; no global constraint enforcement (Bailis et al.). Supported by MySQL, Oracle, SQL Server, YugabyteDB, Redis Enterprise, EDB Postgres Distributed, pglogical — often as a retrofit with sharp edges (auto-increment, triggers, constraints), "dangerous territory" if avoidable.
+- **Topologies (Figure 6-7):** Two leaders: only peer-to-peer. Three+: (a) *circular* (each node → one peer, forwards + tags visited node IDs to break loops), (b) *star/tree* (root relays), (c) *all-to-all* (every → every). Ring/star die if one node dies (manual reconfig); all-to-all survives but fast/slow links cause **overtaking** (Figure 6-8): A inserts row 10 on L1, B reads it on L2 and updates it, yet L3 receives the UPDATE before the INSERT ("update row that doesn't exist"). Timestamps can't fix this (clocks untrustworthy, Chapter 9) — need version vectors ("Detecting Concurrent Writes" p. 237). Many systems lack this; test guarantees before trusting docs.
+- **Sync engines & local-first (2nd-edition new):** Your calendar on phone + laptop: each device is a leader (local SQLite/IndexedDB), syncing hours/days later — multi-leader taken to the extreme over an awful network. Same for real-time collaboration (Google Docs/Sheets, Figma multiplayer, Linear): each open tab is a replica; local keystrokes render in <16 ms without server round-trip, remote edits stream in. A **sync engine** library captures local changes, sends or buffers them, receives + merges remote changes into the UI. **Offline-first** = editable offline; **local-first** = offline-first + survivable even if the vendor's servers vanish (open sync protocol, multiple providers — Git is local-first without real-time). Pros: instant UI, no offline mode (offline = huge delay), declarative local reads/writes (no per-RPC error handling), reactive remote updates. Cons: must pre-download the working set — fine for your files, wrong for Amazon's catalog. Lineage: Lotus Notes (1980s), calendar sync, now Firestore/Realm/Ditto (proprietary) and PouchDB/CouchDB, Automerge, Yjs (open). Games' *netcode* solves the same problem differently — out of scope.
 
----
+### 2.5 Dealing with Conflicting Writes
+Wiki page title `A`: User 1 sets `B` on L1, User 2 sets `C` on L2 concurrently (Figure 6-9). *Concurrent* means neither knew of the other — wall-clock simultaneity is irrelevant (offline edits hours apart still conflict). Single-leader never has this.
 
-### 2.5 Leaderless Replication (Dynamo-Style) & Quorum Intersection
-- **The Leaderless Model:** Pioneered by Amazon Dynamo (2007); implemented in Apache Cassandra, ScyllaDB, and Riak. The database has **no designated leader**. Clients write to and read from multiple replicas directly, or submit requests to an arbitrary coordinator node that forwards them on their behalf (Figure 6-12).
-- **Configurable Quorums ($N, W, R$):**
-  - $N$: The total number of replicas configured for the keyspace (typically $N = 3$ or $N = 5$).
-  - $W$: The number of replica acknowledgments required for a write to be considered successful.
-  - $R$: The number of replicas queried for a read operation.
-- **The Quorum Intersection Condition (Figure 6-13):**
-  $$W + R > N$$
-  If $W + R > N$, the set of nodes written to and the set of nodes read from **must overlap in at least one node**. That overlapping node is guaranteed to return the latest value (or highest version number), ensuring read freshness.
-  - *Standard Configuration:* $N = 3, W = 2, R = 2$ (tolerates 1 failed node).
-  - *Read-Heavy Optimization:* $N = 5, W = 5, R = 1$ (high-throughput (see metrics in same paragraph) reads; any node failure breaks writes).
-  - *Write-Heavy Optimization:* $N = 5, W = 1, R = 5$ (high-throughput (see metrics in same paragraph) writes; any node failure breaks reads).
-- **Anti-Entropy & Consistency Repair Mechanisms:**
-  1. *Read Repair (Figure 6-12):* When a client reads from $R$ replicas, it compares the returned version timestamps. If Node 1 and Node 2 return version 6, but Node 3 returns stale version 5, the client (or coordinator) sends an asynchronous write to Node 3 updating it to version 6.
-  2. *Anti-Entropy Background Process:* A continuous background worker compares datasets across replicas to detect missing data. Uses **Merkle Trees** (hierarchical cryptographic hash trees) to compare gigabytes of data over WAN using minimal network bandwidth (transmitting only hashes of diverging sub-ranges).
-- **Sloppy Quorums and Hinted Handoff:**
-  - *Scenario:* A network partition isolates the client from the designated $N$ home replicas for a key.
-  - *Sloppy Quorum:* The database allows writes to be accepted by $W$ healthy nodes that are *outside* the designated $N$ replicas (temporary foster nodes).
-  - *Hinted Handoff:* When the network heals and home replicas recover, the foster nodes forward the buffered writes to the primary home replicas.
-  - *Trade-off:* Sloppy quorums provide extreme write availability, but **break the $W + R > N$ quorum guarantee**; clients reading $R$ home replicas will not observe writes stored on foster nodes until hinted handoff completes.
+#### Concept Comparison: Conflict Handling
+| Strategy | How | Pros | Cons | When |
+| :--- | :--- | :--- | :--- | :--- |
+| **Avoidance** | Pin each record/user to one home leader/region; odd/even auto-increment splits | Zero conflicts normally | Breaks on region failover/user move; offline clients can't avoid | Single-writer-per-key geo apps |
+| **Last-write-wins (LWW)** | Max timestamp wins; ties by value | Trivial, convergent | Random winner among concurrent writes = silent loss; sensitive to clock skew (fix: logical/HLC clocks p. 417) | Insert-only unique keys; Cassandra/ScyllaDB default |
+| **Manual (siblings)** | Store both `B` and `C`; client reads set, merges, writes back | No silent loss | API becomes set-valued; user-merge UI burden; naive union resurrects deletes (Figure 6-10: union of `[Book]` minus Book plus `[Book,DVD]` minus DVD → both reappear); concurrent resolvers can diverge (`B/C` vs `C/B` → `B/C/C/B`) | CouchDB |
+| **Automatic (CRDT/OT)** | Deterministic merge preserving intent (text diffs, OR-Sets with tombstones, PN-counters, per-key merge) | Convergent (strong eventual consistency), no user interruption | Can't enforce invariants (cap list at 5 → must drop); type-restricted | Collaborative/local-first apps |
 
----
+- **CRDTs vs OT (Figure 6-11):** Both start `ice`. One side prepends `n` → `nice`, other appends `!` → `ice!`; merged `nice!`. *OT* (Google Docs, ShareDB): ship index operations (`insert n@0`, `insert !@3`), transform the late operation's index (`3→4`). *CRDT* (Redis Enterprise, Riak, Cosmos DB, Automerge, Yjs): give each character an immutable ID (`i=1A, c=2A…`), new char `4B` stores predecessor ID (`3A`) or nil for head; concurrent inserts at one spot order by ID — no transformation. Lists/arrays generalize; maps merge per key. Eg-walker blends both.
+- **Subtle conflicts:** Same-field collision is obvious; overlapping meeting-room bookings (two inserts, no field collision) still conflict — availability checks race. No ready-made answer; Chapters 8 and 13 build toward detection/resolution.
 
-### 2.6 Causality Tracking: Happens-Before, Version Vectors, and Siblings
-- **The Concurrency Invariant:**
-  - Two operations $A$ and $B$ are **concurrent** if neither operation knew about the other when it was performed (neither "happened before" the other) (Figure 6-14).
-  - In a distributed system without synchronized clocks, physical timestamps cannot determine causality.
-- **The "Happens-Before" Formalism:**
-  - Operation $A$ *happened before* operation $B$ ($A \to B$) if:
-    1. $B$ was executed on the same node after $A$; or
-    2. $B$ knew the result of $A$ (e.g., $B$ read the value written by $A$); or
-    3. Transitivity: $A \to C$ and $C \to B \implies A \to B$.
-  - If neither $A \to B$ nor $B \to A$, then $A$ and $B$ are **concurrent** ($A \parallel B$).
-- **Capturing Causal Dependencies with Version Numbers (Figure 6-15 & 6-16):**
-  1. The server maintains a version number for every key, incremented on every write.
-  2. When a client reads a key, the server returns all current values and the associated version number.
-  3. When a client updates a key, it **must return the version number** it read previously.
-  4. When the server receives a write with version $V$:
-     - It overwrites all stored values with version $\le V$.
-     - It preserves all existing values with version $> V$ (because those represent concurrent writes!).
-     - Stored values that are concurrent are retained as **siblings** (Figure 6-15).
-- **Version Vectors (Vector Clocks):**
-  - When data is distributed across multiple replicas without a single coordinator, a single integer version counter is insufficient.
-  - A **Version Vector** is a collection of version counters, one for each replica node:
-    $$V = [ \text{Node}_1: c_1, \text{Node}_2: c_2, \dots, \text{Node}_M: c_M ]$$
-  - *Comparison Invariant:*
-    - Version vector $V_A$ dominates (happened before) $V_B$ if and only if:
-      $$\forall k, V_A[k] \ge V_B[k] \quad \text{and} \quad \exists k, V_A[k] > V_B[k]$$
-    - If neither dominates, the writes are **concurrent**, and siblings must be created and merged by client logic.
+### 2.6 Leaderless (Dynamo-Style) Replication and Quorum Math
+- **Model:** No leader; client (or coordinator, which unlike a leader imposes no order) writes/reads several replicas in parallel. Dynamo (2007, paper-only; DynamoDB today is single-leader Multi-Paxos), Riak, Cassandra, ScyllaDB.
+- **Node down without failover (Figure 6-12):** `N=3`. Client writes to all 3; 2 ack (one rebooting) → success (client ignores the miss). Reads also fan out; versions disambiguate (newest timestamp wins). Catch-up via: **read repair** (reader pushes newest version to stale replica — best for hot keys), **hinted handoff** (healthy replica stashes hints for the down node, replays on return — covers cold keys), **anti-entropy** (background Merkle-tree diff + copy, unordered, delayed — unlike leader log).
+- **Quorums:** `N` = replicas per key (sharding in Chapter 7 means one key lives on `N` nodes, not all nodes). `W` = acks needed for success, `R` = responses needed for a read. Requests go to all `N` in parallel; `W/R` = how many successes we wait for.
+$$W + R > N$$
+Overlap guarantees at least one read replica saw the latest write (Figure 6-13). Common: `N=3, W=2, R=2` (tolerate 1 down) or `N=5, W=3, R=3` (tolerate 2); read-heavy `W=N, R=1` (one down node kills writes); write-heavy `W=1, R=N` inverted. `W<N` keeps writes alive with a node down; `R<N` keeps reads alive.
+- **Quorum ≠ guarantee (limitations):** `W+R>N` still confuses: restored node from stale replica can drop below `W`; rebalancing (Chapter 7) skews who holds the `N`; concurrent write+read may or may not see the write (later read can regress — p. 411); failed writes (<W acks) aren't rolled back (later reads may/may not see them); LWW wall-clock skew silently drops writes (Cassandra/ScyllaDB, "Synchronized Clocks" p. 362); concurrent writes arrive in opposite orders → multi-leader-like conflict (next section). Dynamo-style is eventual-consistency-optimized; tune `W/R` as stale-read probability (PBS), not absolute truth.
+- **Monitoring staleness:** Leader-based: `leader_position − follower_position` = lag. Leaderless: no total order — hint counts and PBS-style probes are weak proxies, but "eventual" must still be quantified for ops.
+- **Performance vs single-leader:** Single-leader reads-from-leader are fresh but bottlenecked on leader capacity, pay failover downtime, and amplify leader slowness. Leaderless has no failover; parallel fan-out + **request hedging** (use fastest responses) shrugs off slow nodes/gray failures (degraded-but-not-dead, HotOS). Costs: hint storage + replay load under stress; larger `W/R` raises tail latency (more chances to hit a slow node — seldom beyond 4-of-7 or 5-of-9); total partition can still deny quorum — mitigated by **sloppy quorums** (Riak/Dynamo) / `ANY` (Cassandra/ScyllaDB): any reachable node takes the write, reads may miss it until handoff.
+- **Multi-region leaderless:** Cassandra/ScyllaDB client picks a local **coordinator**, which fans out within its region + one hop per remote region (avoids N× cross-region). Consistency levels: global quorum, per-region quorum, or local-only (fast, staler). Riak keeps client traffic in-region (`N` = in-region replicas) and replicates regions async like multi-leader.
+
+### 2.7 Detecting Concurrent Writes: Happens-Before, Version Vectors, Dotted Vectors
+- **No total order (Figure 6-14):** A writes `X=A` to nodes 1–2, B writes `X=B` to nodes 2–3. Node 1 sees only `A`, node 3 only `B`, node 2 sees `A` then `B`. Blind overwrite = permanent divergence. Fix with any prior merge strategy (LWW in Cassandra/ScyllaDB; siblings/CRDTs in Riak) — but first *detect* concurrency.
+- **Happens-before (Lamport):** `A → B` if `B` knew/depended on `A`. Else concurrent (`A ∥ B`). Figure 6-8's insert→update is ordered (causal); Figure 6-14's pair is concurrent (neither knew). Three outcomes for any pair: `A→B`, `B→A`, or concurrent. Physical simultaneity is irrelevant — relativity analogy: like light-speed limits, a slow/broken network can make hours-apart operations concurrent.
+- **Single-replica version numbers (Figure 6-15, shopping cart):** Server versions every key; reads return siblings + version; writes must echo the prior version and merge prior siblings (CRDT/user input). Server overwrites ≤ incoming version, keeps > as concurrent. Omit the version → concurrent with everything → pure sibling. Five-step trace (milk/eggs/flour/ham/bacon): C1 adds milk→v1 `[milk]`; C2 (unaware) adds eggs→v2 siblings `[milk],[eggs]`; C1 adds flour on v1→v3 `[milk,flour]` overwrites v1 but keeps v2 `[eggs]`; C2 merges v2 + ham→v4 `[eggs,milk,ham]` overwrites `[eggs]`, concurrent with v3; C1 merges v3 + bacon→v5 overwrites v3, concurrent with v4. Nothing lost, old versions eventually overwritten. Dataflow DAG is Figure 6-16.
+- **Version vectors (multi-replica):** One counter per replica per key; each replica bumps its own and tracks seen counters. The vector decides overwrite vs sibling. **Dotted version vectors** (Riak 2.0) refine this. Vectors ride with reads and must be returned on writes (Riak *causal context*); safe to read one replica and write another (may create siblings, never silent loss). Note: *version vectors* ≠ *vector clocks* (subtle; Schwarz/Mattern, Baquero) — vectors are the right structure for replica-state comparison.
 
 ---
 
 ## 3. Important Figures, Diagrams & Visual Architecture
 
-> 📕 **Original figures quick index (source PDF, 673 pages):** open the PDF at the cited page to verify each reconstruction.
+> 📕 **Original figures quick index (source PDF):** open the PDF at the cited page to verify each reconstruction.
 >
 > | Book Fig | PDF page | What to compare |
 > |---|---|---|
-> | Fig 6-1 | PDF p.223 | Single-leader |
+> | Fig 6-1 | PDF p.223 | Single-leader chain |
 > | Fig 6-2 | PDF p.224 | Sync vs async follower |
 > | Fig 6-3 | PDF p.234 | Read-after-write |
-> | Fig 6-4 | PDF p.237 | Monotonic reads |
-> | Fig 6-5 | PDF p.238 | Consistent prefix |
+> | Fig 6-4 | PDF p.236 | Monotonic reads (user 2345) |
+> | Fig 6-5 | PDF p.237 | Consistent prefix (Poons/Cake) |
 > | Fig 6-6 | PDF p.240 | Multi-leader regions |
-> | Fig 6-7 | PDF p.242 | Tree topologies |
-> | Fig 6-8 | PDF p.243 | Write conflict |
-> | Fig 6-9 | PDF p.246 | LWW title |
-> | Fig 6-10 | PDF p.250 | Shopping-cart merge |
-> | Fig 6-11 | PDF p.251 | OT vs CRDT string |
-> | Fig 6-12 | PDF p.254 | Quorum R+W |
-> | Fig 6-13 | PDF p.256 | W+R>N proof |
-> | Fig 6-14 | PDF p.262 | Dynamo concurrent writes |
-> | Fig 6-15 | PDF p.264 | Causal deps |
-> | Fig 6-16 | PDF p.265 | Happened-before arrows |
+> | Fig 6-7 | PDF p.242 | Topologies (ring/star/all-to-all) |
+> | Fig 6-8 | PDF p.243 | Overtaking / causality |
+> | Fig 6-9 | PDF p.246 | Concurrent title B vs C |
+> | Fig 6-10 | PDF p.249 | Shopping-cart union anomaly |
+> | Fig 6-11 | PDF p.251 | OT vs CRDT on `ice` |
+> | Fig 6-12 | PDF p.254 | Quorum write + read repair |
+> | Fig 6-13 | PDF p.256 | `W+R>N` overlap proof |
+> | Fig 6-14 | PDF p.261 | Dynamo concurrent X=A/B |
+> | Fig 6-15 | PDF p.264 | Cart versions 1–5 |
+> | Fig 6-16 | PDF p.265 | Causal DAG arrows |
 
-
-### Figure 6-1: Single-Leader Replication Architecture
-- **Figure Reference:** `Figure 6-1: Single-leader replication directs all writes to a designated leader (reconstructed from text p. 200)`
+### Figure 6-1: Single-Leader Replication
+- **Figure Reference:** `Figure 6-1: Single-leader replication directs all writes to a designated leader`
 - **Original PDF:** Fig 6-1 → PDF p.223 — open the PDF at page 223 to compare with the Mermaid reconstruction below.
-- **Visual Flow & Description:** Shows clients submitting write operations strictly to the primary leader node. The leader records writes locally and streams replication updates to read-only followers. Clients issue read queries to either leader or followers.
+- **Visual Flow & Description:** Clients send writes only to the leader; leader persists locally and streams binlog/WAL to followers; reads go to leader or any follower.
 - **Mermaid Flowchart:**
 
 ```mermaid
@@ -201,28 +160,28 @@ flowchart TD
 
   subgraph CLUSTER["Replication Cluster"]
     direction TB
-    LEADER[("Primary Leader: Processes all PUT/UPDATE/DELETE")]
-    F1[("Follower 1: Read-Only Replica")]
-    F2[("Follower 2: Read-Only Replica")]
+    LEADER[("Primary Leader:<br/>Processes all writes")]
+    F1[("Follower 1:<br/>Read-Only Replica")]
+    F2[("Follower 2:<br/>Read-Only Replica")]
   end
 
   CLIENT_W -->|"1. Submit Writes"| LEADER
-  LEADER -->|"2. Replication Stream (Binlog / WAL)"| F1
-  LEADER -->|"2. Replication Stream (Binlog / WAL)"| F2
+  LEADER -->|"2. Replication Stream<br/>(Binlog / WAL)"| F1
+  LEADER -->|"2. Replication Stream<br/>(Binlog / WAL)"| F2
 
   CLIENT_R1 -->|"Read Queries"| F1
   CLIENT_R2 -->|"Read Queries"| F2
   CLIENT_R1 -.->|"Read Fallback"| LEADER
 ```
 
-- **Key Takeaway:** Centralizing writes on a single leader guarantees a total order of transactions, but follower replication lag introduces read inconsistency across replicas.
+- **Key Takeaway:** One writer gives total order; async followers give read scale at the cost of lag.
 
 ---
 
-### Figure 6-2: Synchronous vs. Asynchronous Leader-Based Replication
-- **Figure Reference:** `Figure 6-2: Leader-based replication with one synchronous and one asynchronous follower (reconstructed from text p. 202)`
+### Figure 6-2: Synchronous vs Asynchronous Replication
+- **Figure Reference:** `Figure 6-2: Leader-based replication with one synchronous and one asynchronous follower`
 - **Original PDF:** Fig 6-2 → PDF p.224 — open the PDF at page 224 to compare with the Mermaid reconstruction below.
-- **Visual Flow & Description:** Demonstrates the latency and durability trade-offs across replica links. The leader blocks write acknowledgment until Follower 1 (synchronous) responds, while streaming changes to Follower 2 (asynchronous) in the background.
+- **Visual Flow & Description:** Leader blocks on sync Follower 1, streams to async Follower 2 in background with visible delay.
 - **Mermaid Sequence Diagram:**
 
 ```mermaid
@@ -255,40 +214,40 @@ sequenceDiagram
   F2-->>L: Delayed Ack
 ```
 
-- **Key Takeaway:** Semi-synchronous replication guarantees zero data loss ($RPO = 0$) across at least two nodes while preventing a single slow asynchronous follower from blocking client writes.
+- **Key Takeaway:** Semi-sync = two durable copies without letting one slow follower halt the world.
 
 ---
 
-### Figure 6-3: Reading Your Own Writes (Read-After-Write) Anomaly
-- **Figure Reference:** `Figure 6-3: Inconsistencies can arise when a user makes a write, followed by a read from a lagging replica (reconstructed from text p. 211)`
+### Figure 6-3: Reading Your Own Writes
+- **Figure Reference:** `Figure 6-3: Inconsistencies when a user writes then reads from a stale replica`
 - **Original PDF:** Fig 6-3 → PDF p.234 — open the PDF at page 234 to compare with the Mermaid reconstruction below.
-- **Visual Flow & Description:** A user submits an update to the leader. Immediately afterward, their browser reloads and reads from Follower 2, which has a 2-second replication lag. The user observes stale data, creating the illusion of lost data.
+- **Visual Flow & Description:** Alice POSTs to leader, gets 200 OK, reloads from a 2-s-lagging follower — her update is missing.
 - **Mermaid Flowchart:**
 
 ```mermaid
 flowchart TD
   USER["User Browser / Client"]
   LEADER[("Leader Database")]
-  F_LAG[("Lagging Follower: Replication Lag = 2000ms")]
+  F_LAG[("Lagging Follower:<br/>Replication Lag = 2000ms")]
 
-  USER -->|"1. POST /profile/update (status = 'Active')"| LEADER
+  USER -->|"1. POST /profile/update<br/>(status = 'Active')"| LEADER
   LEADER -->|"2. Write Committed (200 OK)"| USER
   LEADER -.->|"3. Async Replication In-Flight (Delayed)"| F_LAG
 
   USER -->|"4. Immediate Reload: GET /profile"| F_LAG
-  F_LAG -->|"5. Returns Stale Data: status = 'Offline'!"| USER
+  F_LAG -->|"5. Returns Stale Data:<br/>status = 'Offline'!"| USER
 
   USER -.->|"ANOMALY: User thinks update failed!"| ANOMALY["Read-Your-Writes Invariant Broken"]
 ```
 
-- **Key Takeaway:** Systems using asynchronous read replicas must enforce read-after-write consistency by routing recent write authors to the leader or tracking client LSNs.
+- **Key Takeaway:** Route own-writes reads to leader or gate on LSN.
 
 ---
 
-### Figure 6-4: Monotonic Reads Anomaly (Time Traveling Backward)
-- **Figure Reference:** `Figure 6-4: Reading from a fresh replica then a stale replica causes time to move backward (reconstructed from text p. 213)`
-- **Original PDF:** Fig 6-4 → PDF p.237 — open the PDF at page 237 to compare with the Mermaid reconstruction below.
-- **Visual Flow & Description:** User 2345 makes two consecutive read queries. Query 1 hits Follower 1 (low lag) and sees a new post. Query 2 hits Follower 2 (high lag) and does not see the post, making time appear to move backward.
+### Figure 6-4: Monotonic Reads (Time Moves Backward)
+- **Figure Reference:** `Figure 6-4: When a user first reads from a fresh replica, then from a stale replica, time appears to go backward`
+- **Original PDF:** Fig 6-4 → PDF p.236 — open the PDF at page 236 to compare with the Mermaid reconstruction below.
+- **Visual Flow & Description:** User 2345 queries twice: first a fresh follower (sees user 1234's comment), then a lagging follower (comment gone).
 - **Mermaid Sequence Diagram:**
 
 ```mermaid
@@ -310,20 +269,20 @@ sequenceDiagram
   Note over User: Anomaly: Post B vanished! Time moved backward!
 ```
 
-- **Key Takeaway:** Monotonic read consistency requires pinning a user's reads to the same replica instance via consistent hashing on the user identifier.
+- **Key Takeaway:** Hash `user_id` → one replica for monotonicity.
 
 ---
 
-### Figure 6-5: Consistent Prefix Reads Anomaly
-- **Figure Reference:** `Figure 6-5: If some shards replicate slower than others, an observer sees causal inversion (reconstructed from text p. 215)`
-- **Original PDF:** Fig 6-5 → PDF p.238 — open the PDF at page 238 to compare with the Mermaid reconstruction below.
-- **Visual Flow & Description:** Observer listens to a conversation partitioned across two shards. Shard 2 replicates faster than Shard 1, so the observer reads the answer before ever seeing the question.
+### Figure 6-5: Consistent Prefix Reads
+- **Figure Reference:** `Figure 6-5: If some shards are replicated slower than others, an observer may see the answer before the question`
+- **Original PDF:** Fig 6-5 → PDF p.237 — open the PDF at page 237 to compare with the Mermaid reconstruction below.
+- **Visual Flow & Description:** Mr. Poons's question rides a slow follower, Mrs. Cake's answer rides a fast one; observer hears *"About 10 seconds"* before *"How far can you see?"*.
 - **Mermaid Flowchart:**
 
 ```mermaid
 flowchart TD
   subgraph S1["Shard 1 (Questions)"]
-    Q["A: 'How many planets?'"]
+    Q["Poons: 'How far can you see?'"]
     L1[("Leader 1")]
     F1[("Follower 1 (Lag = 5000ms)")]
     Q --> L1
@@ -331,7 +290,7 @@ flowchart TD
   end
 
   subgraph S2["Shard 2 (Answers)"]
-    A["B: 'Eight planets.'"]
+    A["Cake: 'About 10 seconds.'"]
     L2[("Leader 2")]
     F2[("Follower 2 (Lag = 10ms)")]
     A --> L2
@@ -340,21 +299,21 @@ flowchart TD
 
   OBSERVER["Outside Observer"]
   OBSERVER -->|"Reads Shard 2 first"| F2
-  F2 -->|"Sees: 'Eight planets.'"| OBSERVER
+  F2 -->|"Sees: 'About 10 seconds.'"| OBSERVER
   OBSERVER -->|"Reads Shard 1 later"| F1
-  F1 -->|"Sees: 'How many planets?'"| OBSERVER
+  F1 -->|"Sees: 'How far can you see?'"| OBSERVER
 
   OBSERVER -.->|"CAUSALITY BROKEN: Answer read before Question!"| ANOMALY["Causal Inversion"]
 ```
 
-- **Key Takeaway:** Independent sharding without cross-partition total order breaks causal prefix order unless causally linked writes share the same partition key.
+- **Key Takeaway:** Independent shard orderings break causality; co-locate related writes.
 
 ---
 
-### Figure 6-6: Multi-Leader Multi-Region Deployment
-- **Figure Reference:** `Figure 6-6: Multi-leader replication across multiple geographical regions (reconstructed from text p. 217)`
+### Figure 6-6: Multi-Leader Across Regions
+- **Figure Reference:** `Figure 6-6: Multi-leader replication across multiple regions`
 - **Original PDF:** Fig 6-6 → PDF p.240 — open the PDF at page 240 to compare with the Mermaid reconstruction below.
-- **Visual Flow & Description:** Displays a multi-datacenter deployment. Each datacenter runs a local leader and follower pool. Writes commit locally with sub-10 ms latency, while leaders synchronize across WAN asynchronously.
+- **Visual Flow & Description:** Leader per region (with local AZ followers); leaders replicate across WAN async.
 - **Mermaid Flowchart:**
 
 ```mermaid
@@ -378,14 +337,14 @@ flowchart LR
   L_US <==>|"Asynchronous WAN Replication (70ms RTT)"| L_EU
 ```
 
-- **Key Takeaway:** Multi-leader replication isolates local write latency from trans-oceanic network RTT, but introduces concurrent write conflicts when two regions modify the same key.
+- **Key Takeaway:** Hides inter-region RTT from writers; sacrifices global constraints.
 
 ---
 
-### Figure 6-7: Multi-Leader Replication Topologies
-- **Figure Reference:** `Figure 6-7: Three example topologies for multi-leader replication (reconstructed from text p. 219)`
+### Figure 6-7: Multi-Leader Topologies
+- **Figure Reference:** `Figure 6-7: Three example topologies for multi-leader replication`
 - **Original PDF:** Fig 6-7 → PDF p.242 — open the PDF at page 242 to compare with the Mermaid reconstruction below.
-- **Visual Flow & Description:** Compares Circular (a), Star (b), and All-to-All (c) replication topologies, highlighting the single point of failure in circular/star vs. the message overtaking hazard in all-to-all.
+- **Visual Flow & Description:** (a) circular, (b) star/tree with root relay, (c) all-to-all. Ring/star forward with visited-ID tags.
 - **Mermaid Flowchart:**
 
 ```mermaid
@@ -414,14 +373,14 @@ flowchart TD
   end
 ```
 
-- **Key Takeaway:** All-to-all topology is the most resilient against node crashes, but requires vector clocks to detect message overtaking across divergent network links.
+- **Key Takeaway:** Dense topologies survive single-node loss but need overtaking protection.
 
 ---
 
-### Figure 6-8: Causality Violation via Network Message Overtaking
-- **Figure Reference:** `Figure 6-8: With multi-leader replication, writes may arrive in the wrong order at some replicas (reconstructed from text p. 220)`
+### Figure 6-8: Writes Arriving in the Wrong Order
+- **Figure Reference:** `Figure 6-8: With multi-leader replication, writes may arrive in the wrong order at some replicas`
 - **Original PDF:** Fig 6-8 → PDF p.243 — open the PDF at page 243 to compare with the Mermaid reconstruction below.
-- **Visual Flow & Description:** Client A inserts a row on Leader 1. Client B reads the row on Leader 2 and updates it. Due to network routing latency, Leader 3 receives Client B's update *before* receiving Client A's insert.
+- **Visual Flow & Description:** A inserts row 10 on L1; B reads it on L2 and updates it; L3 gets UPDATE before INSERT.
 - **Mermaid Sequence Diagram:**
 
 ```mermaid
@@ -448,14 +407,14 @@ sequenceDiagram
   end
 ```
 
-- **Key Takeaway:** Asynchronous multi-leader replication cannot guarantee write ordering without explicit causal dependency tracking (version vectors).
+- **Key Takeaway:** Causality needs version vectors, not wall-clock timestamps.
 
 ---
 
-### Figure 6-9: Concurrent Multi-Leader Write Conflict
-- **Figure Reference:** `Figure 6-9: A write conflict caused by two leaders concurrently updating the same record (reconstructed from text p. 223)`
+### Figure 6-9: Concurrent Write Conflict
+- **Figure Reference:** `Figure 6-9: A write conflict caused by two leaders concurrently updating the same record`
 - **Original PDF:** Fig 6-9 → PDF p.246 — open the PDF at page 246 to compare with the Mermaid reconstruction below.
-- **Visual Flow & Description:** User 1 updates title to `"B"` on Leader 1; User 2 concurrently updates title to `"C"` on Leader 2. When the replication stream crosses, both leaders encounter a conflicting state.
+- **Visual Flow & Description:** Page title `A`: User 1 → `B` on L1, User 2 → `C` on L2. Neither knew of the other.
 - **Mermaid Flowchart:**
 
 ```mermaid
@@ -471,66 +430,66 @@ flowchart TD
   L1 -.->|"Replicate: title = 'B'"| L2
   L2 -.->|"Replicate: title = 'C'"| L1
 
-  L1 --- CONFLICT["CONFLICT: Neither write happened before the other!"]
+  L1 --- CONFLICT["CONFLICT:<br/>Neither write happened before the other!"]
   L2 --- CONFLICT
 ```
 
-- **Key Takeaway:** Multi-leader writes are inherently concurrent; systems must converge to identical state via deterministic conflict resolution (LWW, CRDTs, or custom merge).
+- **Key Takeaway:** Concurrency = unawareness, not simultaneity; needs deterministic merge.
 
 ---
 
-### Figure 6-10: Amazon Shopping Cart Sibling Anomaly (Resurrected Items)
-- **Figure Reference:** `Figure 6-10: Amazon's shopping cart anomaly: deletions merged by taking union of items resurrect deleted entries (reconstructed from text p. 226)`
-- **Original PDF:** Fig 6-10 → PDF p.250 — open the PDF at page 250 to compare with the Mermaid reconstruction below.
-- **Visual Flow & Description:** Device 1 removes an item from the cart. Device 2 concurrently adds a new item. If conflict resolution merges states by taking the set union of carts without tombstones, the deleted item resurrects!
+### Figure 6-10: Shopping-Cart Union Anomaly
+- **Figure Reference:** `Figure 6-10: An example of Amazon's shopping cart anomaly: if conflicts are merged by taking the union, deleted items may reappear`
+- **Original PDF:** Fig 6-10 → PDF p.249 — open the PDF at page 249 to compare with the Mermaid reconstruction below.
+- **Visual Flow & Description:** Device 1 removes Book, Device 2 concurrently removes DVD (starting from `{Book, DVD, Soap}`-like state). Naive union of siblings resurrects both deleted items; correct merge tracks deletions (tombstones) → `{Soap}`.
 - **Mermaid Flowchart:**
 
 ```mermaid
 flowchart TD
-  INIT["Initial State: Cart = [ Book A ]"]
+  INIT["Initial State: Cart = [Book, DVD, Soap]"]
   
   subgraph D1["Device 1 (Offline / Lagging)"]
     direction TB
-    OP1["User removes Book A"] --> STATE1["Local Cart: [ ]"]
+    OP1["User removes Book"] --> STATE1["Local Cart: [DVD, Soap]"]
   end
 
   subgraph D2["Device 2 (Online)"]
     direction TB
-    OP2["User adds Book B"] --> STATE2["Local Cart: [ Book A, Book B ]"]
+    OP2["User removes DVD"] --> STATE2["Local Cart: [Book, Soap]"]
   end
 
   INIT --> D1
   INIT --> D2
 
-  STATE1 --> MERGE{"Naive Set Union Merge: Cart1 U Cart2"}
+  STATE1 --> MERGE{"Naive Set Union Merge:<br/>Cart1 U Cart2"}
   STATE2 --> MERGE
 
-  MERGE --> RESULT["Merged Cart: [ Book A, Book B ]"]
-  RESULT -.->|"ANOMALY: Book A was deleted by user but resurrected!"| BUG["Silent Deletion Failure"]
+  MERGE --> RESULT["Merged Cart:<br/>[Book, DVD, Soap]"]
+  RESULT -.->|"ANOMALY:<br/>Deleted Book and DVD resurrected!"| BUG["Silent Deletion Failure"]
 ```
 
-- **Key Takeaway:** Merging state without tracking deletions causes deleted items to resurrect; distributed systems must represent deletions explicitly using tombstones.
+- **Key Takeaway:** Merge must track deletes as tombstones, not just surviving members.
 
 ---
 
-### Figure 6-11: Collaborative Text Editing: Operational Transformation vs. CRDTs
-- **Figure Reference:** `Figure 6-11: How two concurrent insertions into a string are merged by OT and a CRDT (reconstructed from text p. 228)`
+### Figure 6-11: OT vs CRDT on Text
+- **Figure Reference:** `Figure 6-11: How two concurrent insertions into a string are merged by OT and a CRDT, respectively`
 - **Original PDF:** Fig 6-11 → PDF p.251 — open the PDF at page 251 to compare with the Mermaid reconstruction below.
-- **Visual Flow & Description:** Starting with string `"ice"`, User 1 inserts `"t"` at position 0 to make `"tice"`. User 2 concurrently inserts `"a"` at position 3 to make `"icea"`. OT shifts offsets; a sequence CRDT assigns unique immutable fractional IDs to characters.
+- **Visual Flow & Description:** Both start `ice`. One prepends `n` → `nice`, other appends `!` → `ice!`. OT shifts index `3→4`; CRDT orders by char IDs (`1A, 2A…`, new `4B` after `3A`). Both converge `nice!`.
 - **Mermaid Flowchart:**
 
 ```mermaid
 flowchart TD
-  BASE["Initial String: 'ice' (Positions: i=0, c=1, e=2)"]
+  BASE["Initial String: 'ice'<br/>(i=1A, c=2A, e=3A)"]
 
   subgraph USER1["User 1 Operation"]
     direction TB
-    OP1["Insert 't' at Index 0 -> 'tice'"]
+    OP1["Insert 'n' at Index 0<br/>-> 'nice'"]
   end
 
   subgraph USER2["User 2 Operation"]
     direction TB
-    OP2["Insert 'a' at Index 3 -> 'icea'"]
+    OP2["Insert '!' at Index 3<br/>-> 'ice!'"]
   end
 
   BASE --> USER1
@@ -538,22 +497,30 @@ flowchart TD
 
   subgraph OT_ENGINE["Operational Transformation (OT) Resolution"]
     direction TB
-    OT_RULE["User 2's insertion shifted: Index 3 becomes Index 4 because User 1 inserted 1 character before it"]
+    OT_RULE["User 2 insertion shifted:<br/>Index 3 becomes Index 4<br/>(User 1 inserted 1 character before it)"]
+  end
+
+  subgraph CRDT_ENGINE["CRDT Resolution"]
+    direction TB
+    CRDT_RULE["New '!' gets ID 4B after 3A<br/>Concurrent inserts order by ID"]
   end
 
   USER1 --> OT_ENGINE
   USER2 --> OT_ENGINE
-  OT_ENGINE --> FINAL["Converged String: 'ticea'"]
+  USER1 --> CRDT_ENGINE
+  USER2 --> CRDT_ENGINE
+  OT_ENGINE --> FINAL["Converged String: 'nice!'"]
+  CRDT_ENGINE --> FINAL
 ```
 
-- **Key Takeaway:** Collaborative text editing requires preserving user intent by transforming character index offsets (OT) or assigning immutable fractional position IDs (CRDTs).
+- **Key Takeaway:** OT transforms positions; CRDTs make positions immutable IDs.
 
 ---
 
-### Figure 6-12: Leaderless Quorum Read and Read Repair
-- **Figure Reference:** `Figure 6-12: Writing to a majority of replicas, reading from a majority, and forwarding read repair (reconstructed from text p. 231)`
+### Figure 6-12: Leaderless Quorum Write + Read Repair
+- **Figure Reference:** `Figure 6-12: Writing to a majority of replicas, reading from a majority, and forwarding the latest value to an unavailable replica`
 - **Original PDF:** Fig 6-12 → PDF p.254 — open the PDF at page 254 to compare with the Mermaid reconstruction below.
-- **Visual Flow & Description:** Shows a client executing a quorum write ($N=3, W=2$). Node 3 is down, but the write succeeds on Nodes 1 and 2. Later, Client reads from Nodes 2 and 3 ($R=2$). The client detects Node 3 has stale version 5 and issues an asynchronous Read Repair.
+- **Visual Flow & Description:** User 1234 writes to 3 nodes (1 down, 2 ack → success). User 2345 reads 2 nodes (v6 + stale v5), returns v6, writes v6 back to the stale node.
 - **Mermaid Flowchart:**
 
 ```mermaid
@@ -580,14 +547,14 @@ flowchart TD
   WRITE_PHASE -.-> READ_PHASE
 ```
 
-- **Key Takeaway:** Leaderless architectures achieve high availability by accepting writes even when nodes are down, relying on quorum overlap and read repair to heal stale replicas.
+- **Key Takeaway:** No failover — availability via overlapping majorities + lazy healing.
 
 ---
 
-### Figure 6-13: The Quorum Intersection Condition ($W + R > N$)
-- **Figure Reference:** `Figure 6-13: If w + r > n, at least one of the r replicas read from must have seen the write (reconstructed from text p. 233)`
+### Figure 6-13: Quorum Intersection (`W+R>N`)
+- **Figure Reference:** `Figure 6-13: If w + r > n, at least one of the r replicas you read from must have seen the most recent successful write`
 - **Original PDF:** Fig 6-13 → PDF p.256 — open the PDF at page 256 to compare with the Mermaid reconstruction below.
-- **Visual Flow & Description:** Illustrates the Pigeonhole Principle applied to distributed quorums ($N=5, W=3, R=3$). The overlap between write and read nodes guarantees at least one replica contains the latest update.
+- **Visual Flow & Description:** `N=5, W=3, R=3`: write set `{1,2,3}`, read set `{3,4,5}` — node 3 guarantees freshness (pigeonhole principle).
 - **Mermaid Flowchart:**
 
 ```mermaid
@@ -614,86 +581,106 @@ flowchart TD
   N3 -.->|"OVERLAPPING QUORUM NODE: Contains Latest Written Value!"| INTERSECT["Guaranteed Intersection"]
 ```
 
-- **Key Takeaway:** When $W + R > N$, quorum intersection guarantees that stale reads are mathematically impossible, provided writes are executed sequentially.
+- **Key Takeaway:** `W+R>N` = overlap; majorities are the common case, not the only case.
 
 ---
 
-### Figure 6-14: Concurrent Writes in Leaderless Datastores (No Total Order)
-- **Figure Reference:** `Figure 6-14: Concurrent writes in a Dynamo-style datastore have no well-defined order (reconstructed from text p. 238)`
-- **Original PDF:** Fig 6-14 → PDF p.262 — open the PDF at page 262 to compare with the Mermaid reconstruction below.
-- **Visual Flow & Description:** Client 1 writes $X=A$ to Nodes 1 and 2. Client 2 concurrently writes $X=B$ to Nodes 2 and 3. Node 2 receives $A$ then $B$; Node 1 only has $A$; Node 3 only has $B$. There is no global order.
+### Figure 6-14: Concurrent Dynamo Writes Have No Order
+- **Figure Reference:** `Figure 6-14: Concurrent writes in a Dynamo-style datastore: there is no well-defined ordering`
+- **Original PDF:** Fig 6-14 → PDF p.261 — open the PDF at page 261 to compare with the Mermaid reconstruction below.
+- **Visual Flow & Description:** A writes `X=A` to nodes 1–2; B writes `X=B` to nodes 2–3. Node 1 = `A`, node 3 = `B`, node 2 = `A` then `B`. No global order.
 - **Mermaid Flowchart:**
 
 ```mermaid
 flowchart TD
-  C1["Client 1: PUT X = 'A'"]
-  C2["Client 2: PUT X = 'B'"]
+  C1["Client A:<br/><code>PUT X = 'A'</code>"]
+  C2["Client B:<br/><code>PUT X = 'B'</code>"]
 
-  N1[("Node 1: Receives 'A' only")]
-  N2[("Node 2: Receives 'A' then 'B'")]
-  N3[("Node 3: Receives 'B' only")]
+  N1[("Node 1:<br/>Receives 'A' only")]
+  N2[("Node 2:<br/>Receives 'A' then 'B'")]
+  N3[("Node 3:<br/>Receives 'B' only")]
 
   C1 --> N1
   C1 --> N2
   C2 --> N2
   C2 --> N3
 
-  N1 --- DIVERGE["Node 1 thinks X='A'"]
-  N2 --- DIVERGE2["Node 2 thinks X='B'"]
-  N3 --- DIVERGE3["Node 3 thinks X='B'"]
+  N1 --- DIVERGE["Node 1:<br/>Stores X = 'A'"]
+  N2 --- DIVERGE2["Node 2:<br/>Stores X = 'B'"]
+  N3 --- DIVERGE3["Node 3:<br/>Stores X = 'B'"]
 
-  DIVERGE -.->|"CONCURRENCY COLLAPSE: No consensus on total order!"| FAIL["Replica Inconsistency"]
+  DIVERGE -.->|"CONCURRENCY COLLAPSE:<br/>No consensus on total order!"| FAIL["Replica<br/>Inconsistency"]
 ```
 
-- **Key Takeaway:** Leaderless stores accept concurrent writes without coordination, requiring vector clocks and sibling reconciliation to resolve ordering ambiguity.
+- **Key Takeaway:** Leaderless accepts divergence; vectors + merge restore convergence.
 
 ---
 
-### Figure 6-15 & 6-16: Capturing Causality and Version Vectors
-- **Figure Reference:** `Figure 6-15: Capturing causal dependencies between concurrent clients and their DAG representation (reconstructed from text pp. 241-243)`
-- **Original PDF:** Fig 6-15 → PDF p.264 — open the PDF at page 264 to compare with the Mermaid reconstruction below. & 6-16
-- **Visual Flow & Description:** Tracks two clients concurrently updating a shopping cart. When a client submits an update without knowing about a concurrent update, siblings are created. A client merge reconciles siblings into a single causal successor.
+### Figure 6-15: Capturing Causal Dependencies (Cart Versions)
+- **Figure Reference:** `Figure 6-15: Capturing causal dependencies between two clients concurrently editing a shopping cart`
+- **Original PDF:** Fig 6-15 → PDF p.264 — open the PDF at page 264 to compare with the Mermaid reconstruction below.
+- **Visual Flow & Description:** Single-replica version numbers 1–5 across milk/eggs/flour/ham/bacon writes; each write echoes its base version; server keeps concurrent siblings.
 - **Mermaid Flowchart:**
 
 ```mermaid
 flowchart TD
-  INIT["v1: Cart = ['Milk']"]
+  INIT["v1: Cart = ['Milk']<br/>C1 adds milk"]
 
-  C1["Client 1: Reads v1 -> Adds 'Eggs' -> Writes v2: ['Milk', 'Eggs']"]
-  C2["Client 2: Reads v1 (concurrently) -> Adds 'Flour' -> Writes v3: ['Milk', 'Flour']"]
+  C1["C2 (unaware) adds eggs -> v2<br/>Siblings: [milk], [eggs]"]
+  C2["C1 adds flour on v1 -> v3<br/>[milk,flour] overwrites v1, keeps [eggs]"]
 
   INIT --> C1
-  INIT --> C2
+  C1 --> C2
 
-  C1 --> SIBLINGS["Concurrent Siblings Created: { v2: ['Milk', 'Eggs'], v3: ['Milk', 'Flour'] }"]
-  C2 --> SIBLINGS
-
-  SIBLINGS --> MERGE["Client 3 Reads Both Siblings -> Merges to ['Milk', 'Eggs', 'Flour'] -> Writes v4 (supersedes v2 and v3)"]
+  C2 --> C3["C2 merges v2 + ham -> v4<br/>[eggs,milk,ham] overwrites [eggs], concurrent with v3"]
+  C3 --> C4["C1 merges v3 + bacon -> v5<br/>Overwrites v3, concurrent with v4"]
 ```
 
-- **Key Takeaway:** Causality forms a Directed Acyclic Graph (DAG); systems track versions to detect concurrent mutations, preserving siblings until an application merge unifies them.
+- **Key Takeaway:** Base-version echo lets the server separate overwrites from concurrent siblings.
+
+---
+
+### Figure 6-16: Causal-Dependency Graph
+- **Figure Reference:** `Figure 6-16: A graph of the causal dependencies in Figure 6-15`
+- **Original PDF:** Fig 6-16 → PDF p.265 — open the PDF at page 265 to compare with the Mermaid reconstruction below.
+- **Visual Flow & Description:** DAG arrows = "knew about / depended on". Branching = concurrency; joining = merge. Clients stay perpetually slightly stale yet no writes are lost.
+- **Mermaid Flowchart:**
+
+```mermaid
+flowchart TD
+  V1["v1 [milk]"] --> V2["v2 [eggs]<br/>(concurrent with v1-child)"]
+  V1 --> V3["v3 [milk,flour]<br/>(supersedes v1)"]
+  V2 --> V4["v4 [eggs,milk,ham]<br/>(merges v2, concurrent with v3)"]
+  V3 --> V5["v5 [milk,flour,eggs,bacon]<br/>(merges v3, concurrent with v4)"]
+  V2 -.->|"concurrent"| V3
+  V3 -.->|"concurrent"| V4
+```
+
+- **Key Takeaway:** Causality is a DAG; version vectors generalize these arrows to N replicas (dotted vectors in Riak 2.0).
 
 ---
 
 ## 4. Real-World Systems, Case Studies & Code Examples
 
 ### 4.1 Industry Implementations & Architectural Divergence
-- **MySQL InnoDB Primary-Replica:** Canonical single-leader implementation. Uses binary log (binlog) row-based replication. Supports asynchronous and semi-synchronous replication (via the `semisync` plugin).
-- **MongoDB Replica Sets:** Single-leader replication managed via an automated Raft-like election algorithm. Uses an internal capped collection (`oplog.rs`) to stream idempotent document transformations.
-- **Apache Cassandra & ScyllaDB:** Canonical leaderless Dynamo-style stores. Configurable $N, W, R$ per keyspace and query (`LOCAL_QUORUM`, `QUORUM`, `ONE`). Uses Murmur3 token rings, Bloom filters, and SSTables. Implements background anti-entropy via Merkle trees and on-demand read repairs.
-- **Automerge & Yjs (Local-First CRDTs):** High-performance client-side CRDT engines for collaborative applications. Automerge implements JSON-like document CRDTs; Yjs provides ultra-fast text editing and array sync using fractional indexing and state vectors.
+- **MySQL InnoDB Primary-Replica:** Row-based binlog (+GTIDs), async + semi-sync plugin, orchestrator-driven failover. GitHub lesson: fence before promote.
+- **PostgreSQL + pglogical / EDB:** WAL shipping (version-coupled) vs logical decoding (version-tolerant, CDC-friendly). WAL-G/Litestream bridge to object-store backups.
+- **MongoDB Replica Sets:** Single-leader with Raft-like election, oplog streaming of idempotent ops.
+- **Cassandra / ScyllaDB:** Leaderless, `N/W/R` per keyspace/query (`ONE`, `LOCAL_QUORUM`, `QUORUM`, `ANY` sloppy), Murmur3 rings, read repair + hinted handoff + Merkle anti-entropy, LWW by commit timestamp.
+- **CouchDB / PouchDB:** Multi-leader sync-engine heritage, sibling-preserving manual merge.
+- **Automerge & Yjs (local-first CRDTs):** JSON/text CRDTs with fractional indices + state vectors for Figma-like collaboration; ShareDB as the OT counterpart; Redis Enterprise / Cosmos DB as server-side CRDT stores.
 
 ---
 
 ### 4.2 Production Implementation: Vector Clock & Causality Tracker
 
 ```python
-from typing import Dict, List, Tuple, Any
+from typing import Dict, List, Any
 
 class VectorClock:
     """
-    Implements a distributed Vector Clock to detect happens-before
-    relationships and concurrent sibling mutations across replicas.
+    Distributed Vector Clock to detect happens-before
+    vs concurrent sibling mutations across replicas.
     """
     def __init__(self, clock_dict: Dict[str, int] = None):
         self.clock: Dict[str, int] = dict(clock_dict) if clock_dict else {}
@@ -704,13 +691,8 @@ class VectorClock:
         return VectorClock(new_clock)
 
     def dominates(self, other: "VectorClock") -> bool:
-        """
-        Returns True if self strictly happened-after other (self > other).
-        True iff self >= other for all nodes and self > other for at least one.
-        """
         all_keys = set(self.clock.keys()).union(set(other.clock.keys()))
         strictly_greater = False
-
         for k in all_keys:
             v_self = self.clock.get(k, 0)
             v_other = other.clock.get(k, 0)
@@ -718,11 +700,9 @@ class VectorClock:
                 return False
             if v_self > v_other:
                 strictly_greater = True
-
         return strictly_greater
 
     def is_concurrent_with(self, other: "VectorClock") -> bool:
-        """Returns True if self and other are concurrent (neither dominates)."""
         return not self.dominates(other) and not other.dominates(self) and self.clock != other.clock
 
 class DistributedRecord:
@@ -731,31 +711,22 @@ class DistributedRecord:
         self.vclock = vclock
 
 def reconcile_concurrent_writes(
-    existing_records: List[DistributedRecord], 
+    existing_records: List[DistributedRecord],
     incoming_record: DistributedRecord
 ) -> List[DistributedRecord]:
-    """
-    Reconciles an incoming write against existing versioned siblings.
-    Discards obsolete records dominated by incoming write; preserves concurrent siblings.
-    """
+    """Keep concurrent siblings; discard dominated (overwritten) versions."""
     surviving: List[DistributedRecord] = []
     incoming_is_obsolete = False
-
     for record in existing_records:
         if record.vclock.dominates(incoming_record.vclock):
-            # Incoming record is older than existing record; discard incoming
             incoming_is_obsolete = True
             surviving.append(record)
         elif incoming_record.vclock.dominates(record.vclock):
-            # Existing record is obsolete; do not keep it
             continue
         else:
-            # Records are concurrent; preserve existing sibling
             surviving.append(record)
-
     if not incoming_is_obsolete:
         surviving.append(incoming_record)
-
     return surviving
 ```
 
@@ -764,13 +735,11 @@ def reconcile_concurrent_writes(
 ### 4.3 Production Implementation: Quorum Read Repair Coordinator
 
 ```python
-import time
 from typing import List, Optional, Tuple, Any
 
 class ReplicaNode:
     def __init__(self, node_id: str):
         self.node_id = node_id
-        # key -> (value, timestamp_ms)
         self.storage: dict = {}
 
     def get(self, key: str) -> Optional[Tuple[Any, int]]:
@@ -780,68 +749,45 @@ class ReplicaNode:
         self.storage[key] = (value, timestamp_ms)
 
 class QuorumCoordinator:
-    """
-    Executes Dynamo-style quorum reads (R) with automated Read Repair
-    across a cluster of N replica nodes.
-    """
+    """Dynamo-style quorum reads (R) with async read repair."""
     def __init__(self, replicas: List[ReplicaNode]):
         self.replicas = replicas
         self.N = len(replicas)
 
     def quorum_read(self, key: str, R: int) -> Any:
         if R > self.N:
-            raise ValueError("Read quorum R cannot exceed cluster replica count N.")
-
-        # Query R replicas
-        responses: List[Tuple[ReplicaNode, Optional[Tuple[Any, int]]]] = []
-        for replica in self.replicas[:R]:
-            val = replica.get(key)
-            responses.append((replica, val))
-
-        # Filter out None responses
-        valid_responses = [(node, res) for node, res in responses if res is not None]
-        if not valid_responses:
-            return None  # Key does not exist on any queried replica
-
-        # Find the winner with the highest physical timestamp (LWW)
-        winner_node, (winner_val, highest_ts) = max(
-            valid_responses, 
-            key=lambda item: item[1][1]
-        )
-
-        # Trigger asynchronous Read Repair on stale replicas
+            raise ValueError("Read quorum R cannot exceed N.")
+        responses = [(replica, replica.get(key)) for replica in self.replicas[:R]]
+        valid = [(node, res) for node, res in responses if res is not None]
+        if not valid:
+            return None
+        winner_node, (winner_val, highest_ts) = max(valid, key=lambda item: item[1][1])
         for node, res in responses:
             if res is None or res[1] < highest_ts:
-                # Dispatch background write repair
                 node.put(key, winner_val, highest_ts)
-
         return winner_val
 ```
 
 ---
 
-### 4.4 Production War Story: The GitHub MySQL Master Failover Outage
-- **The Context:** GitHub operated an active-passive MySQL replication topology for its core relational data tier. An automated orchestrator monitored the primary master via periodic heartbeats. A passive replica was configured to take over in the event of primary failure.
-- **The Incident:** During a routine network maintenance window, a transient 15-second network glitch interrupted traffic between the active MySQL primary and the monitoring orchestrator. The primary continued processing local application transactions, but the orchestrator presumed the master dead and initiated an emergency failover.
-- **The Cascade:** The orchestrator promoted a replica to master and updated internal DNS records. However, because client connection pooling did not immediately tear down active TCP connections to the old master, the old master continued accepting write transactions for several seconds concurrently with the newly promoted master (**Split-Brain**).
-- **The Disaster:** When the old master was finally isolated, the two databases had diverged: auto-incrementing primary keys had been independently issued for distinct pull requests, comments, and commit status checks. Merging the data required writing custom forensic python scripts to reconstruct chronological event order and remap conflicting foreign keys across millions of rows, causing a 24-hour service degradation.
-- **Remediation & Architecture Lessons:**
-  1. *Fencing Tokens & STONITH:* Implemented fencing primitives (Shoot The Other Node In The Head - STONITH) using power distribution unit (PDU) network switches to forcefully power off a dead primary before promoting a follower.
-  2. *Raft-Based Orchestration:* Replaced ad-hoc heartbeat scripts with GitHub's open-source `orchestrator` tool using Raft consensus to prevent split-brain leader promotions.
+### 4.4 Production War Story: The GitHub MySQL Failover Outage
+- **Context:** Active-passive MySQL with heartbeat orchestrator and passive failover replica.
+- **Incident:** 15-s network blip isolated the primary from the orchestrator but not from app servers. Orchestrator declared it dead.
+- **Cascade:** Replica promoted while old primary still accepted writes (split-brain window: pooled TCP connections lingered). Both issued auto-increment keys independently.
+- **Disaster:** Overlapping primary keys joined against Redis state → private data surfaced to wrong users; forensic key-remap across millions of rows, ~24-h degradation (see also the 2012 "Downtime Last Saturday" double-shutdown caution).
+- **Lessons:** STONITH/fencing before promotion; Raft-based orchestrator elections; semi-sync or group-replication (Paxos) so commits require a second copy; pick max-LSN follower and reject far-behind candidates.
 
 ---
 
 ## 5. Architectural Trade-Off Matrix
 
-| Replication Architecture | Write Path Latency | Read Path Latency | Scalability Bottleneck | Conflict Resolution Complexity | Fault Tolerance & Failover | Best Workload Fit | Catastrophic Failure Mode |
-| :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- |
-| **Single-Leader: Asynchronous** | Minimal (Local write; sub-5 ms) | Sub-millisecond (Scale reads via follower pool) | Single leader CPU & disk write throughput | Zero (Leader defines canonical total order) | Requires failover; un-replicated writes lost on leader crash | Read-dominant web applications ($>90\%$ reads); strict ACID | Discarded writes on failover; replication lag anomalies |
-| **Single-Leader: Synchronous** | High (Bounded by slowest follower network RTT) | Sub-millisecond | Bounded by slowest node in synchronous set | Zero (Total order maintained) | Zero data loss ($RPO = 0$); stalls if any sync follower halts | Financial ledgers; zero-data-loss compliance workloads | Single lagging follower halts all write processing globally |
-| **Multi-Leader (Multi-DC / Active-Active)** | Minimal local write ($<5\ \text{ms}$ in local DC) | Minimal (Read from local DC leader/replicas) | Cross-datacenter conflict resolution CPU | **Extreme** (Requires LWW, CRDTs, or custom application merges) | Survives entire DC blackout; local DCs continue operating | Multi-region global applications; collaborative editing; offline clients | Concurrent write conflicts; LWW wall-clock skew data loss |
-| **Leaderless: Strong Quorum ($W+R > N$)** | Moderate (Waits for $W$ concurrent acknowledgments) | Moderate (Waits for $R$ concurrent responses) | Network packet fan-out; slowest replica in quorum | High (Requires version vectors and sibling handling) | High availability; tolerates $(N - W)$ concurrent node crashes | Write-heavy telemetry; caching layers; shopping carts | Sloppy quorums violate linearizability; sibling explosion |
-| **Leaderless: Weak Quorum ($W+R \le N$)** | Blazing ($W=1$; fire-and-forget) | Blazing ($R=1$; read nearest node) | Background anti-entropy Merkle tree sync | High (Stale reads and silent overwrites frequent) | Maximum availability; system operates under massive partitions | Ephemeral metrics; logging; non-critical counter tracking | Severe data loss; arbitrary dirty reads of obsolete states |
-
----
+| Replication Architecture | Write Latency | Read Scalability | Conflict Handling | Failover / Availability | Best Fit | Catastrophic Mode |
+| :--- | :--- | :--- | :--- | :--- | :--- | :--- |
+| **Single-Leader Async** | Minimal (local ack) | Excellent (follower pool) | None (total order) | Failover; un-replicated writes lost | Read-heavy web (>90% reads) | Discarded writes; lag anomalies |
+| **Single-Leader Semi-Sync** | Bounded by sync follower RTT | Excellent | None | RPO=0 (2 copies); stalls if sync follower down | Ledgers, compliance | One slow node halts writes |
+| **Multi-Leader** | Local (<5 ms in-region) | Local reads | Extreme (LWW/CRDT/OT/manual) | Survives region loss; online through partitions | Geo-active, collaboration, offline/local-first | Silent LWW loss; constraint violations |
+| **Leaderless Strong (`W+R>N`)** | Waits for `W` acks | Waits for `R` responses | High (vectors + siblings) | Tolerates `N-W`/`N-R` down; hedging vs gray failure | Write-available telemetry, carts | Sloppy quorums break overlap; sibling explosion |
+| **Leaderless Weak (`W+R≤N`)** | Blazing (`W=1`) | Blazing (`R=1`) | High, often ignored | Max availability | Ephemeral metrics/logs | Frequent stale reads, drops |
 
 ### Concrete Decision Heuristics
 
@@ -863,92 +809,68 @@ Decision Tree for Replication Strategy:
 
 ## 6. Jargon Buster & Key Terminology
 
-- **Replication Lag:** The duration of time between a write transaction committing on the leader and that mutation applying on an asynchronous follower replica.
-- **Read-After-Write Consistency (Read-Your-Writes):** A consistency guarantee ensuring that a user will always see their own submitted updates upon reloading data.
-- **Monotonic Reads:** A consistency guarantee ensuring that if a user reads data in sequence, they will never observe data in an earlier state than what was returned in previous reads.
-- **Consistent Prefix Reads:** A consistency guarantee ensuring that if a series of writes occurs in a specific causal order, any concurrent reader will observe those writes in the exact same causal order.
-- **Split-Brain:** A catastrophic distributed condition where two distinct nodes simultaneously believe they are the authoritative primary leader, accepting conflicting writes that permanently diverge data.
-- **Fencing Token:** A monotonically increasing integer counter issued by a consensus coordinator that invalidates older, zombie leaders attempting to commit mutations to shared storage.
-- **Quorum ($W + R > N$):** A distributed voting protocol where the number of nodes required to acknowledge a write ($W$) plus the number of nodes queried for a read ($R$) exceeds total cluster replicas ($N$), guaranteeing overlap.
-- **Sloppy Quorum:** A leaderless configuration where writes are accepted by temporary foster nodes when the designated home replicas are unreachable during a network partition.
-- **Hinted Handoff:** An operational mechanism where foster nodes buffer writes accepted during a sloppy quorum and stream them back to primary home replicas once the network heals.
-- **Version Vector (Vector Clock):** A distributed vector of per-node version numbers used to determine whether two independent mutations possess a causal happens-before relationship or are concurrent siblings.
-- **Conflict-free Replicated Data Type (CRDT):** An abstract data type designed to replicate across multiple network nodes, allowing local mutations without coordination and converging deterministically to identical state.
+- **Replication Lag:** Delay between leader commit and follower apply; unbounded under stress.
+- **Read-After-Write (Read-Your-Writes):** You always see your own updates on reload.
+- **Monotonic Reads:** Successive reads by one user never move backward in time.
+- **Consistent Prefix Reads:** Causally ordered writes are observed in that order.
+- **Split-Brain:** Two nodes both believe they are leader and diverge.
+- **Fencing Token / STONITH:** Monotonic epoch rejecting zombie leaders; ultimate form powers off the old leader.
+- **Quorum (`W+R>N`):** Write acks + read responses overlap on ≥1 node. `N` total, `W` write threshold, `R` read threshold.
+- **Sloppy Quorum / `ANY`:** Foster nodes outside home `N` take writes during partitions; overlap suspended until handoff.
+- **Hinted Handoff / Read Repair / Anti-Entropy:** Push-on-return, fix-on-read, and background Merkle-diff healing.
+- **Happens-Before / Concurrent:** `B` knew of `A` vs neither knew of the other (Lamport).
+- **Version Vector / Dotted Version Vector:** Per-replica-per-key counters (Riak 2.0) separating overwrites from siblings; distinct from vector clocks.
+- **CRDT / OT:** Convergent merge types (immutable IDs) vs index-transforming collaborative edits; both give strong eventual consistency.
+- **Sync Engine / Local-First:** Background bidirectional replication with local persistence; local-first survives vendor shutdown.
+- **Zero-Disk Architecture:** All durable data on object storage; compute nodes stateless caches.
 
 ---
 
 ## 7. System Design & Practical Engineering Takeaways
 
 ### 7.1 Production Engineering Checklist
-1. **Never Deploy Asynchronous Failover Without Fencing (STONITH):** Ensure automated failover orchestrators (e.g., Orchestrator, Patroni) can forcibly fence or power down an unresponsive primary via IPMI or cloud API before promoting a follower.
-2. **Pin User Reads to Replicas via Hash Routing:** Prevent monotonic read inversions and time-traveling anomalies by hashing the client's session ID to route their queries deterministically to the same read replica.
-3. **Monitor Replication Lag in Milliseconds, Not Seconds:** In MySQL or PostgreSQL, monitor replica lag using high-resolution heartbeat tables (e.g., Pt-Heartbeat) rather than relying on `Seconds_Behind_Master`, which only measures SQL thread transaction timestamps.
-4. **Enforce Tombstone Tracking on Distributed Deletions:** When implementing multi-leader or leaderless synchronization, never delete records by simply removing keys from local dictionaries. Always store an explicit tombstone record with a deletion timestamp to prevent resurrected items.
-5. **Never Rely on NTP Server Clocks for Last-Write-Wins (LWW):** Physical clock drift (NTP skew) across cloud servers makes LWW non-deterministic. If absolute ordering is required, use hybrid logical clocks (HLC) or state-based vector clocks.
+1. **Never auto-failover without fencing:** Wire STONITH/IPMI/cloud-IAM revocation before promotion; prefer Raft-based orchestrators.
+2. **Pin reads for monotonicity:** Hash session/user ID to one replica; gate post-write reads on LSN for 60 s.
+3. **Monitor lag + staleness:** Leader lag via heartbeat tables (not `Seconds_Behind_Master`); leaderless via hint backlog + PBS probes with alerts.
+4. **Tombstone deletes:** Never bare-delete in multi-leader/leaderless; store deletion markers or deletes resurrect (Figure 6-10).
+5. **Distrust wall clocks for LWW:** NTP skew flips winners; use logical/HLC clocks or vectors where loss matters.
+6. **Pre-plan object-store costs:** Batch to amortize per-call fees; keep WAL on low-latency volumes even in zero-disk designs.
 
 ---
 
 ### 7.2 System Design Interview Strategy
-- **Address Failover Data Loss Proactively:** When proposing a primary-replica database in an interview, do not treat failover as magic. State: *"We will configure semi-synchronous replication with at least one synchronous replica to ensure an $RPO=0$ guarantee. If the primary crashes, failover promotes the synchronized follower to prevent lost writes."*
-- **Explain Quorum Calculations with Concrete Numbers:** When designing Amazon Dynamo or Cassandra storage, calculate quorum trade-offs explicitly: *"For $N=3$, we select $W=2, R=2$. This allows the system to tolerate 1 node failure for writes and 1 node failure for reads while maintaining strong quorum intersection ($W + R = 4 > 3$)."*
-- **Propose Sticky Routing for Replication Lag:** When asked how to prevent users from seeing stale profiles immediately after editing, explain the dual-routing heuristic: *"We route profile reads for the editing user to the leader for 60 seconds post-mutation, while routing general read traffic across asynchronous followers."*
+- **Nail failover explicitly:** *"Semi-sync with one sync follower gives RPO=0; on crash we promote the max-LSN follower after fencing the old primary."*
+- **Show quorum math:** *"N=3, W=2, R=2 tolerates 1 down each way with 4>3 overlap; N=5, W=3, R=3 tolerates 2."* Contrast `W=N,R=1` (reads fast, any down node kills writes).
+- **Volunteer lag fixes:** *"Own-profile reads from leader for 60 s post-write; sticky replica per user; same-shard causality."*
+- **Name the merge:** *"Counter → PN-CRDT, cart → OR-Set with tombstones, text → Yjs/Automerge or OT; show tombstone + vector."*
 
 ---
 
 ### 7.3 Mastery Self-Assessment Questions
 
 #### Question 1 (Conceptual Depth)
-*Why does a quorum configuration where $W + R > N$ fail to provide true linearizability (strict real-time consistency) in leaderless distributed datastores like Apache Cassandra?*
-- **Answer:** 
-  While $W + R > N$ guarantees that the read set and write set overlap on at least one physical replica, it does **not** guarantee linearizability due to several edge conditions:
-  1. *Concurrent Write Overwriting:* If two writes occur concurrently, replicas may receive them in different orders. A quorum read can return a mix of values unless an absolute total order (such as Paxos consensus) is enforced.
-  2. *Sloppy Quorums & Hinted Handoff:* Under network partitions, writes are accepted by foster nodes outside the $N$ home replicas. A subsequent quorum read of $R$ home replicas will not intersect with the foster nodes, returning stale data until hinted handoff completes.
-  3. *Torn Writes & Partial Failures:* If a write succeeds on 1 node but fails on the second (failing to achieve $W=2$), the client receives a failure acknowledgment. However, the value remains on that 1 node. A subsequent reader may or may not see this value, violating linearizability.
-  4. *Read Repair Race Conditions:* A reader detecting a stale value triggers an asynchronous read repair. If a concurrent reader reads the same key before the repair completes, it can observe the stale value again, causing time to move backward.
+*Why does `W+R>N` fail to guarantee linearizability in Cassandra-like stores?*
+- **Answer:**
+  1. *Concurrent writes* arrive in different orders — overlap still yields mixed values without total order (Paxos).
+  2. *Sloppy quorums* park writes on foster nodes outside home `N`; home-`R` reads miss them until handoff.
+  3. *Sub-`W` partial writes* persist where they landed despite client-visible failure.
+  4. *Read-repair races* let a second reader see stale data before async repair lands; concurrent read+write may or may not observe the write.
 
 #### Question 2 (Failure Scenario & Edge Cases)
-*A financial exchange cluster operates a 3-node MySQL group using asynchronous replication. Node 1 is the primary. Node 2 has a replication lag of 150 ms; Node 3 has a replication lag of 2,500 ms. A network switch failure isolates Node 1 from the client pool and orchestrator. The automated failover tool immediately promotes Node 3 to master. Diagnose the architectural defects in this failover execution, analyze the data corruption that will occur, and prescribe the correct failover protocol.*
+*3-node async MySQL: N1 primary, N2 lag 150 ms, N3 lag 2,500 ms. Switch isolates N1 from orchestrator; tool promotes N3. Diagnose and fix.*
 - **Answer:**
-  - *Architectural Defects:*
-    1. *Incorrect Replica Selection:* The orchestrator promoted Node 3 (the most lagging replica with 2,500 ms lag) instead of Node 2 (which had only 150 ms lag).
-    2. *Lack of Fencing:* Node 1 was isolated from the orchestrator but not verified dead, leaving it vulnerable to accepting writes if clients could reach it through alternative network paths (split-brain).
-  - *Data Corruption Analysis:*
-    - Node 3 was missing 2.5 seconds of committed financial transactions that had already been acknowledged to clients.
-    - When promoted to master, Node 3 accepted new transactions, issuing overlapping auto-incrementing trade IDs.
-    - When the network partition healed, transactions committed on Node 1 during those 2.5 seconds were completely lost or collided with new trade IDs on Node 3, causing irreversible balance discrepancies and corrupting foreign-key financial ledgers.
-  - *Prescribed Protocol:*
-    1. The failover tool must poll all accessible replicas to identify the node with the **highest Log Sequence Number (LSN)** (Node 2) and reject promotion of nodes whose lag exceeds a safety threshold.
-    2. Before promoting Node 2, the orchestrator must execute a fencing barrier (e.g., revoking Node 1's cloud IAM permissions or issuing an IPMI reboot) to guarantee Node 1 cannot accept writes.
-    3. The system should be upgraded to **Semi-Synchronous Replication** or **MySQL Group Replication (Paxos-based)** so that transactions cannot commit on the primary without being hardened on at least one replica.
+  - *Defects:* Promoted most-lagging replica (max loss); no fencing (N1 may still take writes → split-brain).
+  - *Corruption:* 2.5 s of acked trades missing on N3; new trades reuse auto-increment IDs; on heal, ID collisions + lost balances corrupt ledgers + downstream Redis joins.
+  - *Fix:* Poll LSNs, promote N2 (max LSN) with lag-threshold veto; fence N1 (IAM revoke/IPMI) first; upgrade to semi-sync or group replication.
 
 #### Question 3 (Trade-Off & Capacity Estimation)
-*A social media platform deploys a leaderless key-value cluster across 5 data nodes ($N = 5$). The service handles $120,000\ \text{read queries/sec}$ and $15,000\ \text{write operations/sec}$. Compare the node-level network query fan-out, per-node QPS load, and maximum node failure tolerance under two configurations: (A) Strong Quorum: $W = 3, R = 3$, vs. (B) Read-Optimized Quorum: $W = 5, R = 1$. Show exact calculations.*
+*Leaderless `N=5`: 120k reads/s, 15k writes/s. Compare (A) `W=3,R=3` vs (B) `W=5,R=1`.*
 - **Answer:**
-  - *Configuration A: Strong Quorum ($N=5, W=3, R=3$)*
-    - *Fault Tolerance:* 
-      - Write tolerance: Can tolerate $N - W = 5 - 3 = \mathbf{2\ \text{failed nodes}}$.
-      - Read tolerance: Can tolerate $N - R = 5 - 3 = \mathbf{2\ \text{failed nodes}}$.
-      - Quorum Intersection: $W + R = 3 + 3 = 6 > 5$ (Fresh reads guaranteed).
-    - *Cluster Network Fan-Out & QPS Load:*
-      - Total Write Messages: $15,000\ \text{writes/sec} \times 3\ \text{replicas} = 45,000\ \text{node writes/sec}$.
-      - Total Read Messages: $120,000\ \text{reads/sec} \times 3\ \text{replicas} = 360,000\ \text{node reads/sec}$.
-      - Total Cluster Operations: $45,000 + 360,000 = 405,000\ \text{ops/sec}$.
-      - Average Load Per Node: $\frac{405,000\ \text{ops/sec}}{5\ \text{nodes}} = \mathbf{81,000\ \text{QPS per node}}$.
-  - *Configuration B: Read-Optimized Quorum ($N=5, W=5, R=1$)*
-    - *Fault Tolerance:*
-      - Write tolerance: Can tolerate $N - W = 5 - 5 = \mathbf{0\ \text{failed nodes}}$! If a single node in the cluster fails or experiences a GC pause, **all client writes fail globally**.
-      - Read tolerance: Can tolerate $N - R = 5 - 1 = \mathbf{4\ \text{failed nodes}}$.
-      - Quorum Intersection: $W + R = 5 + 1 = 6 > 5$ (Fresh reads guaranteed).
-    - *Cluster Network Fan-Out & QPS Load:*
-      - Total Write Messages: $15,000\ \text{writes/sec} \times 5\ \text{replicas} = 75,000\ \text{node writes/sec}$.
-      - Total Read Messages: $120,000\ \text{reads/sec} \times 1\ \text{replica} = 120,000\ \text{node reads/sec}$.
-      - Total Cluster Operations: $75,000 + 120,000 = 195,000\ \text{ops/sec}$.
-      - Average Load Per Node: $\frac{195,000\ \text{ops/sec}}{5\ \text{nodes}} = \mathbf{39,000\ \text{QPS per node}}$.
-  - *Quantitative Trade-off Summary:*
-    - Configuration B cuts per-node load by **$51.8\%$** ($39,000$ vs $81,000$ QPS), drastically reducing CPU and network socket overhead.
-    - However, Configuration B has a catastrophic write availability profile: **zero fault tolerance for writes**. In production, normal node reboots or rolling updates would cause complete service write outages. Therefore, Configuration A ($W=3, R=3$) or a local datacenter quorum ($W=\text{LOCAL\_QUORUM}$) is the only viable production architecture.
-
+  - *(A):* Tolerates 2 down each way (`5-3`); overlap `6>5`. Fan-out: writes `15k×3=45k`, reads `120k×3=360k`, total `405k` → **81k QPS/node**.
+  - *(B):* Writes tolerate **0** down (one GC pause fails all writes); reads tolerate 4; overlap `6>5`. Fan-out: writes `75k`, reads `120k`, total `195k` → **39k QPS/node** (−51.8%).
+  - *Verdict:* (B) halves load but has zero write fault tolerance — unshippable where reboots happen. Choose (A) or `LOCAL_QUORUM`.
 
 ---
+
 > [!NAV] **Chapter Navigation**
 > ⬅️ **Previous:** [[chapter-05-encoding-and-evolution|Chapter 05: Encoding and Evolution]] | 🏠 **Index:** [[00-Master-Reading-Dashboard|Master Dashboard]] | ➡️ **Next:** [[chapter-07-sharding|Chapter 07: Sharding]]
