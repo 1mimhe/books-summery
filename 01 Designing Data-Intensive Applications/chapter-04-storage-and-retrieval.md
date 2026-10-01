@@ -10,243 +10,134 @@
 
 ## 1. Executive Summary & Core Engineering Problem
 
-- **Core Thesis:** At the lowest layer of every data system lies a fundamental tension between write throughput, read latency, and storage amplification. A database storage engine cannot simultaneously optimize for arbitrary point updates, sequential bulk scans, and minimal memory footprint; instead, it must explicitly choose its internal access structures: append-only log-structured merge-trees (LSM-trees) that trade background compaction CPU and read amplification for sequential write bandwidth, page-based in-place B-trees that trade write amplification and page fragmentation for deterministic $O(\log N)$ point reads, or column-oriented stores that sacrifice individual record mutation performance to achieve $10\times\text{--}100\times$ scan throughput via SIMD vectorization and columnar bit-packing.
-- **Problem Statement:** Naive storage designs collapse catastrophically when mechanical hardware constraints collide with access patterns. For example, storing high-velocity sensor telemetry ($100,000\ \text{writes/sec}$) in a standard B-tree database with random primary keys (e.g., UUIDv4) forces the storage engine to execute random in-place page writes across a multi-gigabyte index. Because magnetic disks can sustain only $\sim 100\text{--}200\ \text{random IOPS}$ and enterprise NVMe SSDs sustain $\sim 50,000\text{--}100,000\ \text{random write IOPS}$ before flash translation layer (FTL) garbage collection stalls, writing a 50-byte record into a random 16 KiB page incurs a write amplification factor of $>300\times$, saturating disk I/O channels, driving p99 write latencies from 2 ms to $>5,000\ \text{ms}$, and halting data ingestion. Conversely, executing analytical aggregations across 100 million rows on a row-oriented OLTP engine wastes $>95\%$ of memory bus bandwidth fetching irrelevant columns, bottlenecking CPU execution on memory stalls.
-- **Historical & Industry Context:** Early databases in the 1970s and 1980s (IBM System R) standardized on in-place page-overwrite B-trees tailored to rotational disk seek mechanics. As RAM capacities expanded and write-heavy internet applications surged in the 2000s, Google introduced Bigtable (2006) and log-structured merge-trees (O’Neil et al., 1996), which turn random writes into sequential disk appends, popularized by LevelDB, RocksDB, and Apache Cassandra. In the 2010s, analytical workloads migrated from row-oriented relational engines to columnar data warehouses (C-Store, MonetDB, Vertica, Snowflake, ClickHouse, DuckDB) leveraging CPU vectorized execution. The 2020s (2nd Edition inflection) introduced disaggregated cloud storage (object stores like S3/GCS separating compute from storage) and dense high-dimensional vector search engines (Hierarchical Navigable Small World graphs and Inverted File indexes) to handle artificial intelligence embedding retrievals.
+> *"On the most fundamental level, a database needs to do two things: when you give it some data, it should store the data, and when you ask it for the data later, it should give the data back to you."*
+> — **Martin Kleppmann**, *Designing Data-Intensive Applications*
+
+- **The World's Simplest Database (Why Indexes Exist — p.140):**
+  To understand storage engines, consider the simplest possible database as two Bash functions:
+  ```bash
+  #!/usr/bin/env bash
+  db_set () {
+      echo "$1,$2" >> database.txt
+  }
+  db_get () {
+      grep "^$1," database.txt | sed -e "s/^$1,//" | tail -n 1
+  }
+  ```
+  Alice runs `db_set 42 '{"name":"San Francisco"}'` — an $O(1)$ sequential append costing <1 ms. Bob runs `db_get 42` — `grep` scans the entire file $O(N)$. With 100M records this is minutes per lookup. Appending is the fastest disk operation; scanning is the slowest. Every real engine (Chapter 4, pp.139–174) is an answer to this asymmetry.
+  - **The Core Trade-off of Indexing:** An **index** is an auxiliary structure derived from primary data. It speeds reads ($O(1)$ or $O(\log N)$) but **every index slows writes and consumes disk**, because it must be updated on every write. Databases never index everything by default — you choose indexes from query patterns.
+
+- **Core Thesis:** No engine optimizes point writes, bulk scans, and memory footprint simultaneously. Log-structured merge-trees (LSM) trade background compaction CPU and read amplification for sequential write bandwidth; page-based B-trees trade write amplification ($30\times$–$100\times$) and fragmentation for deterministic $O(\log N)$ reads; columnar stores sacrifice single-row mutation to gain $10\times$–$100\times$ scan throughput via compression + SIMD vectorization.
+- **Problem Statement:** Alice's IoT fleet writes $100{,}000\ \text{writes/sec}$ of 50-byte sensor records with random UUIDv4 keys into a B-tree. Each write dirties a random 16 KiB page: write amplification $>300\times$, HDD random IOPS cap $\sim 150$, NVMe random-write cap $\sim 80{,}000$ before FTL garbage collection stalls, p99 write latency explodes from 2 ms to $>5{,}000$ ms, ingestion halts. Conversely Bob's `SELECT AVG(age)` over 100M rows on a row store wastes $>95\%$ of memory-bus bandwidth fetching unneeded columns.
+- **Historical & Industry Context:** 1970s System R standardized in-place B-trees (Bayer & McCreight 1970, Comer 1979 "ubiquitous"). 1990s O'Neil et al. LSM-tree (1996) + Rosenblum log-structured filesystem → Google Bigtable (2006) introduced SSTable/memtable → LevelDB/RocksDB/Cassandra/HBase/ScyllaDB. 2000s C-Store/MonetDB/Vertica → 2010s Snowflake/ClickHouse/DuckDB columnar + vectorized execution. 2020s disaggregation (S3/GCS object storage, Delta Lake/SlateDB on object stores) + dense vector search (HNSW/IVF for LLM embeddings).
 
 ---
 
 ## 2. In-Depth Technical Concepts & Internal Mechanics
 
-### 2.1 Append-Only Logs & In-Memory Hash Indexes (Bitcask Model)
-- **Foundational Theory:** The simplest possible database is an append-only sequential log file. Writing is unconditionally $O(1)$ and sequential, maximizing storage drive throughput. To enable efficient $O(1)$ point lookups, an in-memory hash table maps every unique key to the byte offset of its latest record within the on-disk data file (Figure 4-1).
-- **Under-the-Hood Data Paths & File Segments:**
-  1. *Write Path:* An incoming `PUT(k, v)` serializes the key-value pair into binary format, appends it to the active on-disk segment file via sequential write, invokes `fsync` (subject to durability policy), and updates the in-memory hash table: `key_dir[k] = (file_id, byte_offset, value_size, timestamp)`.
-  2. *Read Path:* A `GET(k)` queries `key_dir`. If present, it issues a single random disk seek to `byte_offset` on `file_id` and reads exactly `value_size` bytes. If not present in `key_dir`, it returns `KeyNotFound` in $O(1)$ without touching disk.
-  3. *Delete Path:* A deletion appends a special tombstone record (`PUT(k, TOMBSTONE)`). The hash map deletes $k$. During background compaction, tombstones cause the key to be physically purged.
-  4. *Compaction & Merging:* When the active segment reaches a threshold (e.g., 1 GiB), it is frozen as read-only, and a new active segment is opened. A background worker sequentially scans frozen segments, discards overwritten values and tombstones, and writes surviving records into a new compacted segment. An atomic pointer swap switches reader references to the new file, and old segments are deleted via `unlink()`.
-- **Byte-Level Record Layout:**
-  ```text
-  [ CRC32: 4B ] [ Timestamp: 8B ] [ Key_Size: 4B ] [ Value_Size: 4B ] [ Key: K bytes ] [ Value: V bytes ]
-  ```
-  Total fixed header size: 20 bytes per record.
-- **Complexity & Invariants:**
-  - *Time Complexity:* Write $O(1)$ sequential; Read $O(1)$ (1 random disk I/O seek); Range query $O(N)$ (requires full table scan; hash indexes do not maintain sorted order).
-  - *Memory Invariant:* All keys **must fit in RAM**. If the dataset contains 1 billion keys with an average key length of 32 bytes and 16 bytes of hash table pointer overhead (48 bytes/entry), the hash map requires $48\ \text{GiB}$ of resident memory, regardless of data size on disk.
-- **Failure Modes & Edge Cases:**
-  - *Process Crash & Restart:* On crash, the in-memory hash map is destroyed. Recovering it by scanning terabytes of segment files takes hours. Bitcask mitigates this by persisting a compact "hint file" alongside each compacted segment, mapping `(key -> offset)` linearly on disk, allowing rapid sequential memory reconstruction during boot.
-  - *Disk Saturation during Compaction:* Compaction and incoming writes compete for the same sequential disk write bandwidth. Under heavy write traffic, compaction falls behind, disk usage balloons, and write stalls occur.
+### 2.1 Append-Only Logs & Hash Indexes (p.140–142 — Bitcask Model)
+- **Plain-English Intuition:** Keep appending every write to a log. In RAM keep `key -> byte_offset`. To read, look up offset in RAM and seek once on disk. Alice writes `session_abc123`; Bob reads it with one seek.
+- **Foundational Theory:** `db_set` appends `[key,value]` CSV-like lines. Old versions are never overwritten — latest value is last occurrence (`tail -n 1`). This log is the simplest write path ($O(1)$ sequential, no seeks). To avoid $O(N)$ scans, keep an in-memory hash map to byte offsets (Figure 4-1, PDF p.142).
+- **Three Fatal Limits:** (1) Disk never reclaimed — overwritten values bloat file forever. (2) Hash map not persisted — restart requires full log scan; 1 TB log = hours of recovery. (3) Hash must fit in RAM — 1B keys × (32B key + 16B overhead) = $48\ \text{GiB}$ RAM. On-disk hash is impractical (random I/O, collision logic, expensive growth). (4) No range scans — `keys 10000–19999` needs 10K individual lookups.
+
+| Engine | RAM Index? | Write Path | Point Read | Range? | Best For |
+| :--- | :--- | :--- | :--- | :--- | :--- |
+| **Bitcask (log+hash)** | Yes (all keys) | $O(1)$ append | $O(1)$ 1 seek | No | Session store, small keyset |
+| **LSM (RocksDB)** | No (sparse+Bloom) | $O(\log M)$ RAM + WAL | $O(1)$–$O(L)$, Bloom-gated | Yes | Write-heavy, SSD |
+| **B-tree (InnoDB)** | No (buffer pool) | $O(\log_B N)$ random | $O(\log_B N)$, 1 seek | Yes | Read-heavy OLTP |
+
+- **File Segments & Compaction:** Freeze active segment at ~1 GiB, open new active segment, background thread copies only live keys to new file, swaps pointers, `unlink()` old files. Tombstone `PUT(k,TOMBSTONE)` purges deletes. Hint files `(key->offset)` speed restart. LSN per record orders recovery; `fsync` policy sets durability window ($0$–$10$ ms loss on crash if async).
+- **Cost Number:** S3 object storage $\$0.023$/GB-mo vs RAM $\$3$–$\$5$/GB-mo — 100× gap is why RAM-only indexes fail at scale.
 
 ---
 
-### 2.2 SSTables and LSM-Trees (Log-Structured Merge-Trees)
-- **Foundational Theory:** Sorted String Tables (SSTables) enforce a strict invariant: within each segment file, key-value pairs are stored in strictly sorted order by key. This eliminates the requirement that all keys fit in RAM.
-- **Internal Structural Layout:**
-  - *Memtable (RAM):* An in-memory concurrent balanced search tree or skiplist (e.g., SkipList in RocksDB, Red-Black tree in LevelDB) buffering recent mutations in sorted order.
-  - *Write-Ahead Log (WAL on Disk):* An append-only log on disk that records every write before insertion into the memtable. Its sole purpose is durability during crash recovery.
-  - *SSTable Data File (Disk):* An immutable, sequentially written file containing sorted key-value pairs grouped into compressed blocks (typically 4 KiB to 64 KiB, compressed via LZ4, Zstandard, or Snappy).
-  - *Sparse In-Memory Index:* Because keys are sorted, RAM does not need an entry for every key. It stores an index entry only for the start of each block (e.g., every 4 KiB or every $K$ keys). To look up key `handbag`, the engine binary-searches the sparse index between `handgun` and `handsome`, loads that single 4 KiB compressed block off disk, and scans locally (Figure 4-2).
-- **Under-the-Hood Data Paths:**
-  1. *Write Path:*
-     - Client issues `PUT(k, v)`.
-     - Engine appends `[LSN, Type, Key, Value]` to the WAL on disk (sequential I/O + configurable `fsync`).
-     - Key-value pair is inserted into the in-memory Memtable ($O(\log M)$ time).
-     - Client receives write acknowledgment.
-  2. *Memtable Flush:*
-     - When the Memtable exceeds its configured threshold (typically 64 MiB to 256 MiB), it is marked immutable.
-     - A new active Memtable and fresh WAL are allocated immediately so incoming writes never block.
-     - A background flush thread drains the immutable Memtable, writes it sequentially to disk as a Level 0 (L0) SSTable, builds the sparse index and Bloom filter, writes the SSTable footer, and deletes the corresponding old WAL.
-  3. *Read Path:*
-     - Search active Memtable in RAM. If found, return.
-     - Search immutable Memtables waiting for flush in RAM. If found, return.
-     - Search on-disk SSTables from newest to oldest. To avoid reading every SSTable off disk, check the in-memory Bloom filter for each SSTable. If the Bloom filter returns negative, skip the SSTable entirely.
-     - If Bloom filter returns positive, binary search the SSTable's sparse index to locate the block offset, load the 4 KiB block from disk/page-cache, decompress it, and search for the key.
-  4. *Multi-Way Merge Compaction:*
-     - Because SSTables are sorted, merging multiple files is identical to the merge step of MergeSort ($O(N)$ streaming time). The engine reads multiple SSTable segments side by side, compares the lowest keys, retains only the newest value (highest timestamp/sequence number), discards overwritten values and expired tombstones, and streams the output into new sorted SSTable files (Figure 4-3).
-- **Complexity:**
-  - Write: $O(\log M)$ in RAM + sequential append.
-  - Read: $O(L \cdot \log(\text{block count}))$ where $L$ is the number of SSTables searched; with Bloom filters, average read requires $O(1)$ disk I/O.
-  - Write Amplification: $10\times\text{--}40\times$ depending on compaction strategy.
+### 2.2 SSTables and LSM-Trees (pp.143–145 — Sorted Tables, Memtable, Merge)
+- **Plain-English Intuition:** Keep data **sorted by key** on disk. Buffer writes in a sorted RAM structure (memtable); when full (64–256 MiB), flush sorted run to disk as an immutable **SSTable**. Reads binary-search a tiny sparse index.
+- **SSTable Format (Figure 4-2, PDF p.143):** Keys sorted, each key once per file. Group pairs into 4–64 KiB blocks, compress each (LZ4/Zstd/Snappy — shaded area in book figure). Sparse index stores only first key per block (e.g., `handbag -> offset 4096`, `handsome -> offset 8192`). Lookup `handiwork`: binary-search sparse index in RAM, seek to `handbag` block, scan 4 KiB. Index uses immutable B-tree/trie. Block scan is microseconds; disk seek is milliseconds.
+- **LSM Write/Read/Merge (Figure 4-3, PDF pp.144–145):**
+  1. *Write:* Append `[LSN,type,key,value]` to on-disk WAL (sequential + `fsync`), insert into memtable (red-black/skiplist/trie, $O(\log M)$), ack. WAL exists only for crash restore; unsorted.
+  2. *Flush:* Memtable full → freeze as immutable, open new memtable + WAL, background thread writes sorted L0 SSTable + sparse index + Bloom filter, deletes old WAL.
+  3. *Read:* Memtable → immutable memtables → newest-to-oldest SSTables, Bloom-gating each.
+  4. *Merge/compaction:* Multi-way mergesort across segments ($O(N)$ streaming, $O(1)$ RAM per file). Keep newest timestamp per key, drop tombstoned keys. Tombstone must propagate to oldest segment before removal.
+- **Crash & Cost Details:** SSTables immutable → crash during flush/merge = delete partial file, replay WAL. Checksums detect torn WAL tail. Segments work on object storage (SlateDB, Delta Lake [12]). Used by RocksDB/Cassandra/ScyllaDB/HBase, all from Bigtable paper [9] + LSM paper [10]. Embedded engines (p.149): RocksDB, SQLite, LMDB, DuckDB, KùzuDB — same structures, library-linked, per-tenant instances viable (e.g., Bluesky single-tenant SQLite).
 
 ---
 
-### 2.3 Compaction Strategies & Bloom Filter Mechanics
-- **Foundational Theory:** As writes arrive and memtables flush, SSTables accumulate on disk. To reclaim space, purge tombstones, and bound read amplification, background compaction must continuously merge overlapping files.
+### 2.3 Bloom Filters & Compaction Strategies (pp.146–148)
+- **Plain-English Intuition:** Checking 20 SSTables per miss = 20 disk seeks. A **Bloom filter** (10 bits/key in RAM) answers "definitely not here" without I/O. **Compaction** merges files to bound that check.
+- **Bloom Mechanics (Figure 4-4, PDF p.146):** Bit array $m$, $k$ hashes. Book example: 16 bits, key `handbag -> (2,9,4)` sets bits; query `handheld -> (6,11,2)`: bit 11 is 0 → **guaranteed absent**, skip SSTable. All-1s → probably present (or false positive) → check sparse index + block. Formulas: $m = -n\ln p/(\ln 2)^2$, $k=(m/n)\ln 2$. For $p=1\%$: $m/n\approx 9.6\approx 10$ bits/key, $k=7$. Each +5 bits/key cuts $p$ 10×. 100M keys → $10^9$ bits = 125 MiB RAM to save millions of seeks. False positives cost one wasted 4 KiB read — harmless.
 - **Compaction Strategies:**
-  1. *Size-Tiered Compaction (STCS - Cassandra default):*
-     - Small SSTables of roughly similar sizes are merged into larger SSTables when a count threshold is reached (e.g., 4 SSTables of 100 MiB merged into one 400 MiB SSTable; four 400 MiB SSTables merged into one 1.6 GiB SSTable).
-     - *Advantage:* Low write amplification during initial ingestion; high write throughput.
-     - *Fatal Flaw:* High space amplification (often $>50\%$). Merging two large 500 GiB SSTables requires 500 GiB of free disk space headroom simply to execute the compaction step. High read amplification because the same key can exist across multiple SSTables at every size tier.
-  2. *Leveled Compaction (LCS - RocksDB, LevelDB default):*
-     - Disk storage is partitioned into discrete levels ($L_0, L_1, L_2, \dots, L_K$).
-     - $L_0$ contains directly flushed SSTables, which may have overlapping key ranges.
-     - Levels $L_1$ and higher strictly enforce **non-overlapping key ranges**: every key exists in at most *one* SSTable per level.
-     - Each level has a fixed total capacity, growing by an amplification factor $T$ (typically $T = 10$): $L_1 = 10\ \text{MB}$, $L_2 = 100\ \text{MB}$, $L_3 = 1\ \text{GB}$, $L_4 = 10\ \text{GB}$, etc.
-     - When level $L_i$ exceeds its capacity, the compaction worker selects an SSTable from $L_i$, finds all overlapping SSTables in $L_{i+1}$, merges them via multi-way merge sort, and writes new non-overlapping SSTables into $L_{i+1}$.
-     - *Advantage:* Low read amplification (point reads search at most 1 SSTable per level from $L_1$ down); low space overhead (typically $<10\%$ temporary headroom).
-     - *Disadvantage:* High write amplification ($10\text{--}30\times$), as each byte is repeatedly read and re-written across subsequent levels.
-
-```mermaid
-stateDiagram-v2
-  [*] --> Memtable_Active: PUT(k, v)
-  Memtable_Active --> Memtable_Immutable: Exceeds 64MB Threshold
-  Memtable_Immutable --> Level_0: Background Flush (Overlapping Keys)
-  Level_0 --> Level_1: STCS/LCS Compaction (Non-overlapping partitions)
-  Level_1 --> Level_2: 10x Size Capacity Trigger
-  Level_2 --> Level_3: 10x Size Capacity Trigger
-  Level_3 --> [*]: Dropped via Tombstone Purge
-```
-
-- **Bloom Filter Internal Mathematics & Bit-Level Layout:**
-  - An SSTable's Bloom filter is a memory-resident bit array of $m$ bits initialized to 0, parameterized by $k$ independent uniform cryptographic/non-cryptographic hash functions (e.g., MurmurHash3, xxHash).
-  - *Insertion:* To index key $K$, compute $h_1(K), h_2(K), \dots, h_k(K)$ modulo $m$, and set those bit positions to 1 (Figure 4-4).
-  - *Lookup:* To test for key $Q$, compute all $k$ bit positions. If **any** bit is 0, the key is **guaranteed not present** in the SSTable (zero false negatives). If all $k$ bits are 1, the key is **likely present** (with false positive rate $p$).
-  - *Optimal Mathematical Sizing Formulas:*
-    $$m = - \frac{n \ln p}{(\ln 2)^2}, \quad k = \frac{m}{n} \ln 2$$
-    Where $n$ is the number of keys and $p$ is the acceptable false positive probability.
-    - For $p = 0.01$ (1% false positive rate), the optimal ratio is:
-      $$\frac{m}{n} \approx 9.58 \approx 10\ \text{bits per key}, \quad k = 7\ \text{hash functions}$$
-    - Allocating 10 bits per key in RAM allows the engine to reject $99\%$ of unnecessary disk reads for non-existent keys.
+| Strategy | Write Amp | Space | Read | Best Workload |
+| :--- | :--- | :--- | :--- | :--- |
+| **Size-tiered (STCS)** | Low $4\times$–$8\times$ | High ($>50\%$ headroom; 4×256 MB → ~898 MB after drops) | $O(\text{files})$ | Bulk ingest, high writes |
+| **Leveled (LCS L0,L1…)** | High $10\times$–$30\times$ | Low ($<10\%$) | 1 SSTable/level | Read-heavy OLTP |
+| **FIFO/Time-window** | $1\times$–$2\times$ | Lowest (drop whole files) | Fast recent | Metrics, TTL streams |
+  Leveled partitions L1+ by key range (e.g., `a–m`, `n–z`), merges $L_i\to L_{i+1}$ on size breach. Rule of thumb: size-tiered for write-dominated, leveled for read-dominated or skewed hot keys. High write burst → memtable fills, compaction lags → RocksDB backpressure: stall/sleep writes until flush (see §4.4 war story).
 
 ---
 
-### 2.4 B-Trees: Page Layout, In-Place Mutation, and Concurrency Latches
-- **Foundational Theory:** B-trees break the database down into fixed-size **pages** (historically 4 KiB to 16 KiB, matching disk hardware sectors and OS virtual memory pages) and update these pages **in place** on disk, rather than appending sequentially.
-- **Tree Layout & Traversal:**
-  - Pages are structured as a balanced search tree. One page is designated the **Root Page**.
-  - Each page contains an ordered sequence of keys and child page references (Figure 4-5).
-  - The number of child pointers a page can hold is the **Branching Factor** $B$.
-  - *Height Complexity:* For $N$ keys and branching factor $B$, tree depth is:
-    $$\text{Depth} = \left\lceil \log_B N \right\rceil$$
-    A 4-level B-tree with 4 KiB pages and $B = 500$ stores:
-    $$500^4 = 6.25 \times 10^{10}\ \text{keys} \approx 62.5\ \text{billion keys}$$
-    Because root and upper-level internal pages are permanently pinned in the database buffer pool RAM, traversing a 4-level tree requires at most **1 physical disk I/O** (to read the leaf page).
-- **In-Place Page Structure (Slotted-Page Architecture):**
-  ```text
-  +-----------------------------------------------------------------------+
-  | Page Header: [LSN: 8B | Free_Space_Offset: 2B | Slot_Count: 2B | ...] |
-  | Slot Array:  [Offset_1: 2B] [Offset_2: 2B] ... [Offset_K: 2B]         |
-  |                        vvv FREE SPACE vvv                            |
-  | Cells:       ... [Record K (Key, Val)] [Record 1 (Key, Val)]          |
-  +-----------------------------------------------------------------------+
-  ```
-  The slot array grows downward from the header; records grow upward from the bottom of the page. This prevents page defragmentation on every mutation.
-- **Page Splits and Merges:**
-  - *Page Split Path:* When a write inserts a key into a leaf page that has insufficient free space, the page splits into two half-full pages (each containing $\sim B/2$ keys). The median boundary key is pushed up into the parent page (Figure 4-6).
-  - *Cascading Splits:* If the parent page is also full, the split cascades upward recursively. If the root page splits, a new root page is allocated with 2 children, increasing tree depth by 1.
-- **Durability Invariant: The Write-Ahead Log (WAL / Redo Log):**
-  - Updating a B-tree in place requires overwriting raw disk sectors. If a crash or power failure occurs mid-write (a torn page write), the page is corrupted. If a page split required writing two child pages and updating the parent page, a crash mid-split leaves orphan pointers and broken tree invariants.
-  - *The Invariant:* **WAL must be written and `fsync`'d before the dirty page can be written to disk** (Write-Ahead Logging). The WAL record contains the physical or physiological diff (`[Page_ID, Slot_ID, Redo_Bytes, Undo_Bytes]`). On recovery, the engine replays the redo log to bring pages to consistent state.
-- **Concurrency Control: Latches vs. Locks:**
-  - To protect the in-memory tree pointers from concurrent readers/writers during page splits, engines use **latches** (lightweight in-memory mutexes / rw-locks, held for microseconds), distinct from relational **locks** (transactional locks held for the duration of a transaction).
-  - *Latch Crabbing (Coupling):* To traverse down the tree, a thread acquires a shared latch on child page $C$ *before* releasing the latch on parent page $P$. During splits, exclusive latches are held up the tree chain.
+### 2.4 B-Trees: Pages, Splits, WAL (pp.149–152 — Figures 4-5, 4-6)
+- **Plain-English Intuition:** Divide DB into fixed 4–16 KiB **pages** (Postgres 8 KiB, MySQL 16 KiB), update in place. Like an encyclopedia: root tells you which volume, interior tells you which page, leaf holds record. Depth stays 3–4 for terabytes.
+- **Traversal (Figure 4-5, PDF p.150):** Root page holds keys + child pointers (branching factor $B\approx 500$). Lookup 251: root `[100,200,300,400]` → child `200–300` → leaf `250–270` → value inline or heap pointer. Depth $=\lceil\log_B N\rceil$. 4-level × 4 KiB × $B=500$: $500^4\approx 62.5$B keys ≈ 250 TB. Root + interior pinned in buffer pool → 1 physical I/O per point lookup, predictable.
+- **Splits (Figure 4-6, PDF p.151):** Insert 334 into full page `333–345` → allocate new page, split `333–337` / `337–345`, promote boundary 337 to parent. Parent full → recurse; root split → new root, depth +1. Deletes require merges [5]. Slotted-page layout: header `[LSN:8B, free-offset:2B, slots:2B]` + slot array growing down + cells growing up — avoids per-write defrag. Siblings linked for ordered scans; interior keys abbreviated to raise $B$.
+- **Reliability — WAL (p.152):** Overwrite = torn-page + orphan-page risk on crash mid-split. **Invariant: WAL (journal) `fsync` before dirty page reaches disk.** WAL = append-only `[pageID,slot,diff]`; recovery replays redo (ARIES [24]). Buffer pool delays page flushes; WAL guarantees durability. Variants: LMDB copy-on-write (new page + new parents, helps snapshot isolation p.293), sequential leaf layout, sibling pointers. Doublewrite buffer (InnoDB) guards non-atomic 16 KiB writes.
 
 ---
 
-### 2.5 Quantitative Architectural Comparison: B-Trees vs. LSM-Trees
-- **Write Amplification ($WA$):**
-  $$\text{WA} = \frac{\text{Total Bytes Written to Underlying Storage Disk}}{\text{Total Bytes Submitted via Application Writes}}$$
-  - *B-Trees:* Even if modifying a 10-byte column, the database must write: (1) WAL entry ($\sim 100$ bytes), and (2) flush the entire 16 KiB page to disk.
-    $$\text{WA}_{\text{B-Tree}} \approx \frac{16,384\ \text{bytes}}{10\ \text{bytes}} \approx 1,638\times\quad (\text{worst case for random unbuffered writes})$$
-    Even with buffer pool write grouping, typical B-Tree WA is $30\text{--}100\times$.
-  - *LSM-Trees:* Write is appended to WAL sequentially and buffered in RAM. Compaction rewrites SSTables across levels. For Leveled Compaction with branching factor $T=10$, each level rewrite costs $\sim 10\times$, resulting in typical WA of $10\text{--}30\times$.
-- **Read Amplification ($RA$):**
-  - *B-Trees:* $RA = 1$ leaf page read per point lookup ($O(1)$ physical I/O if interior pages cached). Unrivaled deterministic point read latency.
-  - *LSM-Trees:* $RA$ can be high ($O(L)$ SSTable reads across levels) if the key is absent or not filtered by Bloom filters. Range queries require scanning iterators across all active levels simultaneously via a priority queue (Min-Heap).
-- **Space Amplification ($SA$):**
-  - *B-Trees:* Internal fragmentation: pages split when full, leaving pages on average $50\%\text{--}70\%$ full ($30\%\text{--}50\%$ empty dead space). Deleted rows leave holes that can only be reused for identical-sized payloads unless vacuumed.
-  - *LSM-Trees:* SSTables are dense, sequentially packed immutable files with zero page fragmentation. Compression ratios in LSM-trees are typically $20\%\text{--}50\%$ superior to B-trees. However, uncompacted tombstones and old versions consume transient space overhead.
-- **Latency Predictability & The Compaction Stall Hazard:**
-  - B-Trees offer deterministic p99 response times because page writes are absorbed by the operating system dirty page cache and flushed asynchronously via background checkpointing threads.
-  - LSM-Trees suffer from catastrophic **Compaction Stalls (Write Stalls)**. If write traffic saturates disk I/O, the background compaction thread falls behind. When $L_0$ SSTable count exceeds safety thresholds (e.g., 20 files in RocksDB), the storage engine intentionally throttles or completely halts incoming client writes to prevent read performance collapse.
+### 2.5 Comparing B-Trees vs LSM-Trees (pp.153–155)
+- **Rule of Thumb:** LSM for write-heavy, B-tree for read-heavy — but measure your workload; hybrids exist (multiple B-trees merged LSM-style).
+- **Read Performance:** B-tree: 1 page/level, shallow, predictable. LSM: check memtable + several SSTables, Bloom-gated; range queries fan out across all segments via heap merge (Bloom useless — would hash every key in range). LSM write bursts → latency spikes/backpressure.
+- **Sequential vs Random Writes & SSD Physics:** B-tree scattered keys → random page overwrites. LSM → large sequential segment writes. HDD: random seek ~10 ms vs sequential ~200 MB/s — huge gap. SSD/NVMe (PCIe, not SATA): still prefers sequential — flash reads/writes 4 KiB pages but erases 512 KiB blocks; random writes fragment blocks, forcing garbage collection that steals bandwidth and wears flash. Sequential SSTables fill whole erase blocks → erase without GC.
+- **Write Amplification:** $WA = \text{bytes to disk}/\text{bytes from app}$. LSM: WAL + flush + per-level recompaction ($10\times$–$30\times$ leveled; WiscKey [37] separates values to cut it). B-tree: WAL + full page flush even for 10B change ($30\times$–$100\times$+, worst $1638\times = 16384/10$). LSM usually lower (no whole-page rewrites + block compression). Measure long enough — empty LSM shows no compaction; growth shares bandwidth with compaction.
+- **Space & Snapshots:** B-tree fragmentation (deleted pages mid-file, need `VACUUM`; can't return to OS). LSM: dense, compressed, often smaller; leveled overhead low, size-tiered high transient. LSM deletes linger until tombstone compacts through all levels (GDPR concern [42]). LSM snapshots trivial (pin segments, no copy); B-tree overwrites make snapshots hard.
 
 ---
 
-### 2.6 Secondary Indexes, Clustered Storage, and In-Memory Engines
-- **Secondary Index Layouts:**
-  - A secondary index indexes attributes other than the primary key. Unlike primary keys, secondary index entries are rarely unique.
-  - Two primary implementations:
-    1. *Heap File Storage (PostgreSQL default):* Rows are stored in an unordered heap file on disk. The primary index and all secondary indexes map keys to **Tuple Identifiers (TID / RID)**: `(Page_Number, Slot_Offset)`.
-       - *Advantage:* When updating a row without changing indexed columns, secondary indexes remain untouched. If the updated row fits in the same page, PostgreSQL executes a Heap-Only Tuple (HOT) optimization, avoiding all index updates.
-       - *Penalty:* Incur an extra pointer dereference (double read penalty) jumping from index leaf to heap page.
-    2. *Clustered Index (MySQL InnoDB default):* The leaf pages of the primary key B-tree store the **actual row data itself**. Secondary indexes store the **primary key** as their leaf value, rather than a physical heap pointer.
-       - *Advantage:* Point lookups on primary keys require zero heap jumps (extreme locality).
-       - *Penalty:* Every secondary index lookup incurs a two-phase traversal: search secondary B-tree to find primary key $\to$ search primary clustered B-tree to find row data ($2 \times \log_B N$ operations). Updates that relocate primary keys force all secondary indexes to be updated.
-    3. *Covering Indexes (Index with Included Columns):* Storing non-key columns directly in the secondary index leaf (`CREATE INDEX idx_user_email ON users(email) INCLUDE (created_at, status)`). Allows queries querying those attributes to be satisfied entirely from the index leaf without touching the clustered table or heap file (Index-Only Scan).
-- **In-Memory Storage Engines (VoltDB, Redis, Memcached):**
-  - Dropping RAM prices made resident in-memory databases viable.
-  - *Why In-Memory is Faster:* The performance advantage of an in-memory database is **not** simply because it avoids disk reads (an RDBMS with a large buffer pool keeps hot data in OS cache anyway). The real speedup comes from **avoiding the overhead of serializing, packing, and decoding in-memory data structures into disk-page formats**, and eliminating page-level buffer pool lock/latch contention.
-  - *Anti-Caching Architecture:* When memory is exhausted, systems like VoltDB page out the least recently used records to disk at a row granularity, rather than page granularity, avoiding standard OS swap thrashing.
-  - *Non-Volatile Memory (NVM / CXL):* Hardware interfaces allowing byte-addressable persistent memory directly on the memory bus, blurring the architectural boundary between RAM and durable storage.
+### 2.6 Multicolumn, Secondary, Clustered & In-Memory (pp.156–157)
+- **Secondary Indexes (p.156):** Primary key = unique ID; `CREATE INDEX ON …(user_id)` enables non-key search. Built from same key-value structures. Non-unique → postings list per key *or* append row-ID to make unique. Works on B-tree or LSM.
+- **Storing Values Within Index (p.157):** (a) **Clustered:** row lives in index leaf (InnoDB primary key; SQL Server one/clustered table). (b) **Heap:** index holds pointer; rows in unordered heap file (Postgres: index → `(page,slot)` TID; heap append-only or reuse). (c) **Covering / INCLUDE:** duplicate some columns in index (`… INCLUDE(created_at,status)`) → index-only scan, no heap fetch, at cost of space + write amp. Non-key update that fits → HOT overwrite in heap; growth → move + update all indexes or leave forwarding pointer.
+- **Concatenated vs Multidimensional:** Concatenated `(lastname,firstname)` sorts lexicographically — finds `lastname=X` or `lastname=X AND firstname=Y`, useless for `firstname=Y` alone. True 2-D box queries need spatial indexes (see §2.10).
+- **Keeping Everything in Memory (p.157):** RAM cheaper → full datasets fit distributed RAM. Memcached = cache-only (loss OK). VoltDB/SingleStore/TimesTen (relational), RAMCloud (log-structured + durable), Redis/Couchbase (async disk) = durable via battery RAM, disk log, snapshots, or replicas. Disk still used as append-only durability log + backup/inspection. **Counterintuitive truth:** speed comes not from avoiding disk reads (OS page cache already does that) but from avoiding disk-*format* encode/decode overhead [49]. Redis bonus: in-RAM structures (queues, sets) trivial vs disk indexes.
 
 ---
 
-### 2.7 Column-Oriented Storage for Analytical Processing (OLAP)
-- **Foundational Theory:** OLTP databases store records row by row (`Row-Oriented`, Figure 4-7): `Row 1: [ID, Name, Date, Amount]`, `Row 2: [ID, Name, Date, Amount]`. Analytical queries (OLAP) invariably compute aggregations over millions of rows, but access only 2 or 3 columns (`SELECT SUM(Amount), AVG(Age) FROM Users WHERE Date >= '2026-01-01'`). Row stores load every single unused attribute across memory channels, wasting $>90\%$ of I/O and memory bus bandwidth.
-- **Columnar Physical Layout:**
-  - Data is stored as contiguous arrays of single columns:
-    ```text
-    File 1 (id):     [ 1, 2, 3, 4, 5, ... ]
-    File 2 (date):   [ 2026-01-01, 2026-01-01, 2026-01-02, ... ]
-    File 3 (amount): [ 45.00, 12.50, 99.00, ... ]
-    ```
-  - The $i$-th entry in each column file belongs to the same logical record.
-- **Columnar Compression Techniques:**
-  1. *Bitmap Encoding:* For columns with low cardinality (few distinct values, e.g., `gender`, `country`, `status`), replace values with a series of bit vectors (Figure 4-8). If there are $V$ distinct values, create $V$ separate bit vectors, where the $n$-th bit is 1 if row $n$ possesses that value.
-  2. *Run-Length Encoding (RLE):* Compresses sequences of repeated identical bits or values into count pairs:
-     $$\text{Bit sequence: } 1, 1, 1, 1, 0, 0, 1 \implies (4, 1), (2, 0), (1, 1)$$
-     Reduces multi-gigabyte column files to kilobytes when data is sorted.
-  3. *Dictionary Encoding:* High-cardinality strings (e.g., URLs, city names) are mapped to 1-byte or 2-byte integer IDs in a small dictionary file. The column itself is stored as a compact array of integer IDs.
-  4. *Frame of Reference (FoR) & Bit Packing:* Store integers as offsets from a minimum base value. If values in a block range from 1,000 to 1,015, subtract 1,000 and store each number using only 4 bits instead of 32 bits ($8\times$ space reduction).
-- **Sort Keys in Column Stores:**
-  - Choosing the primary sort column dictates compressibility. The first sort key has long contiguous runs of identical values, making RLE compress near $99\%$.
-  - Secondary sort keys compress less efficiently.
-  - *Multiple Sort Orders (C-Store / Vertica Architecture):* Replicate data across different nodes sorted in different column orders. Query 1 (grouped by date) routes to the date-sorted replica; Query 2 (grouped by customer) routes to the customer-sorted replica.
+### 2.7 Data Storage for Analytics & Cloud Warehouses (pp.158–160)
+- **OLTP vs OLAP Internals:** Same SQL surface, different engines. OLTP = many small point reads/writes via PK. OLAP = few huge scans/aggregations. Vendors split engines (SQL Server/HANA/SingleStore HTAP = two engines, one SQL [50–53]).
+- **Cloud Data Warehouses (p.159):** Teradata/Vertica/HANA (on-prem + cloud) vs BigQuery/Redshift/Snowflake (cloud-only, object storage + serverless). Decouple storage (S3/GCS, $\$0.023$/GB-mo, 11-nines) from compute (scale independently, cf. p.14). Native log ingestion (Dataflow/Kinesis), elastic burst. Open-source disaggregation: Hive → Trino/DataFusion/Presto (parse/optimize/execute, Spark/Flink execution) + **storage format** (Parquet/ORC/Lance/Nimble bytes on object store — §2.8) + **table format** (Iceberg/Delta: which files = table, schema, inserts/deletes, time-travel, GC, transactions) + **catalog** (Polaris/Unity/Iceberg REST: create/rename/drop, governance p.24).
+- **Column-Oriented Storage (pp.160–163 — Figures 4-7, 4-8):** Fact tables 100+ cols, queries touch 4–5 (Example 4-1: `fact_sales ⋈ dim_date ⋈ dim_product WHERE year=2024 AND category IN ('Fresh fruit','Candy')` touches only `date_key,product_sk,quantity`). Row stores load all 100 attrs → 95% waste. Columnar stores each column contiguously (Figure 4-7, PDF pp.161–162); row $i$ = $i$-th entry per column. Blocked by timestamp ranges (thousands–millions rows/block) for partition pruning. Parquet/ORC/Lance/Nimble on disk; Arrow/Pandas/NumPy in RAM; Snowflake/DuckDB/Pinot/Druid/InfluxDB IOx/TimescaleDB engines. Document nesting via Dremel shredding/striping [58–59].
+- **Column Compression (Figure 4-8, PDF p.163):** Same-column repetition compresses. Bitmap: $n$ distinct values → $n$ bit-vectors (bit $i$=1 if row $i$ has value); sparse → run-length `(count,value)` + Roaring adaptive. Query `product_sk IN (31,68,69)` = OR 3 bitmaps; `product_sk=30 AND store_sk=3` = AND 2 bitmaps (same row order). Wide-column (Bigtable/HBase/Cassandra) is *row-oriented* despite name — don't confuse.
+- **Sort Order & Writes:** Sort whole rows (not columns independently — else row identity lost). DBA picks sort keys from query patterns: `date_key` first → last-month scan prunes; `product_sk` second groups same-day products. First key RLE-compresses to KiBs even for billions of rows. Point writes rewrite compressed columns → batch via row-oriented in-memory sorted buffer, bulk-merge to column files (LSM-like, object-storage friendly). Engine merges disk + memory transparently (Snowflake/Vertica/Pinot/Druid).
 
 ---
 
-### 2.8 Analytical Query Execution: Vectorization vs. JIT Compilation
-- **The CPU Bottleneck in OLAP:** Once column storage reduces disk I/O and memory bus saturation, query execution becomes CPU bound. The traditional Volcano Iterator Model (`Next()` method called recursively per tuple per operator) incurs massive CPU branch mispredictions and function call overhead.
-- **Architectural Approaches to Execution:**
-  1. *Vectorized Query Execution (Block-Oriented Processing - ClickHouse, DuckDB, Snowflake):*
-     - Operators do not process one row at a time. Instead, an operator accepts a tightly packed vector (e.g., 1,024 elements) of raw column values in a tight C/C++ loop.
-     - Loops fit entirely within CPU L1/L2 data caches.
-     - Modern CPUs apply **SIMD (Single Instruction, Multiple Data)** instructions (e.g., Intel AVX-512, ARM Neon), executing parallel mathematical filters and arithmetic operations across multiple column elements in a single CPU cycle (Figure 4-9).
-  2. *Just-In-Time (JIT) Compilation (HyPer, SingleStore, Spark Catalyst):*
-     - The database translates the declarative SQL query abstract syntax tree (AST) into low-level LLVM bytecode or C code at runtime.
-     - Compiles the entire pipeline of filters, joins, and projections into a single fused machine-code loop.
-     - Data remains in CPU registers across operators without touching main memory.
+### 2.8 Query Execution: Compilation vs Vectorization (pp.166–167 — Figure 4-9)
+- **Plain-English Intuition:** Columnar removes I/O bottleneck — CPU becomes bottleneck. Volcano `Next()` per row = function-call + branch-mispredict storm. Fix: compile query to machine code *or* process 1,024-value batches with SIMD.
+- **Query Compilation (JIT):** SQL AST → LLVM/C loop → machine code (like JVM JIT). Fused filter-join-project loop, data stays in registers. HyPer/SingleStore/Spark Catalyst.
+- **Vectorized Processing:** Interpreted but batched: `equality(product_sk,'bananas') → bitmap`, `equality(store_sk,42) → bitmap`, `AND(bitmaps) → result` (Figure 4-9, PDF p.167). Operators are prebuilt C++ kernels over tight arrays fitting L1/L2. Both exploit sequential access (fewer cache misses [78]), tight loops (pipeline-full, no mispredicts), threads + SIMD (AVX-512/Neon [79–80]), operating on compressed data without decode. Kersten et al. [77] survey both.
 
 ---
 
-### 2.9 Materialized Views and OLAP Data Cubes
-- **Foundational Theory:** While standard relational views are virtual (merely saved queries evaluated at runtime), **Materialized Views** persist the actual computed result set to disk. When base tables update, the database engine incrementally refreshes the view.
-- **OLAP Data Cubes (Multidimensional Aggregations):**
-  - A data cube is a grid of precomputed aggregates across $N$ analytical dimensions (Figure 4-10).
-  - For dimensions `(Date, Store, Product)`, the cube precomputes sums across all combinations: `(Date, Store, Product)`, `(Date, Store)`, `(Date, Product)`, `(Store, Product)`, `(Date)`, and the grand total `()`.
-  - *Query Speedup:* A query requesting total sales for Store 4 in Q1 2026 evaluates in $O(1)$ time by reading a single precomputed cell, bypassing the scan of 500 million raw transaction records.
-  - *Operational Trade-off:* Severe write amplification and dimensionality explosion. An $N$-dimensional cube requires computing $2^N$ sub-aggregates. Adding 10 dimensions multiplies cube storage requirements exponentially.
+### 2.9 Materialized Views and Data Cubes (pp.167–168 — Figure 4-10)
+- **Plain-English Intuition:** Managers rerun `sales by region × product` every morning over 500M rows — precompute the grid once as a materialized view, answer in $O(1)$ at cost of write-time maintenance.
+- **Mechanics:** Virtual view = saved query expanded at read; **materialized view** = result persisted to disk, incrementally refreshed on base-table change (auto in some DBs; Materialize specializes [81]; maintenance p.516). **Data cube / OLAP cube** (Figure 4-10, PDF p.168) = grid of `SUM/COUNT/AVG/MIN/MAX` over dimension combinations (book example: `date_key × product_sk` cells hold `SUM(net_price)`; roll up rows/columns for 1-D totals). 5-D cube (date,product,store,promotion,customer, Fig 3-5) = hypercube, $2^N$ sub-aggregates — exponential storage. Fast for precomputed slices (yesterday's store total = one cell); inflexible for ad-hoc predicates (e.g., `price> $100` if price isn't a dimension). Warehouses keep raw data + use cubes as accelerators.
+- **Materialized view incremental maintenance (pp.167–168, p.516):** A naive materialized view refresh recomputes the whole query (`REFRESH MATERIALIZED VIEW` full rebuild) — $O(N)$ per base write, untenable for 500M-row facts. Production materialized view maintenance is incremental: on each base-table `INSERT/UPDATE/DELETE`, compute only the delta and apply it to the stored materialized view rows. For `SUM/COUNT`, delta = add/subtract; for `MIN/MAX`, delta needs auxiliary state (keep top-k or recompute group on eviction, since deleting the current minimum requires finding the next). For joins, delta = join new rows with opposite side (`ΔR ⋈ S`). Engines implement this via (a) trigger-based refresh — `AFTER INSERT` trigger recomputes affected groups, simple but per-row overhead and hard to keep transactionally consistent under concurrency; (b) log-based streaming maintenance — tail the WAL/binlog (Materialize with Timely/Differential Dataflow, DBToaster research) and maintain the materialized view as a dataflow, giving millisecond-fresh materialized view results; (c) periodic batch merge — micro-batch deltas every minute/hour (Snowflake Dynamic Tables, BigQuery materialized view auto-refresh, ClickHouse materialized view with `TO` table), trading freshness for bulk efficiency. Book defers full treatment to "Maintaining materialized views" p.516: the write-amplification versus read-speedup choice is workload-driven — materialized view wins when the same aggregate is read hundreds of times per write.
+- **Data cube operators — roll-up, drill-down, slice, dice (p.168, Gray et al. [82]):** The Figure 4-10 `date_key × product_sk` grid is the 2-D projection of an $N$-D cube. Four standard OLAP operators navigate it: **roll-up** aggregates one dimension away (daily `date_key × product_sk` cells summed over dates → per-product totals; then summed over products → grand total 950 in the figure — the `COL TOTAL` / `ROW TOTAL` margins); **drill-down** is the inverse (year → quarter → month → day, or category → SKU, adding a dimension back and reading finer cells); **slice** fixes one dimension to a single value (`date='2026-01-01'` → 1-D product vector `[100,250,50]`); **dice** fixes ranges on ≥2 dimensions (`date IN (Jan 1-7) AND product IN (A,B)` → sub-cube). SQL expresses roll-up via `GROUP BY CUBE(date_key,product_sk)` / `ROLLUP` / `GROUPING SETS`, which emit all $2^N$ grouping combinations in one pass. Storage cost is the cube explosion: a 5-D cube materializes 32 cuboids; high-cardinality dimensions (customer_id with 10M values) make full materialization impossible — hence partial cubes (only popular cuboids), iceberg cubes (`HAVING COUNT>threshold`), and approximate cubes (HyperLogLog/Theta sketches for distinct counts).
+- **MOLAP vs ROLAP vs HOLAP:** **MOLAP** (Multidimensional OLAP — Essbase, SSAS, Druid segments, ClickHouse `AggregatingMergeTree` / `SummingMergeTree`) stores the cube natively as dense/sparse multidimensional arrays with pre-aggregated roll-ups; fastest for low-cardinality, high-QPS dashboard slices (`O(1)` cell fetch), but rebuild cost and dimension-cardinality limits bite. **ROLAP** (Relational OLAP — Snowflake, BigQuery, Redshift, Trino/Presto on Parquet/Iceberg) keeps star-schema tables relational and computes aggregates at query time with columnar scans + vectorization (§2.8); unlimited cardinality and ad-hoc flexibility (`price>$100` works), but repeated full scans cost. **HOLAP** hybrids keep detailed rows in ROLAP storage and hot cuboids in MOLAP accelerators. Modern mapping: ClickHouse/Druid/Pinot = MOLAP-style pre-aggregation engines (Druid ingests JSON → roll-up at ingestion with `rollup:true`, query granularity + `TOPN`; ClickHouse `MATERIALIZED VIEW ... TO .inner` + `AggregatingMergeTree` incrementally merges `AggregateFunction(sum, UInt64)` states); Snowflake/BigQuery = ROLAP with automatic materialized view rewrite (optimizer substitutes the stored materialized view when query matches, falls back to raw scan otherwise). Rule: dashboard with <100ms SLA on fixed dimensions → MOLAP cube / materialized view; exploratory SQL with unpredictable predicates → ROLAP columnar scan; most warehouses do both (raw lake + materialized view serving layer).
 
 ---
 
-### 2.10 Multi-Dimensional, Full-Text, and Vector Embeddings
-- **Multi-Dimensional Indexes:**
-  - Standard B-trees and LSM-trees can sort on only one dimension at a time. A concatenated index on `(latitude, longitude)` can efficiently find points in a narrow latitude slice, but searching a bounding box (`WHERE latitude BETWEEN x1 AND x2 AND longitude BETWEEN y1 AND y2`) forces an index scan of all longitudes within that latitude band.
-  - *R-Trees:* Group spatial bounding boxes into hierarchical parent rectangles. Used in PostGIS.
-  - *Space-Filling Curves (Z-Order / Morton Curves, Hilbert Curves):* Map 2D/3D coordinates onto a 1D line while preserving spatial locality, allowing standard 1D B-trees to perform 2D spatial bounding box range scans.
-- **Full-Text Inverted Indexes (Apache Lucene):**
-  - Maps unique terms to a **Postings List** (a sorted list of integer document IDs where the term appears).
-  - Postings lists are stored as sorted, compressed arrays (using Frame of Reference or Roaring Bitmaps).
-  - Conjunction queries (`term1 AND term2`) execute vectorized bitwise AND (150-250 MB/s row-wise vs 3000-7000 MB/s SIMD, Fig 4-9) operations across the two postings lists.
-  - Stored on disk using SSTable-like immutable segment files merged via background log-structured compaction.
-  - *Levenshtein Automata:* Allows fuzzy matching within edit distance $K$ by converting the search term into a non-deterministic finite automaton (NFA) evaluated against the indexed term dictionary.
-- **Vector Embeddings & Approximate Nearest Neighbor (ANN) Search:**
-  - Modern AI applications represent entities (text, images, user preferences) as high-dimensional floating-point vectors (e.g., 768 to 1,536 dimensions).
-  - Search queries seek the $k$ most similar vectors using distance metrics:
-    $$\text{Cosine Distance: } D_C(\mathbf{u}, \mathbf{v}) = 1 - \frac{\mathbf{u} \cdot \mathbf{v}}{\|\mathbf{u}\| \|\mathbf{v}\|}, \quad \text{Euclidean Distance: } D_E(\mathbf{u}, \mathbf{v}) = \sqrt{\sum_{i=1}^d (u_i - v_i)^2}$$
-  - *The Curse of Dimensionality:* Exact nearest neighbor search requires an exhaustive scan of all $N$ vectors ($O(N \cdot d)$ time), which becomes intractable at scale. ANN algorithms trade perfect recall for sub-10 ms query latency:
-    1. *Inverted File Index (IVF):* Partitions vector space into Voronoi cells using $k$-means clustering. Queries search only vectors within the nearest $P$ centroid partitions (probes).
-    2. *Hierarchical Navigable Small World (HNSW) Graphs (Figure 4-11):* Multi-layer proximity graph inspired by skiplists. The top layer has few nodes and long-range edges for coarse-grained routing; lower layers are progressively denser. A query navigates greedily toward the nearest neighbor at the top layer, drops to the lower layer at that local entry point, and repeats until reaching the bottom layer. Delivers logarithmic $O(\log N)$ search time.
+### 2.10 Multidimensional, Full-Text & Vector Embeddings (pp.169–173 — Figure 4-11)
+- **Multidimensional:** Concatenated index can't answer `lat BETWEEN 51.49 AND 51.50 AND lon BETWEEN -0.11 AND -0.10` (gives latitude strip *or* longitude strip, not box). Fix: space-filling curves (Z/Morton, Hilbert [83]) → 1-D B-tree, or R-trees/Bkd-trees grouping bounding boxes (PostGIS via GiST [85]; Uber H3 hex grids [86]). Same for `(R,G,B)` color or `(date,temperature)` (HyperDex [87]).
+- **Full-Text Search (p.170):** Each term = dimension; doc with term $x$ = 1 in dimension $x$. **Inverted index:** `term -> postings list [docIDs]` (or Roaring bitmap, cf. Fig 4-8). `x AND y` = bitmap AND (cf. Fig 4-9); Lucene (Elasticsearch/Solr) stores term→postings in SSTable-like sorted files merged log-structured [90–91]; Postgres GIN same for text + JSON [92–93]. Trigrams (`hello → hel,ell,llo`) enable substring/regex at cost of size [94]; Levenshtein automata over trie/FST handle edit-distance-1 typos [95–97].
+- **Vector Embeddings & ANN (pp.171–173 — Figure 4-11, PDF p.173):** Semantic search ("close my account" → "canceling subscription") via LLM embedding model → float vector (e.g., 768–1536 dims; book toy: agriculture `[0.38,0.83,0.41]` near vegetables `[0.36,0.64,0.67]`, far from star-schema `[0.85,0.10,-0.52]`). *Vector* here = position in space, not SIMD batch (p.172 box). Distance: $\text{cosine}=1-\mathbf{u}\!\cdot\!\mathbf{v}/(\|\mathbf{u}\|\|\mathbf{v}\|)$ (angle) or Euclidean $\sqrt{\sum(u_i-v_i)^2}$ (straight line). Query embeds prompt + context, index returns **top-$k$** nearest. R-trees die in high dims → ANN (approximate, sub-10 ms): **Flat** (exact $O(Nd)$ scan), **IVF** (k-means Voronoi partitions/centroids; `nprobe` partitions searched — more probes = higher recall, more ms), **HNSW** (Figure 4-11: skiplist-like layered graphs; top sparse long edges route, lower dense refine; greedy descend → $O(\log N)$). Production: Faiss (IVF-PQ variants [101,103]), pgvector IVF+HNSW [102], plus **PQ product quantization** (compress vectors to codes for RAM-fit billion-scale). Word2Vec/BERT/GPT → multimodal; RAG feeds hits into LLM.
+
+---
+
+### 2.11 When to Materialize: Freshness, Cost, and Engine Choice (pp.167–168, p.516)
+- **Plain-English Intuition:** Every materialized view is a bet that reads will repay writes. This subsection makes that bet explicit so the materialized view decision is reviewable.
+- **Materialized view freshness ladder:** (1) *Synchronous materialized view* — updated in the same transaction as base tables (triggers, Postgres `REFRESH` in-txn); reads always fresh, writes pay full incremental cost + contention. (2) *Asynchronous materialized view* — base commit returns, background job applies delta seconds/minutes later (Snowflake Dynamic Tables `LAG='5 minutes'`, BigQuery scheduled refresh); reads may be stale, writes stay fast. (3) *On-demand materialized view* — refreshed only on schedule or query miss (nightly cube rebuild, `REFRESH MATERIALIZED VIEW CONCURRENTLY`). Pick by SLA: fraud-balance materialized view needs synchronous;昨日-sales dashboard tolerates 15-min async; monthly-board-deck cube tolerates nightly rebuild.
+- **Materialized view vs forward index vs cube — worked rule:** `SELECT SUM(net_price) FROM fact_sales WHERE date_key='2026-01-01'` over 500M rows: raw columnar scan reads ~4 GB quantity+date columns at 3 GB/s → ~1.3 s; materialized view cell lookup reads 1 row → ~2 ms (650× faster) but each of 10k daily ingested rows triggers an incremental materialized view upsert. If QPS is 50 dashboard hits/s, the materialized view pays; if the query runs twice a day ad-hoc, the materialized view never repays its write amplification — keep it virtual. Each additional materialized view multiplies write amplification linearly, so cap production materialized view counts per fact table (typical 3–7) and drop unused cubes via query-log mining.
+- **Engine cheat-sheet:** ClickHouse `CREATE MATERIALIZED VIEW m TO dest AS SELECT ...` + `SummingMergeTree/AggregatingMergeTree` (MOLAP push, parts merge in background, ideal for append-only events); Snowflake Dynamic Tables / BigQuery materialized views (ROLAP auto-rewrite, lag-tunable, zero-ops); Druid/Pinot roll-up ingestion (dimensions pre-aggregated at intake, `queryGranularity` controls cube resolution); Materialize (Differential Dataflow tailing Postgres/KafkaCDC for sub-second materialized view freshness). All four preserve raw facts underneath — the materialized view is an accelerator, never the system of record (p.168 warning).
 
 ---
 
@@ -256,98 +147,85 @@ stateDiagram-v2
 >
 > | Book Fig | PDF page | What to compare |
 > |---|---|---|
-> | Fig 4-1 | PDF p.142 | Log + hash index |
-> | Fig 4-2 | PDF p.143 | SSTable sparse index |
-> | Fig 4-3 | PDF p.145 | SSTable merge |
-> | Fig 4-4 | PDF p.147 | Bloom filter |
-> | Fig 4-5 | PDF p.150 | B-tree lookup 251 |
-> | Fig 4-6 | PDF p.151 | B-tree split 337 |
-> | Fig 4-7 | PDF p.162 | Columnar layout |
-> | Fig 4-8 | PDF p.163 | Bitmap index |
-> | Fig 4-9 | PDF p.167 | Bitmap AND vectorized |
-> | Fig 4-10 | PDF p.168 | Data cube |
-> | Fig 4-11 | PDF p.173 | HNSW vector search |
-
+> | Fig 4-1 | PDF pp.142 | Log + hash index |
+> | Fig 4-2 | PDF pp.143 | SSTable sparse index |
+> | Fig 4-3 | PDF pp.144–145 | SSTable merge |
+> | Fig 4-4 | PDF pp.146 | Bloom filter |
+> | Fig 4-5 | PDF pp.150 | B-tree lookup 251 |
+> | Fig 4-6 | PDF pp.151 | B-tree split 337 |
+> | Fig 4-7 | PDF pp.161–162 | Columnar layout |
+> | Fig 4-8 | PDF pp.163 | Bitmap index |
+> | Fig 4-9 | PDF pp.167 | Bitmap AND vectorized |
+> | Fig 4-10 | PDF pp.168 | Data cube |
+> | Fig 4-11 | PDF pp.173 | HNSW vector search |
 
 ### Figure 4-1: In-Memory Hash Index with Append-Only Log (Bitcask Model)
-- **Figure Reference:** `Figure 4-1: Storing a log of key-value pairs in an append-only format, indexed with an in-memory hash map (reconstructed from text p. 118)`
+- **Figure Reference:** `Figure 4-1: Storing a log of key-value pairs in an append-only format, indexed with an in-memory hash map`
 - **Original PDF:** Fig 4-1 → PDF p.142 — open the PDF at page 142 to compare with the Mermaid reconstruction below.
-- **Visual Flow & Description:** Illustrates how write operations append raw key-value pairs sequentially to disk while maintaining an in-memory hash map pointing to exact byte offsets. Read operations look up the offset in RAM and jump directly to disk.
+- **Visual Flow & Description:** Writes append sequentially; RAM hash `key -> (offset,len)`; reads seek once. Stale offsets overwritten on update.
 - **Mermaid Flowchart:**
 
 ```mermaid
 flowchart TD
   subgraph SG_RAM["RAM: In-Memory Hash Map (Keydir)"]
     direction TB
-    K1["key: 'user:101' | offset: 0   | len: 64"]
-    K2["key: 'user:102' | offset: 64  | len: 72"]
-    K3["key: 'user:101' | offset: 136 | len: 68"]
+    K1["key: 'user:101'<br/>offset: 0 | len: 64"]
+    K2["key: 'user:102'<br/>offset: 64 | len: 72"]
+    K3["key: 'user:101'<br/>offset: 136 | len: 68"]
   end
-
   subgraph SG_DISK["Disk: Append-Only Data File (Segment 001)"]
     direction TB
-    R1["Offset 0:   user:101 -> {'name': 'Alice', 'role': 'dev'}"]
-    R2["Offset 64:  user:102 -> {'name': 'Bob',   'role': 'ops'}"]
-    R3["Offset 136: user:101 -> {'name': 'Alice', 'role': 'lead'}"]
+    R1["Offset 0:<br/>user:101 -> Alice dev"]
+    R2["Offset 64:<br/>user:102 -> Bob ops"]
+    R3["Offset 136:<br/>user:101 -> Alice lead"]
   end
-
   K1 -.->|"stale offset overwritten"| R1
   K2 -->|"read seek byte 64"| R2
   K3 -->|"active latest pointer"| R3
-
-  CLIENT["Client Write: PUT user:101, val"] -->|"1. Sequential Append"| R3
+  CLIENT["Client Write:<br/>PUT user:101 val"] -->|"1. Sequential Append"| R3
   R3 -.->|"2. Update Offset in RAM"| K3
 ```
 
-- **Key Takeaway:** Append-only logging guarantees maximum disk write throughput by eliminating random seeks, but limits total keyset size to available RAM and requires background segment compaction to reclaim dead space.
+- **Key Takeaway:** Max write throughput, but RAM-bounded keyset + compaction debt.
 
 ---
 
 ### Figure 4-2: SSTable File Layout with Sparse In-Memory Index & Block Compression
-- **Figure Reference:** `Figure 4-2: An SSTable with a sparse index and compressed blocks (reconstructed from text p. 120)`
+- **Figure Reference:** `Figure 4-2: An SSTable with a sparse index and compressed blocks`
 - **Original PDF:** Fig 4-2 → PDF p.143 — open the PDF at page 143 to compare with the Mermaid reconstruction below.
-- **Visual Flow & Description:** Shows sorted records grouped into 4 KiB compressed blocks on disk. RAM holds only a sparse index of boundary keys. Queries perform binary search in RAM, load the single target compressed block, and scan sequentially.
+- **Visual Flow & Description:** Sorted keys in 4 KiB compressed blocks; RAM holds boundary keys only (`handbag`, `handsome`); `handiwork` located by bracketing + block scan.
 - **Mermaid Flowchart:**
 
 ```mermaid
 flowchart TD
   subgraph SG_SPARSE["RAM: Sparse Index (Boundary Keys Only)"]
     direction LR
-    IDX1["'abacus' -> Offset 0"]
-    IDX2["'handbag' -> Offset 4096"]
-    IDX3["'panther' -> Offset 8192"]
+    IDX1["'abacus'<br/>Offset 0"]
+    IDX2["'handbag'<br/>Offset 4096"]
+    IDX3["'panther'<br/>Offset 8192"]
   end
-
   subgraph SG_SST["Disk: Sorted String Table (SSTable File)"]
     direction TB
-    subgraph B1["Compressed Block 0 (Offset 0 .. 4095)"]
-      D1["abacus: 12 ... glitter: 88"]
-    end
-    subgraph B2["Compressed Block 1 (Offset 4096 .. 8191)"]
-      D2["handbag: 45 ... melon: 104"]
-    end
-    subgraph B3["Compressed Block 2 (Offset 8192 .. 12287)"]
-      D3["panther: 3 ... zebra: 99"]
-    end
+    B1["Compressed Block 0<br/>abacus .. glitter"]
+    B2["Compressed Block 1<br/>handbag .. melon"]
+    B3["Compressed Block 2<br/>panther .. zebra"]
   end
-
   IDX1 --> B1
   IDX2 --> B2
   IDX3 --> B3
-
   Q["Query: GET 'handheld'"] -->|"Binary Search in RAM"| IDX2
-  IDX2 -->|"Fetch & Decompress 4KB Block"| B2
+  IDX2 -->|"Fetch plus Decompress 4KB Block"| B2
   B2 -->|"Scan Within Block"| RES["Return Value for 'handheld'"]
 ```
 
-- **Key Takeaway:** Sorting keys on disk allows sparse indexing, eliminating the RAM bottleneck of hash indexes while enabling block-level compression to save disk space and I/O bus bandwidth.
+- **Key Takeaway:** Sorting eliminates RAM-per-key; compression saves I/O.
 
 ---
 
 ### Figure 4-3: Multi-Way SSTable Segment Merge and Compaction
-- **Figure Reference:** `Figure 4-3: Merging several SSTable segments, retaining only the most recent value (reconstructed from text p. 121)`
-- **Original PDF:** Fig 4-3 → PDF p.145 — open the PDF at page 145 to compare with the Mermaid reconstruction below.
-- **Visual Flow & Description:** Depicts the background compaction worker executing an $O(N)$ multi-way merge sort across two older SSTables. Stale keys are dropped, tombstones are purged, and fresh sorted segments are output.
+- **Figure Reference:** `Figure 4-3: Merging several SSTable segments, retaining only the most recent value`
+- **Original PDF:** Fig 4-3 → PDF pp.144–145 — open the PDF at pages 144–145 to compare with the Mermaid reconstruction below.
+- **Visual Flow & Description:** Mergesort-like merge; newest timestamp wins; tombstones purge.
 - **Mermaid Flowchart:**
 
 ```mermaid
@@ -358,47 +236,42 @@ flowchart LR
     A2["'bob': 20 (t=1)"]
     A3["'claire': 30 (t=1)"]
   end
-
   subgraph IN2["SSTable Input Segment B"]
     direction TB
     B1["'alice': 15 (t=3)"]
     B2["'claire': TOMBSTONE (t=4)"]
     B3["'david': 50 (t=2)"]
   end
-
   subgraph MERGE_ENGINE["Compactor: Multi-Way Merge Worker"]
     direction TB
-    CMP["Compare keys in lockstep; discard older t; purge tombstones"]
+    CMP["Compare keys in lockstep<br/>Discard older timestamps<br/>Purge tombstones"]
   end
-
   subgraph OUT["New Compacted SSTable Segment"]
     direction TB
     O1["'alice': 15 (t=3)"]
     O2["'bob': 20 (t=1)"]
     O3["'david': 50 (t=2)"]
   end
-
   IN1 --> CMP
   IN2 --> CMP
   CMP --> OUT
 ```
 
-- **Key Takeaway:** Multi-way merging runs strictly sequentially with minimal memory footprint ($O(1)$ RAM buffer per file), purging overwritten history and keeping on-disk data compact.
+- **Key Takeaway:** Sequential $O(N)$ merge, $O(1)$ RAM per file.
 
 ---
 
 ### Figure 4-4: Bloom Filter Probabilistic Membership Test
-- **Figure Reference:** `Figure 4-4: A Bloom filter checking whether a particular key is present in an SSTable (reconstructed from text p. 123)`
-- **Original PDF:** Fig 4-4 → PDF p.147 — open the PDF at page 147 to compare with the Mermaid reconstruction below.
-- **Visual Flow & Description:** Demonstrates a 16-bit array with $k=3$ hash functions. Key `handheld` checks bits 2, 6, and 11. Because bit 11 is 0, the engine determines with 100% mathematical certainty that `handheld` does not exist, aborting disk I/O.
+- **Figure Reference:** `Figure 4-4: A Bloom filter checking whether a particular key is present in an SSTable`
+- **Original PDF:** Fig 4-4 → PDF p.146 — open the PDF at page 146 to compare with the Mermaid reconstruction below.
+- **Visual Flow & Description:** 16-bit array, $k=3$; `handheld -> (6,11,2)`; bit 11 = 0 → guaranteed miss.
 - **Mermaid Flowchart:**
 
 ```mermaid
 flowchart TD
-  KEY["Key to Query: 'handheld'"] --> H1["Hash 1: h1('handheld') % 16 = 2"]
-  KEY --> H2["Hash 2: h2('handheld') % 16 = 6"]
-  KEY --> H3["Hash 3: h3('handheld') % 16 = 11"]
-
+  KEY["Key to Query:<br/>'handheld'"] --> H1["Hash 1:<br/>h1 % 16 = 2"]
+  KEY --> H2["Hash 2:<br/>h2 % 16 = 6"]
+  KEY --> H3["Hash 3:<br/>h3 % 16 = 11"]
   subgraph BF["16-Bit Bloom Filter Array in RAM"]
     direction LR
     B0["0: 0"]
@@ -412,235 +285,215 @@ flowchart TD
     B8["8: 0"]
     B9["9: 0"]
     B10["10: 0"]
-    B11["11: 0 (MATCH FAILED)"]
+    B11["11: 0<br/>(MATCH FAILED)"]
     B12["12: 0"]
     B13["13: 0"]
     B14["14: 0"]
     B15["15: 0"]
   end
-
   H1 -.-> B2
   H2 -.-> B6
   H3 -.-> B11
-
   B11 --> DECISION{"Is Bit 11 set to 1?"}
-  DECISION -->|"NO (Bit is 0)"| RET_NO["Key GUARANTEED NOT in SSTable -> Skip Disk Read entirely"]
-  DECISION -->|"YES (All bits 1)"| RET_MAYBE["Key PROBABLY present -> Proceed to Disk Sparse Index"]
+  DECISION -->|"NO (Bit is 0)"| RET_NO["Key GUARANTEED NOT in SSTable<br/>(Skip Disk Read entirely)"]
+  DECISION -->|"YES (All bits 1)"| RET_MAYBE["Key PROBABLY present<br/>(Proceed to Disk Sparse Index)"]
 ```
 
-- **Key Takeaway:** A 10-bit-per-key Bloom filter rejects 99% of unnecessary physical disk seeks for non-existent keys, resolving the LSM-tree read amplification bottleneck.
+- **Key Takeaway:** 10 bits/key → 99% of useless seeks skipped.
 
 ---
 
 ### Figure 4-5: B-Tree Index Traversal & Interior Page Pointers
-- **Figure Reference:** `Figure 4-5: Looking up key 251 by using a B-tree index (reconstructed from text p. 126)`
+- **Figure Reference:** `Figure 4-5: Looking up key 251 by using a B-tree index`
 - **Original PDF:** Fig 4-5 → PDF p.150 — open the PDF at page 150 to compare with the Mermaid reconstruction below.
-- **Visual Flow & Description:** Shows a 3-level B-tree with a branching factor of 6. Root page directs key 251 down to the middle child page, which points to the target leaf page holding the actual record.
+- **Visual Flow & Description:** Branching factor 6; root `200–300` → interior → leaf `251–275`.
 - **Mermaid Flowchart:**
 
 ```mermaid
 flowchart TD
-  ROOT["Root Page: [Keys: 100, 200, 300, 400]"]
-  
-  C1["Interior Page: [10 .. 99]"]
-  C2["Interior Page: [100 .. 199]"]
-  C3["Interior Page: [200 .. 299]"]
-  C4["Interior Page: [300 .. 399]"]
-
-  L1["Leaf Page: [200 .. 225]"]
-  L2["Leaf Page: [226 .. 250]"]
-  L3["Leaf Page: [251 .. 275] -> Contains 251!"]
-  L4["Leaf Page: [276 .. 299]"]
-
-  ROOT -->|"key < 100"| C1
-  ROOT -->|"100 <= key < 200"| C2
-  ROOT -->|"200 <= key < 300"| C3
+  ROOT["Root Page:<br/>Keys: 100, 200, 300, 400"]
+  C1["Interior Page:<br/>10 .. 99"]
+  C2["Interior Page:<br/>100 .. 199"]
+  C3["Interior Page:<br/>200 .. 299"]
+  C4["Interior Page:<br/>300 .. 399"]
+  L1["Leaf Page:<br/>200 .. 225"]
+  L2["Leaf Page:<br/>226 .. 250"]
+  L3["Leaf Page:<br/>251 .. 275<br/>(Contains 251!)"]
+  L4["Leaf Page:<br/>276 .. 299"]
+  ROOT -->|"key less than 100"| C1
+  ROOT -->|"100 <= key less than 200"| C2
+  ROOT -->|"200 <= key less than 300"| C3
   ROOT -->|"key >= 300"| C4
-
-  C3 -->|"200 <= key < 226"| L1
-  C3 -->|"226 <= key < 251"| L2
-  C3 -->|"251 <= key < 276"| L3
-  C3 -->|"276 <= key < 300"| L4
-
+  C3 -->|"200 <= key less than 226"| L1
+  C3 -->|"226 <= key less than 251"| L2
+  C3 -->|"251 <= key less than 276"| L3
+  C3 -->|"276 <= key less than 300"| L4
   TARGET["Query: Look up Key 251"] --> ROOT
   ROOT -.-> C3
   C3 -.-> L3
   L3 --> VAL["Return Key 251 Record Payload"]
 ```
 
-- **Key Takeaway:** High branching factor keeps B-trees exceptionally shallow ($3\text{--}4$ levels), bounding disk seek latency to a deterministic $O(\log_B N)$ bound.
+- **Key Takeaway:** $O(\log_B N)$, 1 physical I/O when interior cached.
 
 ---
 
 ### Figure 4-6: B-Tree Page Split on Overflow
-- **Figure Reference:** `Figure 4-6: Growing a B-tree by splitting a page on boundary key 337 (reconstructed from text p. 127)`
+- **Figure Reference:** `Figure 4-6: Growing a B-tree by splitting a page on boundary key 337`
 - **Original PDF:** Fig 4-6 → PDF p.151 — open the PDF at page 151 to compare with the Mermaid reconstruction below.
-- **Visual Flow & Description:** Shows an overflowing leaf page splitting into two siblings. The boundary key 337 moves up into the parent page. If the parent page is full, the split cascades upward.
+- **Visual Flow & Description:** Full page splits; 337 promoted; cascade + WAL + latches.
 - **Mermaid Flowchart:**
 
 ```mermaid
 flowchart TD
-  subgraph BEFORE["Before Split: Page 42 Overflowed (> 16KB)"]
+  subgraph BEFORE["Before Split: Page 42 Overflowed"]
     direction TB
-    P1["Parent Page: [ ... | Child: Page 42 ]"]
-    PAGE42["Page 42: [ 301, 315, 320, 337, 342, 350, 361 ] (FULL)"]
+    P1["Parent Page:<br/>Child: Page 42"]
+    PAGE42["Page 42: 301, 315, 320, 337, 342, 350, 361<br/>(STATUS: FULL)"]
     P1 --> PAGE42
   end
-
-  subgraph AFTER["After Split: Page 42 Split into Page 42 & Page 99"]
+  subgraph AFTER["After Split: Page 42 plus Page 99"]
     direction TB
-    P2["Parent Page: [ ... | 337 | Child: Page 99 ]"]
-    PAGE42_NEW["Page 42 (Left): [ 301, 315, 320 ]"]
-    PAGE99_NEW["Page 99 (Right): [ 342, 350, 361 ]"]
-    P2 -->|"keys < 337"| PAGE42_NEW
+    P2["Parent Page:<br/>337 plus Child Page 99"]
+    PAGE42_NEW["Page 42 Left:<br/>301, 315, 320"]
+    PAGE99_NEW["Page 99 Right:<br/>342, 350, 361"]
+    P2 -->|"keys less than 337"| PAGE42_NEW
     P2 -->|"keys >= 337"| PAGE99_NEW
   end
-
-  BEFORE ==>|"Split triggered on insert of 350; promote boundary 337"| AFTER
+  BEFORE ==>|"Split on insert 350; promote 337"| AFTER
 ```
 
-- **Key Takeaway:** B-trees maintain perfect balance by splitting pages from the bottom up, requiring WAL logging and exclusive latches to ensure crash and concurrency safety.
+- **Key Takeaway:** Balance via bottom-up splits; crash-safe only with WAL.
 
 ---
 
 ### Figure 4-7: Row-Oriented vs. Column-Oriented Physical Layout
-- **Figure Reference:** `Figure 4-7: Storing relational data by column rather than by row (reconstructed from text p. 138)`
-- **Original PDF:** Fig 4-7 → PDF p.162 — open the PDF at page 162 to compare with the Mermaid reconstruction below.
-- **Visual Flow & Description:** Illustrates an e-commerce fact table stored in row format (all attributes of record 1 stored together) versus columnar format (all date keys stored together, all product keys stored together).
+- **Figure Reference:** `Figure 4-7: Storing relational data by column rather than by row`
+- **Original PDF:** Fig 4-7 → PDF pp.161–162 — open the PDF at pages 161–162 to compare with the Mermaid reconstruction below.
+- **Visual Flow & Description:** Fact row `[date,store,prod,qty,amt]` vs per-column files; Example 4-1 reads 3/100 cols.
 - **Mermaid Flowchart:**
 
 ```mermaid
 flowchart TD
-  subgraph ROW_STORE["Row-Oriented Layout (OLTP - Heap / B-Tree Page)"]
+  subgraph ROW_STORE["Row-Oriented Layout (OLTP Heap)"]
     direction TB
-    R1["Row 1: [ Date: 2026-01-01 | Store: 101 | Prod: 9 | Qty: 2 | Amt: $40 ]"]
-    R2["Row 2: [ Date: 2026-01-01 | Store: 102 | Prod: 4 | Qty: 1 | Amt: $15 ]"]
-    R3["Row 3: [ Date: 2026-01-02 | Store: 101 | Prod: 9 | Qty: 5 | Amt: $100 ]"]
+    R1["Row 1: 2026-01-01 | 101 | 9 | 2 | 40"]
+    R2["Row 2: 2026-01-01 | 102 | 4 | 1 | 15"]
+    R3["Row 3: 2026-01-02 | 101 | 9 | 5 | 100"]
     R1 --- R2 --- R3
   end
-
-  subgraph COL_STORE["Column-Oriented Layout (OLAP - Parquet / ClickHouse)"]
+  subgraph COL_STORE["Column-Oriented Layout (OLAP Parquet)"]
     direction TB
-    C_DATE["Date Column File:     [ 2026-01-01, 2026-01-01, 2026-01-02 ]"]
-    C_STORE["Store Column File:    [ 101,        102,        101        ]"]
-    C_PROD["Product Column File:  [ 9,          4,          9          ]"]
-    C_QTY["Quantity Column File: [ 2,          1,          5          ]"]
-    C_AMT["Amount Column File:   [ $40,        $15,        $100       ]"]
+    C_DATE["Date Column File:<br/>2026-01-01, 2026-01-01, 2026-01-02"]
+    C_STORE["Store Column File:<br/>101, 102, 101"]
+    C_PROD["Product Column File:<br/>9, 4, 9"]
+    C_QTY["Quantity Column File:<br/>2, 1, 5"]
+    C_AMT["Amount Column File:<br/>40, 15, 100"]
   end
-
-  ROW_STORE -.->|"Analytical Query reads all columns -> Wastes 80% Memory Bandwidth"| SCAN_ROW[High Read Amp Scan]
-  COL_STORE -.->|"Analytical Query reads only Date & Amount -> 100% Bus Efficiency"| SCAN_COL[Zero Overhead Scan]
+  ROW_STORE -.->|"Analytical Query reads all cols<br/>Wastes 80pct Bandwidth"| SCAN_ROW["High Read Amp Scan"]
+  COL_STORE -.->|"Reads Date plus Amount only<br/>Full Bus Efficiency"| SCAN_COL["Zero Overhead Scan"]
 ```
 
-- **Key Takeaway:** Columnar storage matches hardware reality in analytics: loading only queried columns saturates memory buses with useful data and unlocks extreme compression.
+- **Key Takeaway:** Load only queried columns; enables compression.
 
 ---
 
 ### Figure 4-8: Columnar Bitmap and Run-Length Encoding
-- **Figure Reference:** `Figure 4-8: Compressed, bitmap-indexed storage of a single column (reconstructed from text p. 139)`
+- **Figure Reference:** `Figure 4-8: Compressed, bitmap-indexed storage of a single column`
 - **Original PDF:** Fig 4-8 → PDF p.163 — open the PDF at page 163 to compare with the Mermaid reconstruction below.
-- **Visual Flow & Description:** Shows a low-cardinality `product_sk` column transformed into distinct bit vectors per distinct value, compressed via run-length encoding.
+- **Visual Flow & Description:** `product_sk` → per-value bit-vectors → RLE.
 - **Mermaid Flowchart:**
 
 ```mermaid
 flowchart TD
-  COL["Raw Column: product_sk: [ 29, 30, 29, 29, 31, 30, 29 ]"]
-
+  COL["Raw Column product_sk:<br/>29, 30, 29, 29, 31, 30, 29"]
   subgraph BITMAPS["Uncompressed Bitmaps (1 bit per row)"]
     direction TB
-    B_29["product_sk = 29: [ 1, 0, 1, 1, 0, 0, 1 ]"]
-    B_30["product_sk = 30: [ 0, 1, 0, 0, 0, 1, 0 ]"]
-    B_31["product_sk = 31: [ 0, 0, 0, 0, 1, 0, 0 ]"]
+    B_29["product_sk = 29:<br/>1, 0, 1, 1, 0, 0, 1"]
+    B_30["product_sk = 30:<br/>0, 1, 0, 0, 0, 1, 0"]
+    B_31["product_sk = 31:<br/>0, 0, 0, 0, 1, 0, 0"]
   end
-
-  subgraph RLE["Run-Length Encoded (RLE Compact Bytes)"]
+  subgraph RLE["Run-Length Encoded Compact Bytes"]
     direction TB
-    R_29["RLE: (1, 1), (1, 0), (2, 1), (2, 0), (1, 1)"]
-    R_30["RLE: (1, 0), (1, 1), (3, 0), (1, 1), (1, 0)"]
-    R_31["RLE: (4, 0), (1, 1), (2, 0)"]
+    R_29["RLE: (1,1),(1,0),(2,1),(2,0),(1,1)"]
+    R_30["RLE: (1,0),(1,1),(3,0),(1,1),(1,0)"]
+    R_31["RLE: (4,0),(1,1),(2,0)"]
   end
-
   COL --> BITMAPS
   BITMAPS --> RLE
 ```
 
-- **Key Takeaway:** Bitmap indexing converts high-overhead database operations into raw bit arrays that compress dramatically and execute directly inside CPU cache.
+- **Key Takeaway:** Bitwise ops in CPU cache; Roaring adapts dense/sparse.
 
 ---
 
 ### Figure 4-9: Vectorized Bitwise Execution on SIMD Bitmaps
-- **Figure Reference:** `Figure 4-9: A bitwise AND between two bitmaps lends itself to vectorization (reconstructed from text p. 141)`
+- **Figure Reference:** `Figure 4-9: A bitwise AND between two bitmaps lends itself to vectorization`
 - **Original PDF:** Fig 4-9 → PDF p.167 — open the PDF at page 167 to compare with the Mermaid reconstruction below.
-- **Visual Flow & Description:** Demonstrates how filtering rows matching `product_sk = 29 AND store_sk = 101` evaluates via a single SIMD `VANDPS` machine instruction operating on 512-bit registers.
+- **Visual Flow & Description:** `product_sk=29 AND store_sk=101` via AVX-512 `VANDPS` over 512-bit registers.
 - **Mermaid Flowchart:**
 
 ```mermaid
 flowchart LR
-  BM1["Bitmap 1 (product_sk = 29): [ 1, 0, 1, 1, 0, 0, 1, 0 ... 512 bits ]"]
-  BM2["Bitmap 2 (store_sk = 101):   [ 1, 1, 0, 1, 0, 1, 1, 0 ... 512 bits ]"]
-
-  subgraph SIMD["CPU AVX-512 Register Execution (1 Clock Cycle)"]
+  BM1["Bitmap 1 product_sk=29:<br/>1,0,1,1,0,0,1,0 512 bits"]
+  BM2["Bitmap 2 store_sk=101:<br/>1,1,0,1,0,1,1,0 512 bits"]
+  subgraph SIMD["CPU AVX-512 Register (1 Cycle)"]
     OP["SIMD Bitwise AND (VANDPS)"]
   end
-
-  BM_RES["Result Matching Rows:     [ 1, 0, 0, 1, 0, 0, 1, 0 ... 512 bits ]"]
-
+  BM_RES["Result Matching Rows:<br/>1,0,0,1,0,0,1,0 512 bits"]
   BM1 --> OP
   BM2 --> OP
   OP --> BM_RES
 ```
 
-- **Key Takeaway:** Vectorization eliminates instruction dispatch overhead, evaluating filters on 512 rows per instruction without branch mispredictions.
+- **Key Takeaway:** 512 rows/instruction, no branch mispredicts.
 
 ---
 
 ### Figure 4-10: Multi-Dimensional OLAP Data Cube
-- **Figure Reference:** `Figure 4-10: Two dimensions of a data cube, aggregating data by summing (reconstructed from text p. 143)`
+- **Figure Reference:** `Figure 4-10: Two dimensions of a data cube, aggregating data by summing`
 - **Original PDF:** Fig 4-10 → PDF p.168 — open the PDF at page 168 to compare with the Mermaid reconstruction below.
-- **Visual Flow & Description:** Depicts a 2D matrix aggregating sales by `Product` and `Date`, precalculating row rollups, column rollups, and the grand total cell.
+- **Visual Flow & Description:** `date × product` grid of `SUM(net_price)` + row/column rollups + grand total.
 - **Mermaid Flowchart:**
 
 ```mermaid
 flowchart TD
-  subgraph CUBE["Data Cube Aggregation Grid (Metric: SUM(net_amount))"]
+  subgraph CUBE["Data Cube Grid (Metric: SUM net_amount)"]
     direction TB
-    HEADER["Headers: [ Date / Product ] | Prod A | Prod B | Prod C | ROW TOTAL (By Date)"]
-    R1["2026-01-01                  | $100   | $250   | $50    | $400"]
-    R2["2026-01-02                  | $150   | $300   | $100   | $550"]
-    COL_TOT["COL TOTAL (By Product)  | $250   | $550   | $150   | GRAND TOTAL: $950"]
+    HEADER["Headers: Date/Product | A | B | C | ROW TOTAL"]
+    R1["2026-01-01 | 100 | 250 | 50 | 400"]
+    R2["2026-01-02 | 150 | 300 | 100 | 550"]
+    COL_TOT["COL TOTAL | 250 | 550 | 150 | GRAND 950"]
     HEADER --- R1 --- R2 --- COL_TOT
   end
-
-  Q1["Query: Total Sales on 2026-01-01?"] -->|"Direct Cell Lookup"| R1
-  Q2["Query: Total Sales of Prod B across all dates?"] -->|"Direct Cell Lookup"| COL_TOT
-  Q3["Query: Total Enterprise Sales?"] -->|"Direct Cell Lookup ($950)"| COL_TOT
+  Q1["Query: Sales 2026-01-01?"] -->|"Direct Cell Lookup"| R1
+  Q2["Query: Prod B all dates?"] -->|"Direct Cell Lookup"| COL_TOT
+  Q3["Query: Enterprise Total?"] -->|"Direct Cell 950"| COL_TOT
 ```
 
-- **Key Takeaway:** Data cubes achieve instantaneous $O(1)$ query evaluation by pre-aggregating dimensional combinations, trading write throughput and storage space for zero read latency.
+- **Key Takeaway:** $O(1)$ reads for precomputed slices; $2^N$ storage blowup.
 
 ---
 
-### Figure 4-11: Hierarchical Navigable Small World (HNSW) Multi-Layer Vector Search
-- **Figure Reference:** `Figure 4-11: Searching for the database entry closest to a given query vector in an HNSW index (reconstructed from text p. 149)`
+### Figure 4-11: HNSW Multi-Layer Vector Search
+- **Figure Reference:** `Figure 4-11: Searching for the database entry closest to a given query vector in an HNSW index`
 - **Original PDF:** Fig 4-11 → PDF p.173 — open the PDF at page 173 to compare with the Mermaid reconstruction below.
-- **Visual Flow & Description:** Illustrates an HNSW vector index with 3 hierarchical graph layers. Coarse navigation at Layer 2 identifies entry points for Layer 1, which guides dense search at Layer 0.
+- **Visual Flow & Description:** 3-layer graph; top sparse long edges route, bottom dense refines; IVF alternative partitions by centroids with `nprobe` probes; PQ compresses vectors.
 - **Mermaid Flowchart:**
 
 ```mermaid
 flowchart TD
-  subgraph L2["Layer 2 (Coarse Graph - Sparse Long-Range Edges)"]
+  subgraph L2["Layer 2 (Coarse Sparse Graph)"]
     direction LR
     N2_1((Vec A)) --- N2_2((Vec F))
   end
-
   subgraph L1["Layer 1 (Medium Density Graph)"]
     direction LR
     N1_1((Vec A)) --- N1_2((Vec C))
     N1_2 --- N1_3((Vec F))
     N1_3 --- N1_4((Vec K))
   end
-
-  subgraph L0["Layer 0 (Dense Base Graph - All Vectors Indexed)"]
+  subgraph L0["Layer 0 (Dense Base Graph All Vectors)"]
     direction LR
     N0_1((Vec A)) --- N0_2((Vec B))
     N0_2 --- N0_3((Vec C))
@@ -649,22 +502,21 @@ flowchart TD
     N0_5 --- N0_6((Vec K))
     N0_6 --- N0_7((Vec Z))
   end
-
-  QUERY["Query Vector Q"] -->|"1. Enter at Top Layer"| N2_1
+  QUERY["Query Vector Q<br/>top-k cosine search"] -->|"1. Enter Top Layer"| N2_1
   N2_1 -->|"Greedy step closer to Q"| N2_2
   N2_2 -->|"2. Drop to Layer 1"| N1_3
   N1_3 -->|"Greedy step closer to Q"| N1_4
   N1_4 -->|"3. Drop to Layer 0"| N0_6
-  N0_6 -->|"Local fine-grained search"| N0_7
+  N0_6 -->|"Local fine search"| N0_7
   N0_7 --> RES["Return Nearest Neighbor (Vec Z)"]
 ```
 
-- **Key Takeaway:** HNSW delivers $O(\log N)$ approximate nearest neighbor search over millions of high-dimensional vectors by combining skiplist-style hierarchy with small-world proximity graphs.
+- **Key Takeaway:** $O(\log N)$ ANN; IVF+PQ scales to billions on fixed RAM.
 
 ---
 
 ### LSM-Tree Write and Read Path Concurrent Flow
-- **Visual Flow & Description:** Sequence diagram tracking a concurrent `PUT` mutating the WAL and Memtable, while a background thread flushes immutable segments and a client `GET` queries through Bloom filters.
+- **Visual Flow & Description:** `PUT` via WAL + memtable; background flush; `GET` via Bloom-gated SSTables. LSNs order recovery.
 - **Mermaid Sequence Diagram:**
 
 ```mermaid
@@ -677,7 +529,6 @@ sequenceDiagram
   participant Flusher as Background Flusher
   participant SST as L0 SSTable Disk
   participant Bloom as Bloom Filters
-
   Note over Client,Mem: Write Path Execution
   Client->>WAL: appendRecord(LSN=101, PUT k, v)
   activate WAL
@@ -687,19 +538,17 @@ sequenceDiagram
   activate Mem
   Mem-->>Client: success
   deactivate Mem
-
   Note over Mem,Flusher: Memtable Flush Trigger
-  Mem->>Imm: freeze when size > 64MB
+  Mem->>Imm: freeze when size over 64MB
   activate Imm
   Imm->>Flusher: triggerFlush()
   deactivate Imm
   activate Flusher
   Flusher->>SST: writeSortedDataBlocks(compress=LZ4)
-  Flusher->>Bloom: buildBloomFilter(10 bits/key)
+  Flusher->>Bloom: buildBloomFilter(10 bits per key)
   Flusher->>SST: writeSparseIndexAndFooter()
   Flusher-->>WAL: truncateOldWALSegments()
   deactivate Flusher
-
   Note over Client,Bloom: Read Path Execution
   Client->>Mem: lookup(k)
   Note over Client,Mem: Miss in Active Memtable
@@ -707,7 +556,7 @@ sequenceDiagram
   Note over Client,Imm: Miss in Immutable
   Client->>Bloom: checkBits(k)
   alt Bloom returns false
-    Note over Client,SST: Key guaranteed absent; skip disk I/O!
+    Note over Client,SST: Key guaranteed absent; skip disk IO!
   else Bloom returns true
     Client->>SST: binarySearchSparseIndex(k)
     Client->>SST: readCompressedBlock(4KB)
@@ -715,298 +564,192 @@ sequenceDiagram
   end
 ```
 
-- **Key Takeaway:** Durability is isolated to sequential WAL writes, memory absorbing write latency, while Bloom filters shield disk storage from read amplification.
+- **Key Takeaway:** Sequential WAL isolates durability; Bloom shields disk.
 
 ---
 
 ## 4. Real-World Systems, Case Studies & Code Examples
 
 ### 4.1 Industry Implementations & Architectural Divergence
-- **RocksDB (LSM-Tree Engine):** Developed at Meta (forked from Google LevelDB). Optimized for multi-core CPUs and fast NVMe SSD storage. Introduces column families, concurrent memtable insertions (lock-free skiplist), partitioned filters/indexes to avoid pinned RAM bloat, and dynamic rate limiting to prevent compaction stalls.
-- **Apache Cassandra (LSM Distributed Store):** Optimized for high-throughput distributed writes. Uses Size-Tiered Compaction Strategy (STCS) by default for write-heavy telemetry, with options for Leveled Compaction (LCS) or Time-Window Compaction Strategy (TWCS) for time-series data.
-- **MySQL InnoDB (B-Tree Engine):** Canonical clustered B-tree storage engine. Primary keys are clustered. Implements a doublewrite buffer to protect against torn pages on operating systems lacking atomic 16 KiB block writes. Uses adaptive hash indexing to dynamically build in-memory hash tables over hot B-tree pages.
-- **ClickHouse & DuckDB (Columnar OLAP Engines):** ClickHouse (distributed) and DuckDB (in-process embedded) represent the state of the art in columnar vectorized processing. ClickHouse uses the MergeTree engine family (LSM-like sorted columnar chunks merged in the background). DuckDB processes data in vectorized data chunks of 2,048 elements matching CPU cache lines.
+- **RocksDB (LSM):** Meta fork of LevelDB; multi-core skiplist memtables, column families, partitioned filters, rate-limited compaction to avoid stalls; NVMe-tuned.
+- **Cassandra STCS/LCS/TWCS (LSM distributed):** STCS default for ingest; LCS for reads; TWCS drops whole time windows for metrics with TTL.
+- **InnoDB / Postgres (B-tree):** InnoDB clustered PK + doublewrite anti-torn-page + adaptive hash; Postgres heap + TID + HOT + `VACUUM`, GIN for full-text/JSON.
+- **ClickHouse / DuckDB / Snowflake (columnar):** MergeTree LSM-like sorted parts + 2,048-row vector chunks; Snowflake decoupled S3 + virtual warehouses ($\$2$–$\$4$/credit); BigQuery serverless scan $\$5$/TB.
+- **Lucene / Faiss / pgvector:** Lucene SSTable-like term segments + background merge; Faiss IVF-PQ + HNSW; pgvector both in Postgres.
 
 ---
 
 ### 4.2 Production Implementation: SSTable Segment Compactor with Tombstone Purging
 
 ```python
-import os
 import struct
-from typing import List, Tuple, Iterator, Optional
+from typing import List, Tuple, Optional
 
 class SSTableRecord:
     TOMBSTONE = b"__DELETED_TOMBSTONE__"
 
     @staticmethod
     def encode(key: bytes, value: bytes, timestamp: int) -> bytes:
-        # Header: Key_Len (2B), Val_Len (4B), Timestamp (8B)
-        header = struct.pack(">HQ Q", len(key), len(value), timestamp)
+        header = struct.pack(">HQL", len(key), len(value), timestamp)
         return header + key + value
 
     @staticmethod
     def decode(stream) -> Optional[Tuple[bytes, bytes, int]]:
-        header_bytes = stream.read(struct.calcsize(">HQ Q"))
-        if not header_bytes:
+        hdr = stream.read(struct.calcsize(">HQL"))
+        if not hdr:
             return None
-        key_len, val_len, timestamp = struct.unpack(">HQ Q", header_bytes)
-        key = stream.read(key_len)
-        value = stream.read(val_len)
-        return key, value, timestamp
+        kl, vl, ts = struct.unpack(">HQL", hdr)
+        return stream.read(kl), stream.read(vl), ts
 
-def multiway_sstable_compactor(
-    input_segment_paths: List[str], 
-    output_segment_path: str,
-    sparse_index_interval_bytes: int = 4096
-) -> List[Tuple[bytes, int]]:
-    """
-    Executes an out-of-core multi-way merge sort across sorted SSTable files.
-    Purges overridden keys, drops tombstones, and outputs a compacted segment
-    with a sparse in-memory index mapping boundary keys to byte offsets.
-    """
-    streams = [open(p, "rb") for p in input_segment_paths]
-    active_records = [SSTableRecord.decode(s) for s in streams]
-    sparse_index = []
-    
-    bytes_written = 0
-    last_indexed_offset = -sparse_index_interval_bytes
-
-    with open(output_segment_path, "wb") as out:
+def multiway_sstable_compactor(input_paths: List[str], out_path: str,
+                               index_interval: int = 4096):
+    """Mergesort SSTables, keeps newest LSN, purges tombstones, builds sparse index."""
+    streams = [open(p, "rb") for p in input_paths]
+    active = [SSTableRecord.decode(s) for s in streams]
+    sparse, written, last_idx = [], 0, -index_interval
+    with open(out_path, "wb") as out:
         while True:
-            # Find the minimum key across all active streams
-            min_key = None
-            min_indices = []
-
-            for i, rec in enumerate(active_records):
-                if rec is not None:
-                    k, _, _ = rec
-                    if min_key is None or k < min_key:
-                        min_key = k
-                        min_indices = [i]
-                    elif k == min_key:
-                        min_indices.append(i)
-
-            if min_key is None:
-                break  # All streams fully consumed
-
-            # Disambiguate by choosing the record with the latest timestamp
-            winner_record = max(
-                (active_records[idx] for idx in min_indices),
-                key=lambda item: item[2]
-            )
-            key, val, ts = winner_record
-
-            # Advance all input streams that matched min_key
-            for idx in min_indices:
-                active_records[idx] = SSTableRecord.decode(streams[idx])
-
-            # Purge tombstones during compaction
+            mk = None
+            for rec in active:
+                if rec and (mk is None or rec[0] < mk):
+                    mk = rec[0]
+            if mk is None:
+                break
+            cand = [r for r in active if r and r[0] == mk]
+            key, val, ts = max(cand, key=lambda x: x[2])
+            for i, rec in enumerate(active):
+                if rec and rec[0] == mk:
+                    active[i] = SSTableRecord.decode(streams[i])
             if val == SSTableRecord.TOMBSTONE:
                 continue
-
-            # Check if we should add an entry to the sparse index
-            if bytes_written - last_indexed_offset >= sparse_index_interval_bytes:
-                sparse_index.append((key, bytes_written))
-                last_indexed_offset = bytes_written
-
-            encoded = SSTableRecord.encode(key, val, ts)
-            out.write(encoded)
-            bytes_written += len(encoded)
-
-    # Clean up file descriptors
+            if written - last_idx >= index_interval:
+                sparse.append((key, written))
+                last_idx = written
+            enc = SSTableRecord.encode(key, val, ts)
+            out.write(enc)
+            written += len(enc)
     for s in streams:
         s.close()
-
-    return sparse_index
+    return sparse
 ```
 
 ---
 
-### 4.3 Production Implementation: Optimal Bloom Filter with Murmur3 Hashing
+### 4.3 Production Implementation: Optimal Bloom Filter
 
 ```python
 import math
 import mmh3
+from typing import Iterator
 
 class BloomFilter:
-    """
-    Cache-aligned Bloom Filter with mathematically optimal bit sizing
-    and MurmurHash3 dual-hash simulation (Kirsch-Mitzenmacher optimization).
-    """
-    def __init__(self, expected_elements: int, false_positive_rate: float):
-        if not (0 < false_positive_rate < 1):
-            raise ValueError("FPR must be between 0 and 1.")
-        
-        self.n = expected_elements
-        self.p = false_positive_rate
-        
-        # Optimal bits: m = - (n * ln(p)) / (ln(2)^2)
-        self.m = int(math.ceil(- (self.n * math.log(self.p)) / (math.log(2) ** 2)))
-        # Optimal hash count: k = (m / n) * ln(2)
-        self.k = int(round((self.m / self.n) * math.log(2)))
-        
-        # Byte array storage
-        self.bit_array = bytearray((self.m + 7) // 8)
+    """10 bits/key -> 1% FPR; Kirsch-Mitzenmacher double hashing."""
+    def __init__(self, n: int, p: float):
+        self.n, self.p = n, p
+        self.m = int(math.ceil(-(n * math.log(p)) / (math.log(2) ** 2)))
+        self.k = int(round((self.m / n) * math.log(2)))
+        self.bits = bytearray((self.m + 7) // 8)
 
-    def _get_hashes(self, key: bytes) -> Iterator[int]:
-        # Kirsch-Mitzenmacher: gi(x) = h1(x) + i * h2(x)
+    def _hashes(self, key: bytes) -> Iterator[int]:
         h1 = mmh3.hash(key, 0, signed=False)
         h2 = mmh3.hash(key, 42, signed=False)
         for i in range(self.k):
             yield (h1 + i * h2) % self.m
 
     def add(self, key: bytes) -> None:
-        for bit_index in self._get_hashes(key):
-            byte_idx = bit_index // 8
-            bit_offset = bit_index % 8
-            self.bit_array[byte_idx] |= (1 << bit_offset)
+        for b in self._hashes(key):
+            self.bits[b // 8] |= (1 << (b % 8))
 
     def contains(self, key: bytes) -> bool:
-        """
-        Returns False: Guaranteed that key was never added.
-        Returns True: Key is probably in the set (within false positive bound).
-        """
-        for bit_index in self._get_hashes(key):
-            byte_idx = bit_index // 8
-            bit_offset = bit_index % 8
-            if not (self.bit_array[byte_idx] & (1 << bit_offset)):
-                return False
-        return True
+        return all(self.bits[b // 8] & (1 << (b % 8)) for b in self._hashes(key))
 ```
 
 ---
 
 ### 4.4 Production War Story: The RocksDB Write-Stall Meltdown
-- **The Context:** An advertising exchange tracked ad impressions using an 8-node RocksDB-backed key-value cluster, sustaining an aggregate ingestion rate of $600,000\ \text{writes/sec}$. The storage configuration allocated standard 64 MiB memtables with Leveled Compaction and default thread pool settings (2 compaction threads).
-- **The Pathological Incident:** During a Black Friday promotion, ingestion traffic doubled to $1.2\ \text{million writes/sec}$. Memtables filled and flushed to Level 0 every 1.5 seconds. Because $L_0$ SSTables contain overlapping key ranges, Level 0 files accumulated faster than the 2 compaction worker threads could merge them into Level 1.
-- **The Cascade:** When the $L_0$ file count reached 20 (the `level0_slowdown_writes_trigger`), RocksDB introduced synthetic artificial sleep delays (1 millisecond per write) to throttle clients. Because the incoming request rate did not decrease, the client application thread pools saturated with waiting connections. Within 45 seconds, the $L_0$ file count breached 32 (the `level0_stop_writes_trigger`).
-- **The Catastrophe:** RocksDB completely stopped accepting writes (`Status::Incomplete("Write stall")`). Application load balancers marked the database nodes unhealthy and routed traffic to remaining nodes, instantly triggering identical write stalls in a cascading cluster-wide outage.
-- **Remediation & Lessons:**
-  1. *Dynamic Compaction Thread Sizing:* Compaction threads were increased from 2 to 8 dedicated cores on NVMe storage.
-  2. *Write Buffer Manager:* Implemented RocksDB's global `WriteBufferManager` across all column families to enforce smooth backpressure instead of hard stop thresholds.
-  3. *Switch to Tiered Compaction for Ingestion:* For append-heavy time-series data without immediate point read requirements, the team migrated to Time-Window Compaction Strategy (TWCS), eliminating cross-level write amplification.
+- **Context:** Ad exchange, 8-node RocksDB, $600{,}000\ \text{writes/sec}$, 64 MiB memtables, 2 compaction threads, NVMe $\$0.10$/GB-mo.
+- **Incident:** Black Friday $1.2$M writes/sec → L0 flush every 1.5 s, overlapping ranges pile to 20 files (`level0_slowdown_writes_trigger` → 1 ms sleep/write), thread pools saturate, 45 s later 32 files (`level0_stop_writes_trigger` → `Incomplete("Write stall")`), LB marks nodes unhealthy, cascade.
+- **Fix:** 2→8 compaction cores, `WriteBufferManager` smooth backpressure, TWCS for TTL series, `rate_limiter` on compaction I/O. Lesson: provision compaction bandwidth = $WA \times$ ingest (e.g., $20\times \times 50$ MB/s = 1 GB/s disk).
 
 ---
 
 ## 5. Architectural Trade-Off Matrix
 
-| Storage Architecture | Primary Advantage | Point Read (p99) | Write Throughput & Amplification | Space Amplification | Crash Recovery Mechanism | Best Workload Fit | Catastrophic Failure Mode |
+| Architecture | Advantage | Point Read p99 | Write Amp | Space Amp | Recovery | Best Fit | Failure Mode |
 | :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- |
-| **Bitcask (Append Log + In-Memory Hash)** | Maximum sustained sequential write speed; simplest engine | $O(1)$ disk seek; sub-5 ms | High throughput; $\text{WA} \approx 1\times\text{--}2\times$ | High ($\sim 50\%$ dead space until compaction) | Replay hint files off disk; scan segments | Low key cardinality; high-frequency value updates | RAM exhaustion when unique key count exceeds memory |
-| **LSM-Tree: Leveled (RocksDB, LevelDB)** | High sequential write throughput; superior compression | Moderate ($O(L)$ levels; mitigated by Bloom to 1--2 seeks) | High throughput; high $\text{WA} \ (10\times\text{--}30\times)$ | Low ($\sim 10\%\text{--}20\%$ temporary headroom) | Replay sequential WAL; discard un-flushed memtable | Write-heavy OLTP; high-concurrency ingestion on SSDs | Compaction falling behind write rate triggers total Write Stall |
-| **LSM-Tree: Size-Tiered (Cassandra STCS)** | Lowest initial write amplification during bulk ingest | High ($O(\text{files})$ reads across all uncompacted tiers) | Maximum initial write throughput; $\text{WA} \ (4\times\text{--}8\times)$ | Catastrophic ($>50\%$ free disk headroom required) | Replay commit log; rebuild memtable in RAM | Bulk historical append logging; time-series data | Disk full crash during major compaction of large files |
-| **B-Tree (In-Place Slotted Page - InnoDB)** | Deterministic sub-millisecond point reads; stable tail latency | $O(\log_B N)$; strictly 1 physical seek if pages cached | Moderate; extreme $\text{WA} \ (30\times\text{--}100\times+)$ | Moderate ($30\%\text{--}50\%$ internal page fragmentation) | Replay physical/redo WAL; doublewrite buffer rollback | Read-heavy OLTP ($>80\%$ reads); range-scan queries | Random write patterns on large datasets induce massive I/O thrashing |
-| **Columnar Engine (Parquet, ClickHouse)** | Unrivaled analytical scan throughput via SIMD vectorization | Unusable for single-row lookups ($O(N)$ column reads) | High for batch appends; catastrophic for point updates | Minimal (Extreme: $80\%\text{--}95\%$ via RLE / Bitmaps) | Immutable file snapshots; lakehouse manifest CAS | Analytical aggregations (OLAP); data warehousing | Executing high-concurrency single-record point `UPDATE/DELETE` |
-| **HNSW Vector Index (Faiss, pgvector)** | Fast $O(\log N)$ approximate nearest neighbor search | Sub-10 ms for high-dimensional vectors | Low; high build time ($O(N \log N)$ distance ops) | High ($1.5\times\text{--}2.5\times$ vector size for graph edges) | Rebuild graph or persist serialized adjacency layers | AI embeddings; semantic search; recommendation engines | Graph size exceeding RAM forces random disk seeks, stalling search |
-
----
+| **Bitcask (log+hash)** | Max sequential write | $O(1)$ <5 ms | $1\times$–$2\times$ | ~50% dead pre-compact | Hint files + scan | Small keyset, frequent updates | RAM exhaustion |
+| **LSM Leveled (RocksDB)** | High write + compression | $O(L)$, Bloom→1–2 seeks ~3 ms | $10\times$–$30\times$ | 10–20% temp | WAL replay (LSN) | Write-heavy OLTP | Write stall |
+| **LSM Size-tiered (Cassandra)** | Bulk ingest | $O(\text{files})$ ~10 ms | $4\times$–$8\times$ | >50% headroom | Commit log | Historical append | Disk-full during merge |
+| **B-tree (InnoDB)** | Deterministic reads | $O(\log_B N)$ 1 seek ~1 ms | $30\times$–$100\times$ | 30–50% frag | WAL + doublewrite | Read-heavy + ranges | Random-write thrash |
+| **Columnar (Parquet/ClickHouse)** | SIMD scans 3000 MB/s | $O(N)$ unusable | Batch good, point fatal | −80 to −95% via RLE | Immutable snapshots | OLAP | Point UPDATE storm |
+| **HNSW (Faiss/pgvector)** | $O(\log N)$ ANN <10 ms | <10 ms top-k | Build $O(N\log N)$ | $1.5\times$–$2.5\times$ | Rebuild/persist | Embeddings/RAG | RAM spill → seeks |
+| **Materialized view / Data cube (MOLAP accel)** | $O(1)$ precomputed roll-ups | $O(1)$ ~2 ms cell fetch | +$N_{views}\times$ incremental delta per base write | $2^N$ cuboids if fully materialized | Rebuild or replay deltas | Repeated fixed aggregates | Stale reads + write-amp blowup |
 
 ### Concrete Decision Heuristics
 
 ```text
-Decision Tree for Storage Engine Selection:
-1. Is the workload Analytical (OLAP - aggregates, scans over millions of rows)?
-   ├── YES:
-   │    ├── Querying immutable/batch historical logs? -> Use Columnar Engine (Parquet / ClickHouse / Snowflake).
-   │    └── Queries require real-time pre-aggregated rollups on fixed dimensions? -> Precompute Materialized OLAP Data Cube.
-   └── NO (OLTP - point lookups, single-row inserts/updates by key):
-        ├── Does the entire set of unique keys fit in server RAM?
-        │    ├── YES and values are updated frequently? -> Use In-Memory Hash Store (Bitcask / Redis).
-        │    └── NO:
-        │         ├── Is the workload heavily Read-Dominant (>85% reads) requiring deterministic p99 latency?
-        │         │    └── YES -> Use B-Tree Clustered Store (MySQL InnoDB / PostgreSQL).
-        │         └── Is the workload Write-Heavy (>30% writes) or ingestion-rate bound?
-        │              ├── Need point-read efficiency across levels? -> Use LSM-Tree with Leveled Compaction (RocksDB).
-        │              └── Pure append-only time-series with predictable TTL? -> Use LSM-Tree with Time-Window Compaction (TWCS).
+1. OLAP aggregates over millions of rows?
+   YES -> Columnar (Parquet/ClickHouse/Snowflake); fixed rollups -> Data Cube.
+   NO (OLTP point lookups):
+     Keys fit RAM + frequent updates? YES -> Bitcask/Redis.
+     NO -> Read-dominant >85% + p99 determinism? YES -> B-tree (InnoDB/PG).
+           Write-heavy >30%? Leveled LSM (RocksDB); append TTL? TWCS.
 ```
 
 ---
 
 ## 6. Jargon Buster & Key Terminology
 
-- **Memtable:** An in-memory, write-buffered balanced search tree (skiplist or red-black tree) that stores recent mutations in sorted order before flushing them as immutable SSTables to disk.
-- **SSTable (Sorted String Table):** An immutable on-disk file format storing a sequence of key-value pairs sorted strictly by key, organized into compressed blocks with an internal index.
-- **Write Amplification (WA):** The ratio of the number of bytes written to underlying physical storage (flash/disk) relative to the logical number of bytes requested by the application write.
-- **Read Amplification (RA):** The number of physical disk/block reads required to satisfy a single logical database read request.
-- **Space Amplification (SA):** The ratio of the physical disk space consumed by the database files relative to the actual uncompressed raw size of valid data records.
-- **Compaction:** The background maintenance process in log-structured storage engines that merges multiple immutable data files, reconciles updates, and purges deleted records (tombstones).
-- **Bloom Filter:** A space-efficient probabilistic data structure that tests set membership with zero false negatives and a tunable false positive rate, preventing unnecessary disk I/O.
-- **Latch vs. Lock:** In database internals, a **latch** is a short-duration, low-overhead in-memory concurrency control primitive (e.g., mutex or spinlock) protecting in-memory data structures (like B-tree page pointers) for microseconds. A **lock** is a high-level transaction primitive held for the entire duration of a transaction to maintain ACID isolation.
-- **Vectorized Execution:** A query processing model where operators evaluate batches of column data (e.g., 1,024 elements) within tight loops using CPU SIMD instructions, rather than processing one row at a time via recursive function calls. *Confused with:* Vector embedding search.
-- **HNSW (Hierarchical Navigable Small World):** A multi-layer graph algorithm used in vector databases for approximate nearest neighbor search that achieves logarithmic $O(\log N)$ search complexity by navigating through hierarchical proximity layers.
+- **Memtable:** Sorted RAM buffer (skiplist/red-black) drained as SSTables; WAL-guarded by LSN.
+- **SSTable:** Immutable sorted key-value file in compressed blocks + sparse index.
+- **Write/Read/Space Amplification (WA/RA/SA):** Disk bytes per app byte; disk reads per logical read; disk bytes per live byte.
+- **Compaction:** Background mergesort of SSTables purging overwrites/tombstones.
+- **Bloom Filter:** Probabilistic membership, zero false negatives; 10 bits/key → 1% FPR.
+- **Latch vs Lock:** Microsecond in-memory mutex (crabbing) vs transaction-duration isolation lock.
+- **Clustered vs Heap vs Covering:** Row-in-leaf vs pointer-to-heap vs index-duplicated columns for index-only scans.
+- **Vectorized Execution vs Vector Embedding:** SIMD batches (bits) vs float position in semantic space — different meanings (p.172 box).
+- **HNSW / IVF / PQ:** Layered proximity graph; centroid-partitioned inverted file (`nprobe`); product-quantized codes for RAM-fit billions.
+- **Data Cube:** Precomputed $2^N$ aggregates; $O(1)$ reads, exponential writes.
+- **Materialized view:** Persisted query result on disk (vs virtual view expanded at read); refreshed by full rebuild or incremental maintenance via triggers / WAL-tail dataflow / batch merge; each extra materialized view adds write amplification but cuts hot aggregate reads from seconds to milliseconds.
+- **Materialized view incremental maintenance:** Delta-propagation (`SUM/COUNT` add/subtract, `MIN/MAX` with auxiliary state, join deltas `ΔR ⋈ S`); Materialize/Differential Dataflow, Snowflake Dynamic Tables, ClickHouse `TO`-table views.
+- **Roll-up / Drill-down / Slice / Dice:** Cube navigation — aggregate away a dimension / add it back / fix one dimension / fix ranges on several; SQL `CUBE/ROLLUP/GROUPING SETS`.
+- **MOLAP vs ROLAP vs HOLAP:** MOLAP stores native multidimensional arrays + pre-aggregated cuboids (Druid, Essbase, ClickHouse `AggregatingMergeTree`) for $O(1)$ dashboard cells; ROLAP computes from relational star schema at query time (Snowflake, BigQuery) for ad-hoc flexibility; HOLAP hybrids keep both.
 
 ---
 
 ## 7. System Design & Practical Engineering Takeaways
 
 ### 7.1 Production Engineering Checklist
-1. **Never Disable WAL fsync Without Measuring Data Loss Window:** Disabling WAL `fsync` (`flush_log_at_trx_commit = 2` in MySQL or `wal_level = minimal` in Postgres) boosts write IOPS by $10\times$ by buffering writes in OS cache, but guarantees torn transactions and data loss on server power failure.
-2. **Size LSM Bloom Filters at Exactly 10 Bits/Key:** Sizing Bloom filters below 10 bits per key exponentially increases the false positive rate ($p \approx 0.6185^{m/n}$), degrading point read throughput by driving unnecessary random disk reads. Sizing above 12 bits yields diminishing returns while wasting resident RAM.
-3. **Budget 50% Disk Headroom for Size-Tiered Compaction:** If operating Apache Cassandra with Size-Tiered Compaction (STCS), never exceed $50\%$ disk utilization. Compacting a 500 GiB SSTable requires allocating a 500 GiB temporary file concurrently before the old file can be unlinked.
-4. **Enforce Secondary Index Column Ordering on Concatenated Indexes:** When defining multi-column B-tree indexes `(A, B, C)`, order columns from highest equality filtering cardinality to range filtering cardinality. A query filtering on `B` cannot use an index ordered `(A, B)`.
-5. **Pin B-Tree Root and Interior Pages in Memory:** Ensure database buffer pools are sized to permanently hold Level 0 through Level $(D-1)$ of all active B-tree indexes, guaranteeing that point lookups incur at most 1 physical disk read (the leaf page).
+1. **Never disable WAL fsync blindly:** `flush_log_at_trx_commit=2` gains $10\times$ IOPS but opens 1-s loss window; torn pages cost $\$50$K+ incidents.
+2. **Size Bloom at 10 bits/key:** Below that FPR explodes ($p\approx 0.6185^{m/n}$); above 12 bits wastes RAM.
+3. **Keep 50% headroom for STCS:** 500 GiB merge needs 500 GiB temp; exceeding 50% risks ENOSPC mid-compaction.
+4. **Order concatenated indexes equality→range:** `(A,B)` useless for `WHERE B=?`; spatial/box needs R-tree, not concatenation.
+5. **Pin B-tree interior in buffer pool:** Guarantees 1 physical I/O per point lookup (~1 ms p99 vs 15 ms spilling).
 
 ---
 
 ### 7.2 System Design Interview Strategy
-- **Derive Storage Engine from Workload Asymmetry:** In system design interviews (e.g., designing Uber ride location tracking vs. an e-commerce checkout ledger), immediately state the write/read ratio. Propose LSM-trees (RocksDB/Cassandra) for high-velocity write ingest ($>10,000\ \text{writes/sec}$) to avoid B-tree random I/O write amplification. Propose clustered B-trees (PostgreSQL/InnoDB) when point-read latency determinism and relational ACID invariants dominate.
-- **Address Compaction Interference Proactively:** When proposing an LSM-tree architecture, score points with the interviewer by proactively pointing out the **compaction stall failure mode**. Explain how background compaction threads saturate disk I/O channels, driving p99 write latency spikes, and propose mitigations (rate-limiting compaction I/O, provisioned IOPS NVMe drives, or separate flush threads).
-- **Capacity Sketching Template:**
-  $$\text{Storage Growth} = \text{QPS}_{\text{write}} \times \text{Avg Payload Bytes} \times (1 + \text{Write Amplification}) \times \text{Replication Factor}$$
-  $$\text{RAM Required (Bitcask)} = \text{Unique Key Count} \times (\text{Key Bytes} + 16\ \text{Bytes Pointer Overhead})$$
-  $$\text{RAM Required (Bloom Filters)} = \text{Total Unique Records} \times 10\ \text{bits} \div 8\ \text{bits/byte}$$
+- **Derive engine from ratio:** $>10{,}000$ writes/sec random keys → LSM (sequentialize); $>80\%$ reads + ranges → clustered B-tree; 100M-row scans of 3/40 cols → columnar (prove $320\times$ I/O cut).
+- **Name the stall:** Propose LSM → immediately add compaction backpressure mitigation (I/O limiter, extra threads, TWCS) — interview signal.
+- **Capacity sketch:** `Growth = QPS×bytes×(1+WA)×RF`; `RAM_bitcask = keys×(key+16B)`; `RAM_bloom = records×10/8 bytes`; `Scan = rows×col_bytes/compression / (1 GB/s × cores)`.
 
 ---
 
 ### 7.3 Mastery Self-Assessment Questions
 
 #### Question 1 (Conceptual Depth)
-*Why does an LSM-Tree achieve higher raw write throughput than an in-place B-Tree on disk, but why can its read latency and p99 tail latency degrade substantially under sustained mixed workloads?*
-- **Answer:** 
-  An LSM-tree achieves superior write throughput because it converts random application writes into sequential disk I/O. Incoming writes are appended to an on-disk sequential Write-Ahead Log (WAL) and buffered in an in-memory skiplist (Memtable). The sequential write bandwidth of modern storage media (HDD $\sim 150\text{--}250\ \text{MB/s}$, NVMe SSD $\sim 3,000\text{--}7,000\ \text{MB/s}$) is ~10-100x higher scan throughput (columnar + SIMD, see trade-off matrix) than random I/O seek capabilities. In contrast, a B-tree must overwrite fixed 16 KiB pages in-place across the disk address space. If the active dataset exceeds the buffer pool, every B-tree write incurs random page reads and writes, multiplying write amplification ($30\times\text{--}100\times$).
-  However, LSM-tree read latency degrades under sustained mixed load due to **Read Amplification** and **Compaction Interference**. A point read in an LSM-tree must check the Memtable and potentially multiple SSTables across levels ($L_0$ to $L_k$). Even with Bloom filters, range queries must merge iterators across all overlapping SSTables using a priority queue. Furthermore, background compaction threads continuously read and rewrite gigabytes of SSTables to maintain leveled invariants. Under high write load, compaction saturates disk I/O and CPU memory buses, creating severe queueing delays that cause p99 read and write latencies to spike by orders of magnitude (compaction stalls).
+*Why does LSM beat B-tree on writes but risk p99 reads under mixed load?*
+- **Answer:** LSM turns random writes into sequential WAL + RAM skiplist ($O(\log M)$), flushing 64 MiB sorted runs at 3–7 GB/s NVMe vs B-tree random 16 KiB overwrites ($30\times$–$100\times$ WA, 80K IOPS cap). Reads degrade via RA (check $L_0$–$L_k$ + heap-merge ranges; Bloom skips only points) + compaction stealing disk/CPU → queueing spikes ms→seconds.
 
-#### Question 2 (Failure Scenario & Edge Cases)
-*A high-frequency IoT ingest platform running a 5-node RocksDB-backed key-value cluster suddenly experiences complete ingestion failure: all worker threads trying to execute `db->Put()` block indefinitely, and incoming HTTP requests time out. Monitoring shows disk space utilization is at 60%, CPU utilization has dropped to near zero, and disk write throughput has collapsed. Diagnose the root cause, identify the exact threshold violation, and prescribe immediate operational remediation.*
-- **Answer:**
-  - *Diagnosis:* The cluster has encountered a **Hard Write Stall (`stop-writes trigger`)** caused by an uncompacted Level 0 file explosion.
-  - *Mechanism:* The ingestion rate exceeded the disk compaction throughput. Flushes from the Memtable to $L_0$ occurred faster than compaction threads could merge $L_0$ files into $L_1$. In RocksDB, when the number of files in $L_0$ crosses `level0_slowdown_writes_trigger` (default 20), writes are throttled. When it breaches `level0_stop_writes_trigger` (default 36 files), RocksDB unconditionally **blocks all incoming write threads** completely until compaction reduces $L_0$ file count below the limit.
-  - *Remediation:*
-    1. *Immediate:* Temporarily increase `max_background_compactions` and `max_background_jobs` dynamically via `db->SetOptions()` to assign all available CPU cores to compaction.
-    2. *Configuration Tuning:* Increase `write_buffer_size` (e.g., from 64 MiB to 256 MiB) to reduce total file count, and increase `level0_stop_writes_trigger` to provide temporary ingestion buffer headroom.
-    3. *Architectural Fix:* Enable RocksDB's `rate_limiter` to smooth out bursty compaction I/O and transition write-heavy time-series tables to a Universal Compaction or Time-Window Compaction Strategy (TWCS).
+#### Question 2 (Failure Scenario)
+*RocksDB `Put()` blocks, disk 60%, CPU ~0, throughput collapsed. Diagnose.*
+- **Answer:** Hard write stall: $L_0$ files > `level0_stop_writes_trigger` (36). Flush outran merge. Immediate `SetOptions(max_background_compactions=8)`, raise `write_buffer_size` 64→256 MiB, enable `rate_limiter`; long-term TWCS/universal for append series.
 
-#### Question 3 (Trade-Off & Capacity Estimation)
-*An analytics telemetry system ingests 1 billion records per day. Each record consists of 40 columns (total uncompressed row size = 1 KiB). An analytical query executes every 10 minutes, computing `SELECT customer_id, SUM(transaction_amount) FROM transactions WHERE date BETWEEN '2026-01-01' AND '2026-01-30' GROUP BY customer_id`. Compare the storage footprint and disk I/O scan requirements for this 30-day query under: (A) A row-oriented PostgreSQL InnoDB B-Tree table, vs. (B) A column-oriented ClickHouse / Parquet storage engine where `date`, `customer_id` (4 bytes), and `transaction_amount` (8 bytes) are compressed via run-length and dictionary encoding with a $5\times$ compression factor. Show exact quantitative derivations.*
-- **Answer:**
-  - *Dataset Volume:*
-    - Records over 30 days: $30\ \text{days} \times 10^9\ \text{records/day} = 30 \times 10^9\ \text{records}$ (30 billion rows).
-  - *Approach A (Row-Oriented B-Tree / Heap Store):*
-    - Uncompressed raw data size: $30 \times 10^9 \times 1,024\ \text{bytes} \approx 30.72\ \text{TB}$.
-    - Accounting for page header overhead, tuple headers (24 bytes/row), and $30\%$ internal page fragmentation in B-trees ($1 / 0.70 \approx 1.43\times$ multiplier):
-      $$\text{Storage Footprint} \approx 30.72\ \text{TB} \times 1.43 \approx 43.9\ \text{TB}$$
-    - *Query Scan I/O:* Because records are stored row by row, scanning the 30-day range requires loading every page off disk across memory channels, even though the query only uses 3 out of 40 columns.
-      $$\text{Disk I/O Scanned} = 30.72\ \text{TB} \ (\text{or } 43.9\ \text{TB with page slack})$$
-      At a sequential read throughput of $1\ \text{GB/s}$, reading 30.72 TB requires:
-      $$\text{Time} = \frac{30,720\ \text{GB}}{1\ \text{GB/s}} = 30,720\ \text{seconds} \approx 8.53\ \text{hours}$$
-      The 10-minute query SLA is completely missed.
-  - *Approach B (Column-Oriented ClickHouse / Parquet):*
-    - Total uncompressed size of the 3 accessed columns per row:
-      - `date` (4 bytes) + `customer_id` (4 bytes) + `transaction_amount` (8 bytes) = 16 bytes per row.
-      - Uncompressed size for 30 billion rows:
-        $$30 \times 10^9 \times 16\ \text{bytes} = 480 \times 10^9\ \text{bytes} = 480\ \text{GB}$$
-    - Applying columnar compression ($5\times$ factor via bit-packing and RLE):
-      $$\text{Disk Footprint of 3 Queried Columns} = \frac{480\ \text{GB}}{5} = 96\ \text{GB}$$
-    - Total storage footprint for all 40 columns compressed ($5\times$ overall):
-      $$\text{Total Table Storage} = \frac{30.72\ \text{TB}}{5} \approx 6.14\ \text{TB}$$
-    - *Query Scan I/O:* The columnar engine reads **only** the 3 target column files off disk:
-      $$\text{Disk I/O Scanned} = 96\ \text{GB}$$
-      At $1\ \text{GB/s}$ sequential NVMe read speed:
-      $$\text{Time} = \frac{96\ \text{GB}}{1\ \text{GB/s}} = 96\ \text{seconds}$$
-      With multi-core vectorized SIMD execution across 16 cores, scan time drops to $< 10\ \text{seconds}$, effortlessly satisfying the 10-minute reporting SLA with a $320\times$ reduction in I/O scan bandwidth.
-
+#### Question 3 (Capacity Estimation)
+*1B rows/day, 1 KiB/row (40 cols). 30-day `SUM(amount) GROUP BY customer` every 10 min. Row vs columnar I/O?*
+- **Answer:** 30B rows = 30.72 TB raw → 43.9 TB with B-tree slack; full scan 30 TB @1 GB/s = 8.5 h (misses SLA). Columnar 3 cols (16B/row) = 480 GB → /5 compression = 96 GB; scan 96 s single-core, <10 s on 16 SIMD cores — $320\times$ cut, meets SLA.
 
 ---
+
 > [!NAV] **Chapter Navigation**
 > ⬅️ **Previous:** [[chapter-03-data-models-and-query-languages|Chapter 03: Data Models and Query Languages]] | 🏠 **Index:** [[00-Master-Reading-Dashboard|Master Dashboard]] | ➡️ **Next:** [[chapter-05-encoding-and-evolution|Chapter 05: Encoding and Evolution]]
