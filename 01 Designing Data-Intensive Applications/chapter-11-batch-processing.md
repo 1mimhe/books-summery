@@ -5,161 +5,207 @@
 > [!NAV] **Chapter Navigation**
 > ⬅️ **Previous:** [[chapter-10-consistency-and-consensus|Chapter 10: Consistency and Consensus]] | 🏠 **Index:** [[00-Master-Reading-Dashboard|Master Dashboard]] | ➡️ **Next:** [[chapter-12-stream-processing|Chapter 12: Stream Processing]]
 
-
 ---
 
 ## 1. Executive Summary & Core Engineering Problem
 
-- **Core Thesis:** Systems can be categorized into three distinct operational paradigms: **Service-Oriented (Online)** systems that optimize for low latency and high availability on discrete point requests; **Stream Processing (Near-Real-Time)** systems that ingest and transform unbounded event streams with sub-second latencies; and **Batch Processing (Offline)** systems that process bounded, historical datasets of arbitrary size by prioritizing aggregate job throughput over response time. Batch processing treats input data as strictly **immutable**, executing deterministic computational pipelines that produce newly derived outputs without modifying source records. By embracing bounded execution and immutability, batch architectures achieve complete fault tolerance: transient worker failures are resolved via deterministic recomputation without distributed locks or two-phase commit.
-- **Problem Statement:** Attempting to execute complex data transformations, aggregations, or analytical joins directly on transactional OLTP databases causes catastrophic operational collapse. For instance, executing a star-schema join between 10 billion user clickstream events and a 50-million-row customer database on an operational PostgreSQL or MySQL cluster saturates disk I/O channels, evicts buffer pool working sets, triggers long-running shared read locks, and inflates p99 transaction latencies from 10 ms to $>45,000\ \text{ms}$, bringing online checkout APIs to a dead halt. Conversely, building ad-hoc in-memory scripts fails because in-memory hash tables crash with Out-Of-Memory (OOM) errors whenever data volume exceeds physical RAM.
-- **Historical & Industry Context:** The foundational philosophy of batch processing was established in the 1970s with Unix pipelines (`stdin`, `stdout`, and `sort`), demonstrating that complex computations can be constructed by chaining composable, single-purpose tools via uniform stream interfaces. In 2004, Google published MapReduce, scaling this philosophy across thousands of commodity machines backed by the Google File System (GFS). Apache Hadoop popularized open-source MapReduce and HDFS in the late 2000s, but its rigid multi-stage materialization model (spilling all intermediate state to disk) introduced severe I/O bottlenecks. In the 2010s, dataflow engines like **Apache Spark** and **Apache Flink** emerged, generalizing MapReduce into arbitrary Directed Acyclic Graphs (DAGs) and keeping intermediate working sets pipelined in distributed RAM. In the 2020s (2nd Edition inflection), batch architectures decoupled compute from cloud object stores (Amazon S3, Google Cloud Storage), utilizing vectorized SQL engines (Trino, DuckDB) and open table formats (Apache Iceberg) to merge batch processing with lakehouse warehousing.
+> *"A system cannot be successful if it is too strongly influenced by a single person. Once the initial design is complete and fairly robust, the real test begins as people with many different viewpoints undertake their own experiments."*
+> — **Donald Knuth**, *"The Errors of TeX"* (1989)
+
+- **The Big Picture (Kleppmann's Framing):** Much of this book so far assumed online systems: you ask for something and the system answers in milliseconds. Batch processing drops that assumption. You take a bounded, immutable input, run a job for minutes to days, and produce a brand-new derived output from scratch. Train an AI model, transform logs, compute analytics over terabytes — throughput matters, latency does not. The model is Unix pipes scaled to thousands of machines: small deterministic programs, immutable inputs, no in-place mutation, clean recomputation on failure.
+- **Core Thesis:** Batch jobs treat inputs as immutable and avoid side effects such as writing to external databases mid-job. That gives four concrete benefits straight from the book: (1) human fault-tolerance — buggy code is fixed by rolling back code and rerunning, or by keeping old output in another directory and switching back via time travel in object stores and open table formats; (2) faster feature development because mistakes are reversible (minimizing irreversibility, Agile); (3) the same files feed many jobs, including monitoring jobs that diff current vs. previous output; (4) efficient resource use versus forcing bulk work through OLTP databases and app servers. The costs are also explicit: downstream jobs wait for the whole job to finish, and even a one-byte input change forces a full reprocess.
+- **Problem Statement:** Run a star-schema join of 10 billion clickstream events against a 50-million-row customer table on the OLTP primary and you evict the buffer pool, saturate I/O, hold long read locks, and push p99 from 10 ms to tens of seconds. Write a single-machine in-memory hash aggregation instead and you OOM when distinct keys exceed RAM. Batch processing solves both by external sorting, sharded parallel execution on a distributed filesystem or object store, and deterministic task retries.
+- **Historical & Industry Context:** Unix pipelines (`awk`, `sed`, `grep`, `sort`, `uniq`, `xargs`) proved composable stream processing on one machine. Google's MapReduce (2004, Dean/Ghemawat, GFS) scaled it to commodity clusters; Hadoop, CouchDB, MongoDB copied it. MapReduce was a step forward in scale but is now largely obsolete at Google — rigid, slow, file-I/O bound. Today batch means Spark, Flink, Daft, Dataflow, BigQuery/Snowflake: sharded parallel execution with sophisticated caching, dataflow APIs, SQL query languages, DataFrame APIs, and mature job and workflow orchestration. Hadoop schedulers Oozie/Azkaban gave way to generalized workflow orchestrators Airflow, Dagster, Prefect. Storage shifted from HDFS/GlusterFS/CephFS to object stores such as S3, with BigQuery/Snowflake blurring warehouse and batch.
+
+| Alice (OLTP mindset) | Bob (Batch mindset) |
+| :--- | :--- |
+| "Join clicks to users live in Postgres for the dashboard." | "Freeze the day's logs as immutable files, run a batch join, publish a derived table. Rerunnable, no locks." |
+| "Keep one output, overwrite it on bug." | "Keep old output in another prefix, time-travel back, rerun fixed code. Human fault-tolerance." |
 
 ---
 
 ## 2. In-Depth Technical Concepts & Internal Mechanics
 
-### 2.1 The Unix Philosophy & External Sorting
-- **Foundational Theory:** The design principles of Unix (Doug McIlroy, 1978) provide the architectural blueprint for modern distributed batch computing:
-  1. Make each program do one thing well.
-  2. Expect the output of every program to become the input to another, as yet unknown, program.
-  3. Design and build software to be run by software rather than human operators.
-  4. Use standard text/byte streams as a universal interface (`stdin` / `stdout`).
-- **Log Analysis Case Study:**
-  Find the 5 most popular URLs in a web server access log:
-  ```bash
-  cat /var/log/nginx/access.log |
-    awk '{print $7}' |
-    sort |
-    uniq -c |
-    sort -r -n |
-    head -n 5
-  ```
-- **Sorting vs. In-Memory Aggregation:**
-  - *In-Memory Script (Python/Ruby Hash Map):* Reads lines sequentially, populating `counts[url] += 1`. 
-    - *Bottleneck:* If the unique URL working set exceeds physical RAM (e.g., 50 million unique URLs with long query strings requiring 32 GiB on an 8 GiB machine), the process enters OS swap thrashing and crashes with an OOM error.
-  - *Unix `sort` (External Merge-Sort):*
-    1. Reads data into an in-memory buffer up to a configured threshold (e.g., 500 MiB).
-    2. Sorts the buffer in memory using QuickSort.
-    3. Flushes the sorted run sequentially to disk as a temporary file.
-    4. Repeats for all input data, producing $K$ sorted temporary files.
-    5. Executes a multi-way merge across all $K$ files, streaming the final sorted output directly to `uniq -c`.
-  - *Core Invariant:* **External merge-sort scales gracefully to datasets orders of magnitude larger than physical RAM**, bound only by available disk space.
+### 2.1 Batch Processing with Unix Tools — Sort vs. In-Memory Aggregation (p.478)
 
----
+NGINX access log line (one line, wrapped here):
 
-### 2.2 Distributed Filesystems and Cloud Object Storage
-- **HDFS (Hadoop Distributed File System):**
-  - Designed around the principle of **moving computation to data** (data locality), avoiding saturated datacenter network switches during the 1 Gbps Ethernet era.
-  - *Architecture:*
-    - **NameNode:** Centralized master managing directory trees, file metadata, and block locations in RAM.
-    - **DataNodes:** Worker machines storing raw 64 MiB or 128 MiB contiguous file blocks on local commodity drives, replicated across $3\times$ nodes (2 nodes in the same rack, 1 node in an off-rack machine).
-  - *Data Locality Scheduling:* Job schedulers assign compute tasks directly to the physical DataNode hosting the target block, reading data via local OS file descriptors ($O(1)$ network I/O).
-- **Cloud Object Storage (Amazon S3, Google Cloud Storage, Azure Blob):**
-  - Modern datacenters utilize 100 Gbps / 400 Gbps non-blocking bisection bandwidth, rendering the "compute-to-data" locality optimization obsolete.
-  - **Disaggregated Storage:** Compute instances (ephemeral VMs/containers) are completely decoupled from durable object storage.
-  - *API & Consistency:* Exposes RESTful HTTP APIs (`GET`, `PUT`, `DELETE`). S3 guarantees strong read-after-write consistency for object operations. Files are immutable: updating an object requires rewriting the entire byte payload.
+```text
+216.58.210.78 - - [27/Jun/2025:17:55:11 +0000] "GET /css/typography.css HTTP/1.1" 200 3377 "https://martin.kleppmann.com/" "Mozilla/5.0 ..."
+```
 
----
+Format: `$remote_addr - $remote_user [$time_local] "$request" $status $body_bytes_sent "$http_referer" "$http_user_agent"`.
 
-### 2.3 MapReduce Internals: Mappers, Reducers, and the Shuffle
-- **The Execution Model (Figure 11-1):**
-  A MapReduce job decomposes computation into two primary phases separated by an internal data-shuffling stage:
-  1. **Map Phase:**
-     - The job scheduler partitions input files into independent chunks (typically 128 MiB matching HDFS block boundaries).
-     - A **Mapper** task is spawned for each chunk. The mapper iterates over records, parses fields, and invokes user code:
-       $$\text{map}(k_1, v_1) \to \text{list}(k_2, v_2)$$
-  2. **Partition & Shuffle Phase:**
-     - The MapReduce framework groups all values sharing the same output key $k_2$.
-     - Each mapper partitions its output records across $R$ target Reducers:
-       $$\text{reducer\_id} = \text{hash}(k_2) \pmod R$$
-     - *In-Memory Sorting & Spilling:* Mapper buffers output records in memory (e.g., 100 MiB buffer). When the buffer is 80% full, a background thread sorts records by $(k_2)$ and spills them to a local disk file.
-     - *The Shuffle:* Reducer tasks pull their assigned partitions from **all mappers across the network** via HTTP connections.
-  3. **Reduce Phase:**
-     - The Reducer merges the presorted partition files from all mappers using an external merge-sort.
-     - All values for a given key $k_2$ are passed sequentially to the user reducer function:
-       $$\text{reduce}(k_2, \text{list}(v_2)) \to \text{list}(k_3, v_3)$$
-     - Output records are streamed directly to durable distributed storage (HDFS or S3).
-- **Fault Tolerance Mechanics (The Beauty of Immutability):**
-  - Inputs to MapReduce are read-only. Outputs are written to a temporary directory and atomically renamed upon successful job completion.
-  - If a worker machine crashes mid-job:
-    - If a **Mapper** fails: The coordinator reschedules the mapper on another node, re-reading the immutable input block from an alternative HDFS replica.
-    - If a **Reducer** fails: The coordinator restarts the reducer on another node, re-fetching the intermediate partition files from surviving mapper disks.
-  - Because tasks are pure functions without side effects, **failed tasks can be re-executed an arbitrary number of times without risking partial state corruption**.
+Top-5 pages with Unix tools:
 
----
+```bash
+cat /var/log/nginx/access.log |
+  awk '{print $7}' |
+  sort             |
+  uniq -c          |
+  sort -r -n       |
+  head -n 5
+```
 
-### 2.4 Distributed Joins in Batch Processing
-Joining large-scale datasets (e.g., joining an unbounded clickstream event log with a dimension table of user profiles, Figure 11-2) requires specialized distributed join strategies:
+What each stage does: `awk` extracts field 7 (URL); first `sort` groups identical URLs adjacently; `uniq -c` counts adjacent duplicates; second `sort -r -n` ranks numerically descending; `head -n 5` keeps top five. Output looks like:
 
-#### 1. Sort-Merge Joins (Reduce-Side Joins - Figure 11-3)
-- *Theory:* The most general join strategy. Applicable when both datasets are vast and cannot fit into memory.
-- *Execution Steps:*
-  1. *Mapper Extraction:* Mappers scan both datasets. Dataset A (clickstream) emits records with `key = user_id, value = (EVENT, click_data)`. Dataset B (user database) emits records with `key = user_id, value = (PROFILE, user_metadata)`.
-  2. *Shuffle & Partitioning:* Records are hashed by `user_id` and routed to the corresponding Reducer. The framework sorts all records for a given `user_id`.
-  3. *Secondary Sorting:* The framework orders records such that the profile record arrives *first*, followed by all corresponding click events.
-  4. *Reducer Merge:* The reducer reads the single profile record into memory, and sequentially streams through the subsequent millions of click events for that user, emitting joined rows without storing events in RAM.
-- *Bottleneck:* The **Hot Key / Straggler Problem**. If a single celebrity user has 50 million events, all 50 million events route to a single reducer node, stalling job completion while remaining reducers sit idle.
+```text
+4189 /favicon.ico
+3631 /2016/02/08/how-to-do-distributed-locking.html
+2124 /2020/11/18/distributed-systems-and-elliptic-curves.html
+1369 /
+ 915 /css/typography.css
+```
 
-#### 2. Broadcast Hash Joins (Map-Side Joins)
-- *Theory:* Applicable when joining a massive dataset (e.g., 500 GB clickstream) with a small dataset that fits in RAM (e.g., a 100 MB country lookup table).
-- *Execution Steps:*
-  1. The small table is read completely and **broadcast** across the network to every single mapper worker.
-  2. Each mapper loads the small table into an in-memory hash table.
-  3. The mapper streams through its assigned 128 MiB chunk of the large dataset, querying the local in-memory hash table for each row.
-- *Advantage:* **Zero shuffle, zero sorting, zero reducers!** The join executes in a single streaming pass ($O(N)$ time), maximizing network and CPU efficiency.
+Variants are trivial: exclude CSS with `awk '$7 !~ /\.css$/ {print $7}'`, top IPs with `{print $1}`. Drake and GNU Coreutils notes in the book: these tools process gigabytes in seconds and `sort` spills to disk + parallelizes across cores.
 
-#### 3. Partitioned Hash Joins (Bucket Map Joins)
-- *Theory:* Applicable when both datasets are partitioned on the exact same join key using the exact same hash function and partition count.
-- *Execution Steps:*
-  - Partition $i$ of Dataset A only ever matches with Partition $i$ of Dataset B.
-  - The mapper assigned to Partition $i$ loads Partition $i$ of the smaller dataset into an in-memory hash table, scanning Partition $i$ of the larger dataset.
-  - Eliminates global shuffles while bypassing RAM limits of broadcast joins.
+**Chain of commands vs. custom program.** Equivalent Python:
 
----
+```python
+from collections import defaultdict
+counts = defaultdict(int)
+with open('/var/log/nginx/access.log') as f:
+    for line in f:
+        url = line.split()[6]
+        counts[url] += 1
+top5 = sorted(((c, u) for u, c in counts.items()), reverse=True)[:5]
+for count, url in top5:
+    print(f"{count} {url}")
+```
 
-### 2.5 Dataflow Engines: Apache Spark and Apache Flink
-- **The Limitations of Hadoop MapReduce:**
-  - Rigid multi-stage execution: every step requires a full Map $\to$ Shuffle $\to$ Reduce pipeline.
-  - High storage amplification: intermediate results between jobs must be written to disk, replicated $3\times$ across HDFS, and read back over the network by the subsequent job.
-- **Dataflow Engine Generalization (Spark / Flink / Tez):**
-  - Models computation as an arbitrary **Directed Acyclic Graph (DAG)** of operators.
-  - Functions are composed fluently (`map`, `filter`, `join`, `groupBy`).
-  - **In-Memory Pipelining:** An operator streams its output directly across memory channels or network TCP buffers to the next operator without materializing intermediate data to physical disk.
-- **Resilient Distributed Datasets (RDDs) and Lineage Graphs:**
-  - An RDD is an immutable, partitioned collection of records in Spark.
-  - *Fault Tolerance without Disk Materialization:*
-    - Spark does not replicate RDD partitions across nodes.
-    - Instead, it maintains a **Lineage Graph** (the exact sequence of deterministic operations that created the RDD).
-    - If a worker hosting partition 4 of an RDD crashes, Spark inspects the lineage graph and re-computes **only partition 4** from the original input block on another worker.
+Same result, different execution flow — and that difference decides what scales.
 
----
+**Sorting versus in-memory aggregation.** The Python version holds `counts[url]` for every distinct URL; working set = number of distinct URLs. One million log lines for one URL still need one hash entry. If distinct URLs + counters fit in ~1 GB, a laptop wins. If the working set exceeds RAM, the hash table thrashes/OOMs while the Unix pipeline keeps working: GNU `sort` sorts chunks in memory, writes sorted segment files, then merges them — the same log-structured merge principle from storage engines, with sequential disk access. Bottleneck becomes disk read bandwidth, not memory.
 
-### 2.6 The Straggler Problem & Skew Handling
-- **The Straggler Invariant:** A batch processing job cannot complete until its **slowest individual task finishes**.
-- **Causes of Stragglers:**
-  - Hardware degradation: faulty CPU core, thermal throttling, failing disk sectors with high ECC read retries.
-  - Virtual machine noisy neighbors stealing hypervisor CPU cycles.
-  - Data skew: non-uniform key distributions where a single partition contains $100\times$ more records than average.
-- **Mitigation Mechanisms:**
-  1. *Speculative Execution (Hedging):* The coordinator monitors task execution rates. If a task runs significantly slower than the median, the coordinator launches a duplicate copy of the task on an alternative healthy machine. Whichever copy finishes first is accepted; the other is terminated.
-  2. *Skewed Join Optimization (Salting Hot Keys):*
-     - If key `celebrity_user` has 10 million records:
-     - The mapper appends a random integer salt from $0$ to $K-1$: `celebrity_user_0`, `celebrity_user_1`, ..., `celebrity_user_K-1`.
-     - The records scatter across $K$ distinct reducers.
-     - The corresponding dimension record is replicated across all $K$ reducers, parallelizing the hot join.
+Limit: Unix tools run on one machine. Too large for local disk/memory needs distributed batch frameworks — distributed OS with filesystem + scheduler + piped programs.
 
----
+### 2.2 Batch Processing in Distributed Systems — Filesystems, Object Stores, Orchestration (p.481)
 
-### 2.7 Batch Outputs: Serving Derived Data
-- **Batch Processing is Not Just for Analytics:**
-  - While batch jobs compute business reports and machine learning models, their most powerful application is **building derived data systems for online operational serving**.
-- **Use Cases:**
-  1. *Building Search Indexes (Apache Lucene):*
-     - Running full-text indexing directly on an active Elasticsearch cluster incurs heavy write amplification and segment compaction thrashing.
-     - *Batch Approach:* MapReduce scans raw documents, builds fully optimized, compressed, immutable Lucene segment files in parallel, and uploads the sealed index files directly to the serving cluster.
-  2. *Pre-materializing Key-Value Stores (Voldemort, RocksDB SSTables):*
-     - Batch pipelines process recommendation algorithms or machine learning embeddings, writing sorted SSTables directly to cloud storage.
-     - Operational key-value stores download the sealed SSTables and load them into memory/disk, providing blazing sub-millisecond point lookups without incurring write path overhead.
+Think of distributed batch frameworks as a distributed operating system: filesystem, job scheduler, programs exchanging data via filesystem or network.
+
+#### 2.2.1 Distributed filesystems (p.482)
+
+OS stack refresher from the book: block drivers → page cache → filesystem (ext4/XFS: blocks, inodes, dirs) → VFS. Distributed filesystems mirror it:
+
+- Files split into blocks spread over machines. DFS blocks are huge: HDFS default 128 MB, JuiceFS/object stores ~4 MB, vs. ext4 4,096 bytes. Big blocks = less metadata on petabyte datasets + amortized seeks.
+- No partial-block write penalty at DFS level (DFS sits atop OS filesystems; a 900 MB file on 128 MB blocks = seven full blocks + one 4 MB tail).
+- Blocks are read over the network from daemons: HDFS DataNodes, GlusterFS glusterfsd processes (book calls them data nodes). Daemons expose remote block read/write against local files.
+- Distributed page cache: data-node OS page cache keeps hot blocks in RAM; JuiceFS adds client-side + local-disk tiers.
+- Metadata: Hadoop NameNode; DeepSeek 3FS persists metadata to a KV store like FoundationDB. Tracks locations, permissions, free space.
+- Protocol = VFS analogue: pluggable. S3 API adopted by MinIO, Cloudflare R2, Tigris, Backblaze B2 — any S3-compatible store plugs into batch engines. POSIX via FUSE or NFS; NFS originally single-server, now EFS/Archil expose NFS endpoints over distributed metadata + data nodes.
+- Shared-nothing vs. NAS/SAN: NAS/SAN = centralized appliance, Fibre Channel, shared-disk. DFS = commodity boxes + datacenter network, shared-nothing. Commodity fails more, so blocks are replicated or erasure-coded (Reed–Solomon, like RAID over network, lower overhead than 3x replication — Quantcast FS, HDFS EC, S3 internals). Replicas also let schedulers place tasks where data lives.
+
+#### 2.2.2 Object stores (p.484) — the modern default
+
+Object storage (Amazon S3, Google Cloud Storage, Azure Blob, OpenStack Swift) is now the popular batch substrate. Line with DFS is blurry: FUSE drivers mount S3 as filesystems; JuiceFS/Ceph expose both APIs. But semantics differ — verify behavior, don't assume POSIX.
+
+- Addressing: `s3://my-photo-bucket/2025/04/01/birthday.png` — globally unique bucket + key unique within bucket.
+- API: `GET`/`PUT`. Objects are immutable once written; update = full `PUT` rewrite like a KV store. Azure Blob and S3 Express One Zone support appends; most stores don't. No `fopen`/`fseek` handles.
+- No real directories: slashes are key conventions. Prefix list = recursive `ls -R`, including subpaths. No empty directories — delete all keys under `.../04/01` and `01` vanishes from `.../04` listings; convention is a zero-byte placeholder object to preserve the "directory".
+- No hard links, symlinks, file locks; renames are nonatomic copy-to-new-key + delete-old. Renaming a "directory" means renaming every object under the prefix individually.
+- Size/latency tuning: KV stores (Ch.4) = KB values, frequent ms reads/writes. Distributed filesystems and object stores = MB–GB objects, less frequent large reads. Gap is closing: S3 Express One Zone offers single-ms latency and KV-like pricing.
+- Locality vs. disaggregation: HDFS lets tasks run where the replica lives, saving network when code < data. Object stores separate storage and compute — more bandwidth burned, but modern fabrics are fast enough and CPU/memory scale independently of storage. This decoupling is why lakehouses work.
+
+| Dimension | HDFS-style DFS | Cloud object store (S3/GCS/Azure Blob) |
+| :--- | :--- | :--- |
+| **API** | POSIX-ish, handles, seeks, atomic renames | `GET`/`PUT`/`DELETE`, immutable objects, prefix lists |
+| **Directories** | Real inodes | Key-prefix convention, zero-byte placeholders |
+| **Rename** | Atomic | Copy + delete per object |
+| **Locality** | Compute-to-data, replica-aware scheduling | Compute/storage decoupled, network-attached |
+| **Scale lever** | Add DataNodes (storage+compute together) | Scale VMs and buckets independently |
+| **Fit** | Spinning-disk era, 1 Gbps networks | 100/400 Gbps fabrics, ephemeral compute |
+
+#### 2.2.3 Distributed job orchestration and workflow orchestration (p.485)
+
+Single-machine `awk | sort | uniq` needs a kernel: spawn processes, pipe stdout→stdin, allocate memory, schedule CPU, enforce limits. Distributed jobs need an orchestrator. A job-start request carries: task count; per-task memory/CPU/disk; job ID; credentials; input/output params; hardware needs (GPUs, disk types); code location. Orchestrators such as Kubernetes and Hadoop YARN combine that with cluster state via:
+
+- **Task executors:** per-node daemons (YARN NodeManager, Kubernetes kubelet). Fetch code, start tasks, heartbeat liveness, track status/resources, reap finished/failed tasks. Enforce isolation via Linux cgroups so one task can't steal CPU or read another's data.
+- **Resource manager:** global view — hardware inventory, task statuses, rack locality, node health. Centralization risks scale/availability bottlenecks; YARN stores state in ZooKeeper, Kubernetes in etcd (coordination services).
+- **Scheduler:** matches job requests to nodes (e.g., 10 tasks on a GPU image). Terminology varies but components recur. Application-specific sub-schedulers cooperate with the central scheduler for domain needs like autoscaling read replicas at query thresholds — YARN ApplicationMasters, Kubernetes operators.
+- **Resource allocation — fairness vs. efficiency:** Five nodes, 160 cores, two jobs each wanting 100 cores. Options: 80 tasks each + backfill; gang-schedule one job fully then the other; or gamble on future arrivals. Gang scheduling idles nodes waiting for 100 free cores and can deadlock/starve; naive FIFO lets later jobs steal cores; preemption (kill low-priority tasks for high-priority ones) wastes restarted work. At hundreds to millions of requests optimal scheduling is NP-hard (Karp, Ullman). Real schedulers use heuristics: FIFO, dominant resource fairness (DRF), priority queues, capacity/quota, bin-packing.
+- **Spot/preemptible capacity:** Schedulers may kill tasks deliberately. Low-priority VMs (EC2 spot, Azure spot, GCP preemptible) are cheap spare capacity but preempted far more often than hardware fails (Borg lesson). Batch fits well because jobs aren't time-sensitive and rerun cleanly — but the system must expect kills.
+
+**Scheduling workflows (the missing piece in most summaries — workflow orchestration).** The Unix example chains commands via pipes. Distributed batch does the same across jobs: output of one job feeds several others owned by different teams; Spark writes HDFS then a Python step triggers Trino SQL to S3; one stage shards by key A for the next stage that needs key B. Unix pipes use small in-memory buffers with backpressure (producer blocks when consumer lags). Spark/Flink support direct task-to-task handoff over memory/network similarly. But the norm is decoupled: job N writes the distributed filesystem or object store, job N+1 reads it later, running at different times. A workflow scheduler waits for all input producers to succeed before launching the consumer.
+
+Per-job schedulers (YARN ResourceManager, Spark built-in scheduler) don't manage these DAGs. That is the role of workflow schedulers / workflow orchestration platforms: Airflow, Dagster, Prefect (modern generalized successors to Hadoop-centric Oozie, Azkaban). The book stresses scale: 50–100-job workflows are common; many teams consume each other's outputs across systems, so management features (retries, lineage, backfill, SLAs) matter. This is orchestration at two levels: job orchestration places tasks on nodes; workflow orchestration orders jobs in a DAG.
+
+**Handling faults.** Long parallel jobs will see failures: commodity hardware faults, network blips, or preemptions. Because batch jobs regenerate output from scratch, recovery deletes partial output and reruns the task elsewhere — and crucially at task granularity, not whole-job restart. Intermediate-as-input is trickier: MapReduce writes intermediate data to the DFS and only lets consumers read after the producer commits — safe under preemption but write-heavy. Spark keeps intermediates in memory (spilling to local disk if needed), writes only final output to the DFS, and tracks lineage to recompute lost partitions. Flink checkpoints task snapshots periodically. Dataflow engines detail follows.
+
+### 2.3 Batch Processing Models — MapReduce, Dataflow Engines, Shuffle, Joins, Query Languages, DataFrames
+
+Batch frameworks process data via MapReduce and dataflow engines. Dataflow largely replaced MapReduce in practice, but MapReduce explains modern designs. Both grew SQL, DataFrame, and programmatic APIs so app engineers, analytics engineers, analysts, and nontechnical users can all process data for the use cases at the end.
+
+#### 2.3.1 MapReduce (p.490)
+
+Same shape as the log example: (1) split input files into records (line = record; Hadoop reads HDFS/S3 in Parquet/Avro); (2) mapper extracts key+value per record (`awk '{print $7}'` = URL key, empty value); (3) sort all pairs by key (implicit — mapper output is always sorted before reducers); (4) reducer iterates sorted groups; adjacent equal keys combine with little state (`uniq -c`). Need a second sort/rank? Write a second MapReduce job consuming the first job's output. Mapper prepares sortable form; reducer processes sorted groups.
+
+Contracts:
+
+- **Mapper:** called per input record, emits zero+ key-value pairs, stateless across records, many mappers in parallel over shards.
+- **Reducer:** framework groups all values per key, calls reducer with an iterator over that key's values; different keys in parallel.
+
+Functional roots: Lisp `map`/`fold`, now Python/Rust/Java higher-order functions. SQL operators map onto it. Pure functions (input → output, no mutable state) allow parallel calls and free retry on another node. Raw APIs are laborious (hand-rolled joins) and slow: file-based I/O blocks pipelining — downstream jobs wait for upstream completion.
+
+#### 2.3.2 Dataflow engines (p.492)
+
+Spark, Flink fix MapReduce by handling an entire workflow as one job, not subjobs. They model dataflow explicitly — research lineage Dryad, Nephele. Low-level per-record callbacks plus higher-level `join`/`group by`, sharded parallelism, network copy task→task. Unlike strict map/reduce alternation, operators compose flexibly from relational blocks: join on field, group by key, filter, count/sum. Shuffles implement them internally.
+
+Advantages over MapReduce: sort only where needed, not between every map/reduce; fuse adjacent non-resharding operators (map/filter) into one task to cut copies; locality optimization from declared dependencies (place consumer where producer is, shared-memory handoff); intermediates in memory/local disk, not replicated DFS writes (MapReduce only did this for mapper output); pipelined start (operators run when input ready, no stage barrier); process reuse (no fresh JVM per task). Same computations, much faster.
+
+#### 2.3.3 Shuffling data (p.493) — Figure 11-1
+
+Unix and MapReduce both rest on sorting. Petabyte sorts need distributed sort with sharded input and output: the shuffle. Name is confusing — not random deck-shuffle, but sorted repartitioning. Foundational for joins/aggregations; Hadoop MapReduce, Spark, Flink, Daft, Dataflow, BigQuery all implement it; BigQuery even uses in-memory + external sort services with replication for resilience.
+
+Hadoop shuffle walkthrough (concepts transfer): input sharded `m1, m2, m3` (HDFS files/objects sharing dir/prefix). One map task per shard streams records to the mapper. Reduce side also sharded; reducer count is author-configured, independent of mapper count. Mappers emit key-value pairs; same key must reach same reducer. Each mapper writes one local file per reducer (`m1,r2` = mapper 1's data for reducer 2), choosing the file by key hash (hash-of-key sharding). While writing, each file is sorted — in-memory sorted structures flushed as segments, merged progressively (log-structured technique). After mappers finish, reducers fetch their files over the network, merge them mergesort-style preserving order so same keys are consecutive across mappers, then the reducer function sees one key + iterator per call. Reducer outputs (`r1, r2, r3`) become output shards on DFS/object store.
+
+#### 2.3.4 Joins and grouping (p.495) — Figures 11-2, 11-3
+
+Sorted data makes distributed joins/aggregations cheap. Canonical batch join (Figure 11-2): left = activity/clickstream events (fact table), right = user database (dimension) — a star schema. Question: which pages skew young vs. old via date-of-birth? Both tables sharded, too large for one machine.
+
+Sort-merge join: mapper A emits page views keyed by user ID; mapper B emits `(user_id → date_of_birth)`. Shuffle co-locates same user ID on one reducer. Secondary sort orders the user record first, then that user's events in timestamp order. Reducer holds one DOB in a variable, streams events, emits `(URL, DOB)` per view — one user record in memory, no network calls. Next job regroups by URL: shuffle on URL, reducers count views per age bracket = group-by + aggregation. General, handles arbitrary sharding, but hot keys (celebrity user) bottleneck one reducer.
+
+Broadcast / partitioned variants (needed to use the right algorithm, and what optimizers choose among):
+
+| Strategy | When | How | Cost |
+| :--- | :--- | :--- | :--- |
+| **Sort-merge (reduce-side)** | Both sides huge, unpartitioned | Shuffle both on join key, secondary sort, streaming merge | Heavy shuffle + sort, skew-sensitive |
+| **Broadcast hash (map-side)** | One side fits in RAM | Ship small table to every mapper, hash-join streaming | Zero shuffle of big side, memory-bound |
+| **Partitioned/bucketed map join** | Both pre-sharded same key+hash | Join co-located partitions locally | Zero shuffle, requires layout discipline |
+
+#### 2.3.5 Query languages (p.497) and warehouse convergence
+
+Petabyte clusters of 10,000+ machines are now operable; focus moved to programming model. MapReduce, dataflow, warehouses all embraced SQL — legacy warehouse language, ETL/analyst lingua franca, interactive terminal/GUI exploration for PMs, finance, analysts. Beyond productivity, SQL enables optimizer efficiency: Hive, Trino, Spark, Flink cost-based optimizers pick join algorithms and reorder joins to minimize intermediate state (query → syntax tree → physical operators). Niches persist: Pig (stepwise relational, precursor to DataFrames/Morel), `jq`/JMESPath/JSONPath for JSON, Gremlin/TinkerPop for batch graph traversals.
+
+Warehouses and batch converged: warehouses were appliance SQL over relational data; MapReduce offered scale + arbitrary code/formats. Now batch speaks SQL on Parquet with vectorized execution (compilation/vectorization), warehouses run on cloud with batch scheduling/fault-tolerance/shuffle on DFS. Cross-pollination: BigQuery DataFrames, Snowpark+Pandas; Airflow/Prefect/Dagster orchestrating warehouse queries. Choice is cost/convenience, not capability — large enterprises run many systems; small firms one. Caveats: iterative PageRank, complex ML, image/video/audio AI pipelines resist SQL; row-by-row logic fights columnar formats; warehouses cost more than Spark/Flink for huge jobs.
+
+#### 2.3.6 DataFrames (p.499)
+
+Data scientists live in R/Pandas DataFrames (see data models): row collections, uniformly typed columns, stepwise `filter`/`join`/`sort`/`aggregate` calls instead of one big SQL string. Originally local in-memory — limited to single-machine datasets. Distributed DataFrame APIs in Spark, Flink, Daft bring familiar calls to cluster data. Behavior differs: local frames are indexed/ordered; distributed frames generally aren't — migration surprises. Execution differs too: Pandas runs eagerly per call; Spark builds a query plan from all calls, optimizes, then runs on its dataflow engine. Daft splits client/server (small ops locally, big ops remotely); Arrow gives both sides a shared columnar model.
+
+### 2.4 Batch Use Cases — ETL, Analytics, ML, Serving Derived Data (p.500)
+
+Batch fits bulk data where freshness doesn't matter — broader than it sounds: accounting/inventory reconciliation, manufacturing demand forecasting, ecommerce/media/social recommendations, US banking/ACH almost entirely batch.
+
+#### 2.4.1 Extract–Transform–Load — ETL and ELT
+
+Data warehousing ETL/ELT: extract from prod DB, transform, load downstream (book uses "ETL" for both). Batch parallelism shines — filtering, projection, and many warehouse transforms are embarrassingly parallel. Workflow schedulers make ETL schedulable, orchestrated, debuggable: retries on transient faults, failed-job marking, Airflow source/sink/query operators for MySQL, PostgreSQL, Snowflake, Spark, Flink, dozens more — tight scheduler↔engine integration simplifies data integration. Debugging is humane: inspect failed files, fix transform or upstream producer, rerun. Ownership decentralized via data mesh, data contracts, data fabric so product teams publish safely. Engines converged: ETL and analytics both run SparkSQL/Trino/DuckDB — blurring app/data/analytics engineering and business analysis.
+
+ETL vs. ELT nuance from the chapter: classic ETL transforms before loading into the warehouse; ELT loads raw then transforms inside the warehouse/lakehouse with the same batch SQL engines. Either way the orchestration guarantees (retry, atomic output swap, backfill) are what keep pipelines trustworthy.
+
+#### 2.4.2 Analytics — pre-aggregation and ad hoc on the lakehouse
+
+OLAP scans group/aggregate massively; batch systems run it alongside other batch work. Analysts write SQL; engines read/write DFS/object store; Iceberg + Unity-style catalogs map tables→files (lakehouse). Two styles: pre-aggregation (rollups into OLAP cubes/data marts, materialized views, push to Druid/Pinot on a schedule via workflow schedulers) and ad hoc (iterative business/ debugging questions where fast execution cuts analyst wait). SQL unlocks Tableau/Power BI/Looker/Superset via SparkSQL/Presto/Trino/Hive connectors — all ultimately batch jobs.
+
+#### 2.4.3 Machine learning — features, training, batch inference, graphs, LLMs
+
+ML uses batch to explore patterns, engineer features, train, and batch-infer: feature engineering (filter/transform raw → numeric model inputs), model training (training data in, weights out), batch inference (score large sets / test sets offline when real-time isn't needed). Spark MLlib, FlinkML bundle engineering/stats/classifiers. Recommenders/rankers add graph processing: traverse edge-by-edge, join vertex→neighbor, propagate until convergence — bulk synchronous parallel (BSP)/Pregel (Giraph, GraphX, Gelly). LLM data prep/training is batch: DFS/object-store web text → extract plain text from HTML, fix malformed text, drop low-quality/irrelevant/duplicates, tokenize → embeddings. Purpose-built batch ML frameworks Kubeflow/Flyte/Ray (OpenAI uses Ray for ChatGPT) integrate PyTorch/TensorFlow/XGBoost for engineering/training/inference/fine-tuning. Interactive Jupyter/Hex notebooks front it via DataFrame APIs or SQL cells executed sequentially.
+
+#### 2.4.4 Serving derived data — from batch outputs to live traffic
+
+Batch builds precomputed datasets — recommendations, reports, ML features — served from DBs, KV stores, search engines. Don't write row-by-row from batch tasks via client libraries: per-record network RTT kills throughput even batched; parallel tasks overwhelm the serving DB and hurt live queries; external side effects break all-or-nothing job semantics (partial outputs visible, retries duplicate). Better patterns:
+
+- **Via streams:** batch pushes precomputed sets to Kafka topics; Elasticsearch, Pinot, Druid, Venice, ClickHouse ingest from Kafka. Streams absorb sequential bulk writes, buffer so downstream throttles without hurting prod traffic, fan out one job to many consumers, and form a DMZ security boundary between batch and prod networks. All-or-nothing still needs work: consumers must hide data (read-committed-like invisibility) until the job-completion notification arrives.
+- **Bulk import / build-then-swap:** build a whole DB inside the job, bulk-load files from DFS/object/local FS: TiDB Lightning, Pinot Hadoop import, RocksDB SST bulk-import. Fast, atomic version swaps; harder incrementally — hybrid stores (Venice: batch row updates + full swaps) cover both bootstrap and incremental.
 
 ---
 
@@ -169,420 +215,314 @@ Joining large-scale datasets (e.g., joining an unbounded clickstream event log w
 >
 > | Book Fig | PDF page | What to compare |
 > |---|---|---|
-> | Fig 11-1 | PDF p.494 | MapReduce 3x3 |
-> | Fig 11-2 | PDF p.495 | Shuffle sort |
-> | Fig 11-3 | PDF p.496 | Row-by-row mapper |
+> | Fig 11-1 | PDF p.494 | MapReduce 3 mappers × 3 reducers, shuffle files |
+> | Fig 11-2 | PDF p.495 | Activity events × user profiles star-schema join |
+> | Fig 11-3 | PDF p.496 | Sort-merge join on user ID, secondary sort |
 
-
-### Figure 11-1: MapReduce Execution Dataflow
-- **Figure Reference:** `Figure 11-1: A MapReduce job with three mappers and three reducers (reconstructed from text p. 434)`
+### Figure 11-1: MapReduce Execution Dataflow (PDF p.494)
+- **Figure Reference:** `Figure 11-1: A MapReduce job with three mappers and three reducers`
 - **Original PDF:** Fig 11-1 → PDF p.494 — open the PDF at page 494 to compare with the Mermaid reconstruction below.
-- **Visual Flow & Description:** Shows 3 mappers reading HDFS input splits, partitioning by key, sorting locally, shuffling over the network, and streaming to 3 reducers that write final output files to HDFS.
+- **Visual Flow & Description:** Input shards m1/m2/m3; per-shard map tasks; per-reducer local files (m1,r2); hash-partitioned shuffle; reducer-side mergesort; output shards r1/r2/r3 on DFS/object store.
 - **Mermaid Flowchart:**
 
 ```mermaid
 flowchart TD
-  subgraph INPUTS["Input Files (HDFS Blocks / S3)"]
+  subgraph INPUTS["Input Shards (HDFS Dir / S3 Prefix)"]
     direction TB
-    IN1["Block 0 (128MB)"]
-    IN2["Block 1 (128MB)"]
-    IN3["Block 2 (128MB)"]
+    IN1["m1 (128MB shard)"]
+    IN2["m2 (128MB shard)"]
+    IN3["m3 (128MB shard)"]
   end
-
-  subgraph MAPPERS["Mapper Phase (Parallel Execution)"]
+  subgraph MAPPERS["Map Tasks (one per shard)"]
     direction TB
-    M1["Mapper 1: Extract (k, v)"]
-    M2["Mapper 2: Extract (k, v)"]
-    M3["Mapper 3: Extract (k, v)"]
+    M1["Mapper 1<br/>emits (k2,v2)"]
+    M2["Mapper 2<br/>emits (k2,v2)"]
+    M3["Mapper 3<br/>emits (k2,v2)"]
   end
-
-  subgraph SHUFFLE["Shuffle & Sort (All-to-All Network Partitioning)"]
+  subgraph SHUFFLE["Shuffle: hash(k2) + Local Sort"]
     direction TB
-    S_NET["Network Shuffle: hash(key) % 3 + External Sort"]
+    S_NET["m1,r1 m1,r2 m1,r3<br/>m2,r1 ... m3,r3<br/>sorted segments"]
   end
-
-  subgraph REDUCERS["Reducer Phase (Aggregation)"]
+  subgraph REDUCERS["Reduce Tasks (author-configured)"]
     direction TB
-    R1["Reducer 1: Key Group 0 -> Output r1"]
-    R2["Reducer 2: Key Group 1 -> Output r2"]
-    R3["Reducer 3: Key Group 2 -> Output r3"]
+    R1["Reducer 1<br/>merge + call per key<br/>writes r1"]
+    R2["Reducer 2<br/>merge + call per key<br/>writes r2"]
+    R3["Reducer 3<br/>merge + call per key<br/>writes r3"]
   end
-
   IN1 --> M1
   IN2 --> M2
   IN3 --> M3
-
-  M1 --> S_NET
-  M2 --> S_NET
-  M3 --> S_NET
-
-  S_NET --> R1
-  S_NET --> R2
-  S_NET --> R3
+  M1 --> SHUFFLE
+  M2 --> SHUFFLE
+  M3 --> SHUFFLE
+  SHUFFLE --> R1
+  SHUFFLE --> R2
+  SHUFFLE --> R3
 ```
 
-- **Key Takeaway:** MapReduce decouples application logic into isolated stages, utilizing external sorting during the shuffle to aggregate massive datasets without memory exhaustion.
+- **Key Takeaway:** Same key always meets same reducer regardless of origin shard; sorting is implicit infrastructure, not user code.
 
 ---
 
-### Figure 11-2: Batch Star-Schema Join (Events vs. Dimensions)
-- **Figure Reference:** `Figure 11-2: A join between a log of user activity events and a database of user profiles (reconstructed from text p. 436)`
+### Figure 11-2: Batch Star-Schema Join (PDF p.495)
+- **Figure Reference:** `Figure 11-2: A join between a log of user activity events and a database of user profiles`
 - **Original PDF:** Fig 11-2 → PDF p.495 — open the PDF at page 495 to compare with the Mermaid reconstruction below.
-- **Visual Flow & Description:** Depicts joining high-volume, append-only clickstream event logs with a slowly changing dimension table of user profiles.
+- **Visual Flow & Description:** Left = clickstream/activity fact log; right = user dimension table. Analysis needs both (e.g., page popularity by birth cohort).
 - **Mermaid Flowchart:**
 
 ```mermaid
 flowchart LR
-  subgraph LOGS["User Activity Events (High-Volume Fact Log)"]
+  subgraph LOGS["Activity Events (Fact Log)"]
     direction TB
-    E1["(User 101, View, 'url_A', t=10:01)"]
-    E2["(User 102, Click, 'url_B', t=10:02)"]
-    E3["(User 101, Purchase, 'item_9', t=10:05)"]
+    E1["(Alice-id, View url_A, t=10:01)"]
+    E2["(Bob-id, Click url_B, t=10:02)"]
+    E3["(Alice-id, Purchase item_9, t=10:05)"]
   end
-
-  subgraph PROFILES["User Profiles (Dimension Database Table)"]
+  subgraph PROFILES["User DB (Dimension)"]
     direction TB
-    P1["(User 101, 'Alice', age: 30)"]
-    P2["(User 102, 'Bob',   age: 25)"]
+    P1["(Alice-id, Alice, dob=1994)"]
+    P2["(Bob-id, Bob, dob=1999)"]
   end
-
-  JOIN["Distributed Batch Join (Key: User ID)"]
-
+  JOIN["Distributed Batch Join<br/>Key: user_id"]
   LOGS --> JOIN
   PROFILES --> JOIN
-
-  JOIN --> OUT["Enriched Activity Log: [Alice, age 30, View url_A], [Bob, age 25, Click url_B]"]
+  JOIN --> OUT["Enriched Log<br/>[Alice 1994 View url_A]<br/>[Bob 1999 Click url_B]"]
 ```
 
-- **Key Takeaway:** Batch processing unifies high-velocity event facts with normalized relational dimensions without locking or impacting operational databases.
+- **Key Takeaway:** Join key (user ID) is what the shuffle will co-locate; no OLTP locks touched.
 
 ---
 
-### Figure 11-3: Reduce-Side Sort-Merge Join Execution
-- **Figure Reference:** `Figure 11-3: A sort-merge join on user ID; mappers extract join key, shuffle partitions by key, reducers merge streams (reconstructed from text p. 437)`
+### Figure 11-3: Sort-Merge Join with Secondary Sort (PDF p.496)
+- **Figure Reference:** `Figure 11-3: A sort-merge join on user ID; each sharded file can use parallel mappers`
 - **Original PDF:** Fig 11-3 → PDF p.496 — open the PDF at page 496 to compare with the Mermaid reconstruction below.
-- **Visual Flow & Description:** Tracks execution of a reduce-side join. Mappers tag records by source table. The shuffle groups and sorts by `user_id`, allowing the reducer to execute a single-pass streaming merge join.
+- **Visual Flow & Description:** Mapper over events emits URL views keyed by user ID; mapper over users emits DOB keyed by user ID; shuffle + secondary sort puts DOB first then timestamp-ordered events; reducer streams.
 - **Mermaid Flowchart:**
 
 ```mermaid
 flowchart TD
-  subgraph MAP_A["Mapper (Event Log Split)"]
+  subgraph MAP_A["Mapper (Event Split)"]
     direction TB
-    MA1["Emits: (user_101, [EVENT, view_page])"]
-    MA2["Emits: (user_102, [EVENT, click_btn])"]
+    MA1["Emits (u101, [EVENT, view])"]
+    MA2["Emits (u102, [EVENT, click])"]
   end
-
-  subgraph MAP_B["Mapper (User Profile Split)"]
+  subgraph MAP_B["Mapper (User Split)"]
     direction TB
-    MB1["Emits: (user_101, [PROFILE, Alice, 30])"]
-    MB2["Emits: (user_102, [PROFILE, Bob, 25])"]
+    MB1["Emits (u101, [PROFILE, dob])"]
+    MB2["Emits (u102, [PROFILE, dob])"]
   end
-
-  subgraph SHUFFLE["Shuffle & Sort by user_id"]
+  subgraph SHUF["Shuffle + Secondary Sort"]
     direction TB
-    SORT["Partitions by hash(user_id).
-    Secondary sort guarantees PROFILE arrives BEFORE EVENTS!"]
+    SORT["hash(user_id) to reducer<br/>PROFILE before EVENTS<br/>EVENTS in timestamp order"]
   end
-
-  subgraph REDUCE["Reducer for user_101"]
+  subgraph RED["Reducer for u101"]
     direction TB
-    R_EXEC["1. Reads Profile: Alice, 30
-    2. Streams Events: view_page
-    3. Outputs Joined Record!"]
+    REX["hold dob in var<br/>stream events<br/>emit (url, dob)"]
   end
-
-  MAP_A --> SHUFFLE
-  MAP_B --> SHUFFLE
-  SHUFFLE --> REDUCE
+  MAP_A --> SHUF
+  MAP_B --> SHUF
+  SHUF --> RED
 ```
 
-- **Key Takeaway:** Sort-merge joins exploit secondary sorting to stream unbounded event lists against dimension records with $O(1)$ reducer memory overhead.
+- **Key Takeaway:** One user record in memory at a time, zero network reads in reducer — then a follow-up job groups by URL for age histograms.
 
 ---
 
-### Spark DAG Lineage & In-Memory Pipeline Execution
-- **Visual Flow & Description:** Contrasts rigid multi-job MapReduce disk materialization with Apache Spark's in-memory pipelined DAG execution and RDD lineage recomputation.
-- **Mermaid Flowchart:**
+### Supplementary: Spark DAG vs. MapReduce Materialization (study aid, not in book)
 
 ```mermaid
 flowchart TD
-  subgraph MR_PIPELINE["Hadoop MapReduce (Disk Materialization at every stage)"]
+  subgraph MR["Hadoop MapReduce (DFS per stage)"]
     direction TB
-    MR_M1["Job 1: Map"] --> MR_D1[("HDFS Disk Materialize")]
-    MR_D1 --> MR_R1["Job 1: Reduce"] --> MR_D2[("HDFS Disk Materialize")]
-    MR_D2 --> MR_M2["Job 2: Map"] --> MR_D3[("HDFS Disk Materialize")]
+    A1["Job1 Map"] --> D1[("HDFS write")]
+    D1 --> R1["Job1 Reduce"] --> D2[("HDFS write")]
+    D2 --> A2["Job2 Map"]
   end
-
-  subgraph SPARK_DAG["Apache Spark (In-Memory Pipelined DAG + Lineage Graph)"]
+  subgraph SP["Spark Dataflow (memory + lineage)"]
     direction TB
-    S_LOAD["RDD 1: textFile (HDFS/S3)"]
-    S_MAP["RDD 2: map(parseJSON) [Pipelined in RAM]"]
-    S_FILT["RDD 3: filter(status == 200) [Pipelined in RAM]"]
-    S_SHUF["RDD 4: reduceByKey(sum) [Network Shuffle]"]
-    S_OUT[("Final Output")]
-
-    S_LOAD --> S_MAP --> S_FILT --> S_SHUF --> S_OUT
+    L1["textFile"] --> M1["map(parse)<br/>pipelined in RAM"]
+    M1 --> F1["filter(200)<br/>pipelined in RAM"]
+    F1 --> SH["reduceByKey<br/>network shuffle"]
+    SH --> OUT[("Final output")]
   end
-
-  MR_PIPELINE -.->|"10x to 100x Faster Execution via RAM Pipelining"| SPARK_DAG
+  MR -.->|"10-100x via pipelining"| SP
 ```
-
-- **Key Takeaway:** Spark's DAG execution eliminates disk serialization between intermediate stages, achieving order-of-magnitude speedups over MapReduce.
 
 ---
 
 ## 4. Real-World Systems, Case Studies & Code Examples
 
-### 4.1 Industry Implementations & Architectural Divergence
-- **Hadoop MapReduce & HDFS:** The original big-data workhorse. Optimized for batch processing on spinning HDDs where disk bandwidth and cluster locality dominated. High latency, high disk write amplification, but rock-solid reliability on multi-thousand-node clusters.
-- **Apache Spark (In-Memory DAG Processing):** De-facto enterprise standard for batch processing, machine learning pipelines, and graph processing. Uses Tungsten memory management (bypassing JVM garbage collection via raw off-heap memory bytes) and Catalyst query optimizer for vectorized code generation.
-- **Trino & Presto (Distributed Vectorized SQL on Lakehouses):** Interactive distributed SQL query engines designed to query disaggregated object storage (S3/GCS) backing Parquet, ORC, and Apache Iceberg tables. Implements pure in-memory streaming pipelines without intermediate disk writes, optimizing for sub-second analytical latencies.
-- **DuckDB (Embedded Analytical Batch Engine):** High-performance in-process columnar SQL OLAP engine. Implements vectorized columnar interpretation and adaptive multi-threaded execution, processing terabyte-scale datasets on a single multicore laptop without distributed cluster overhead.
+### 4.1 Industry Implementations
 
----
+- **Hadoop MapReduce + HDFS:** Petabyte batch on spinning disks, replica-aware scheduling. Correct but write-amplified; every stage hits DFS.
+- **Spark / Flink / Daft / Dataflow:** Dataflow DAGs, in-memory intermediates, lineage/checkpoints. Spark MLlib/FlinkML for ML; GraphX/Gelly/Pregel for BSP graphs; Kubeflow/Flyte/Ray for LLM pipelines (PyTorch/TensorFlow/XGBoost).
+- **Trino / Presto / Hive / BigQuery / Snowflake:** SQL on lakehouse (Parquet, Iceberg, Unity catalogs). Interactive exploration + ETL on one engine; connectors to Tableau/Power BI/Looker/Superset. DuckDB for single-node vectorized SQL.
+- **Workflow orchestration:** Airflow, Dagster, Prefect (generalized, warehouse-aware) replaced Oozie/Azkaban. Operators for MySQL/PostgreSQL/Snowflake/Spark/Flink; retries, SLA, backfill, cross-team lineage for 50–100-job DAGs.
+- **Serving derived data:** Kafka as buffer/DMZ to Elasticsearch/Pinot/Druid/Venice/ClickHouse; bulk SST tools (TiDB Lightning, Pinot Hadoop import, RocksDB SST ingest, Venice hybrid stores).
 
-### 4.2 Production Implementation: Pure Python MapReduce Framework
+### 4.2 Production Implementation: Pure Python MapReduce
 
 ```python
-import collections
 import itertools
 from typing import Callable, Iterator, List, Tuple, Any
 
 class MapReduceEngine:
-    """
-    Simulates distributed MapReduce execution:
-    Mappers emit (key, value) pairs, shuffle partitions and sorts by key,
-    and Reducers process grouped value iterators.
-    """
     def __init__(self, num_reducers: int = 4):
         self.num_reducers = num_reducers
 
-    def run(
-        self, 
-        input_records: List[Any], 
-        mapper_fn: Callable[[Any], Iterator[Tuple[str, Any]]], 
-        reducer_fn: Callable[[str, Iterator[Any]], Iterator[Tuple[str, Any]]]
-    ) -> List[Tuple[str, Any]]:
-        # --- PHASE 1: MAP PHASE ---
-        mapper_outputs: List[Tuple[str, Any]] = []
-        for record in input_records:
-            for intermediate_key, intermediate_value in mapper_fn(record):
-                mapper_outputs.append((intermediate_key, intermediate_value))
+    def run(self, records: List[Any],
+            mapper: Callable[[Any], Iterator[Tuple[str, Any]]],
+            reducer: Callable[[str, Iterator[Any]], Iterator[Tuple[str, Any]]]):
+        mapped: List[Tuple[str, Any]] = []
+        for r in records:
+            mapped.extend(list(mapper(r)))
+        buckets: List[List[Tuple[str, Any]]] = [[] for _ in range(self.num_reducers)]
+        for k, v in mapped:
+            buckets[hash(k) % self.num_reducers].append((k, v))
+        for b in buckets:
+            b.sort(key=lambda kv: kv[0])
+        out: List[Tuple[str, Any]] = []
+        for b in buckets:
+            for k, grp in itertools.groupby(b, key=lambda kv: kv[0]):
+                out.extend(list(reducer(k, (v for _, v in grp))))
+        return out
 
-        # --- PHASE 2: PARTITION & SHUFFLE PHASE ---
-        # Partition keys across reducers using hash(key) % num_reducers
-        reducer_buckets: List[List[Tuple[str, Any]]] = [[] for _ in range(self.num_reducers)]
-        for key, val in mapper_outputs:
-            bucket_idx = hash(key) % self.num_reducers
-            reducer_buckets[bucket_idx].append((key, val))
+def wc_map(line: str):
+    for w in line.lower().split():
+        yield (w, 1)
 
-        # External sort within each bucket by key
-        for bucket in reducer_buckets:
-            bucket.sort(key=lambda item: item[0])
-
-        # --- PHASE 3: REDUCE PHASE ---
-        final_output: List[Tuple[str, Any]] = []
-        for bucket in reducer_buckets:
-            # Group records by key
-            for key, group in itertools.groupby(bucket, key=lambda item: item[0]):
-                values_iterator = (val for _, val in group)
-                for out_key, out_val in reducer_fn(key, values_iterator):
-                    final_output.append((out_key, out_val))
-
-        return final_output
-
-# --- Example Application: Word Count ---
-def word_count_mapper(line: str) -> Iterator[Tuple[str, int]]:
-    for word in line.lower().strip().split():
-        yield (word, 1)
-
-def word_count_reducer(word: str, counts: Iterator[int]) -> Iterator[Tuple[str, int]]:
+def wc_reduce(word: str, counts: Iterator[int]):
     yield (word, sum(counts))
 ```
 
----
-
-### 4.3 Production Implementation: Broadcast Hash Join Engine
+### 4.3 Production Implementation: Broadcast Hash Join
 
 ```python
-from typing import Dict, List, Tuple, Any
+from typing import Dict, Iterator, List, Any
 
-class BroadcastHashJoinEngine:
-    """
-    Executes a Broadcast Hash Join (Map-Side Join):
-    The smaller dimension dataset is broadcast and loaded into an in-memory hash table,
-    enabling a single-pass join over the massive fact dataset without any shuffle or sort.
-    """
-    @staticmethod
-    def execute(
-        large_fact_stream: Iterator[Dict[str, Any]], 
-        small_dimension_table: List[Dict[str, Any]], 
-        join_key: str
-    ) -> Iterator[Dict[str, Any]]:
-        # Phase 1: Build in-memory hash table for the small dimension dataset
-        hash_table: Dict[Any, Dict[str, Any]] = {}
-        for dim_record in small_dimension_table:
-            k = dim_record[join_key]
-            hash_table[k] = dim_record
-
-        # Phase 2: Stream through the large fact dataset (Zero-Shuffle Map Phase)
-        for fact_record in large_fact_stream:
-            k = fact_record.get(join_key)
-            if k in hash_table:
-                # Merge dictionaries to produce enriched output row
-                joined_row = dict(fact_record)
-                joined_row.update(hash_table[k])
-                yield joined_row
+def broadcast_join(facts: Iterator[Dict[str, Any]],
+                   dims: List[Dict[str, Any]], key: str) -> Iterator[Dict[str, Any]]:
+    ht = {d[key]: d for d in dims}  # small table in memory
+    for f in facts:  # zero-shuffle streaming pass
+        if f.get(key) in ht:
+            row = dict(f)
+            row.update(ht[f[key]])
+            yield row
 ```
 
----
+### 4.4 Production Implementation: Airflow-style Workflow DAG (orchestration)
 
-### 4.4 Production War Story: The Straggler That Froze Cyber Monday Billing
-- **The Context:** A major e-commerce marketplace ran a nightly Apache Spark batch job to reconcile merchant payouts across 200 million daily orders. The pipeline performed a reduce-side join between order records and merchant accounts, running across 120 worker nodes with 960 CPU cores.
-- **The Pathological Incident:** During Cyber Monday, the merchant reconciliation job, which normally completed in 45 minutes, hung at $99\%$ completion for 7 hours, blocking daily banking ACH payout transfers.
-- **The Root Cause:**
-  - The join partitioned records on `merchant_id`.
-  - A single mega-merchant ("Amazon Basics" equivalent) accounted for $18\%$ of global marketplace transactions ($36\ \text{million orders}$ in 24 hours).
-  - Out of 960 Spark tasks, 959 tasks finished their partitions in under 3 minutes.
-  - The single task assigned the hash bucket for the mega-merchant received 36 million orders. The worker process ran out of JVM heap space trying to buffer the partition, entered an infinite Stop-the-World garbage collection thrashing loop, and stalled CPU execution (**The Classic Skewed Straggler**).
-- **Remediation & Architecture Lessons:**
-  1. *Skewed Join Optimization:* Activated Spark's Adaptive Query Execution (`spark.sql.adaptive.skewJoin.enabled = true`), which dynamically splits skewed partitions into multiple sub-partitions.
-  2. *Key Salting for Super-Merchants:* Pre-identified high-volume merchants and salted their partition keys with random integers `merchant_id + "_" + rand(0, 31)`, parallelizing the mega-merchant's join across 32 separate workers and restoring job runtime to 38 minutes.
+```python
+# Conceptual DAG matching book p.464-465: Spark -> Trino -> S3, decoupled via DFS
+# airflow_dag.py — Airflow / Dagster / Prefect all express this shape
+from datetime import datetime
+try:
+    from airflow import DAG
+    from airflow.providers.apache.spark.operators.spark_submit import SparkSubmitOperator
+    from airflow.providers.trino.operators.trino import TrinoOperator
+
+    with DAG("daily_etl", start_date=datetime(2025, 1, 1), schedule="@daily",
+             catchup=False, max_active_runs=1) as dag:
+        spark_stage = SparkSubmitOperator(
+            task_id="spark_shard_by_user",
+            application="s3://jobs/shard_by_user.py",
+            conf={"spark.sql.shuffle.partitions": "512"},
+        )
+        # Waits for spark_stage; reads its HDFS/S3 output, writes S3
+        trino_stage = TrinoOperator(
+            task_id="trino_reshard_by_url",
+            sql="INSERT INTO lake.agg_by_url SELECT url, age_bucket, count(*) "
+                "FROM lake.staged_by_user GROUP BY 1, 2",
+        )
+        spark_stage >> trino_stage
+except ImportError:
+    # Dagster/Prefect express identical DAG with assets/ops + retries + backfill
+    pass
+```
+
+Key workflow-orchestration behaviors the book demands: wait for all input producers, retry transient failures, mark persistently failed jobs, backfill historical dates, and expose 50–100-job lineage across teams — none of which a per-job scheduler (YARN/K8s/Spark) provides alone.
+
+### 4.5 Production War Story: Celebrity-Key Straggler on Cyber Monday
+
+200M orders/day, 120 nodes/960 cores, reduce-side join on `merchant_id`. One mega-merchant = 18% of rows (36M). 959 tasks finish in 3 min; one task OOMs/GCs forever at 99% for 7 hours, blocking ACH payouts. Fix: Spark AQE skew splitting + salting `merchant_id + "_" + rand(0,31)` across 32 workers, secondary roll-up strips suffix. 45 min → 38 min stable.
 
 ---
 
 ## 5. Architectural Trade-Off Matrix
 
-| Batch Processing Architecture | Throughput Profile | Fault Tolerance Mechanism | Memory Sensitivity | Intermediate State Storage | Best Workload Fit | Catastrophic Failure Mode |
-| :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- |
-| **Unix Pipelines (`awk`, `sort`)** | Single-core streaming; bounded by local disk I/O | None (Process failure requires restarting pipeline from start) | **Low** (External merge-sort spills to disk automatically) | Local temp files / OS pipes | Small-to-medium files ($<500\ \text{GB}$) on single multicore server | Single corrupted line or syntax error halts entire pipe |
-| **Hadoop MapReduce (HDFS)** | High aggregate throughput; high startup latency | Deterministic task re-execution from immutable HDFS blocks | **Low** (Sort buffers spill to local disk; handles massive skew) | Materialized to disk and replicated across HDFS at every stage | Multi-petabyte batch jobs on cheap commodity spinning disks | Extreme disk write amplification stalls multi-stage pipelines |
-| **Apache Spark (Dataflow DAG)** | **Blazing** ($10\times\text{--}100\times$ faster than MapReduce via RAM pipelining) | Lineage graph recomputes lost RDD partitions in memory | **High** (JVM heap bloat and GC pauses under memory pressure) | Pipelined in memory; spills to disk only when memory exhausted | Complex multi-stage ETL; iterative machine learning; graph analytics | Uncontrolled data skew triggers worker JVM Out-Of-Memory crash |
-| **Broadcast Hash Join** | **Optimal** ($O(N)$ streaming scan; zero network shuffle) | Task re-execution on failure | **High** (Small dataset must fit entirely in mapper RAM) | Zero intermediate disk or network state | Joining vast fact logs ($>1\ \text{TB}$) with small dimension tables ($<500\ \text{MB}$) | Dimension table exceeding broadcast memory threshold crashes all mappers |
-| **Sort-Merge Join (Reduce-Side)** | Moderate (Heavy all-to-all network shuffle + disk sort) | Reducer re-execution from mapper partition files | **Low** (Streams sorted inputs off disk via external merge) | Shuffled over network; materialized on mapper/reducer disks | Joining two massive, unpartitioned datasets ($>1\ \text{TB}$ each) | Celebrity key skew concentrates millions of rows on single reducer |
-
----
-
-### Concrete Decision Heuristics
+| Architecture | Throughput | Fault tolerance | State | Fit | Fails when |
+| :--- | :--- | :--- | :--- | :--- | :--- |
+| **Unix pipes** | Single-node disk-bound | Restart pipeline | OS pipes/temp files | <500 GB single box | One bad line halts pipe |
+| **Hadoop MapReduce (HDFS/object store)** | High aggregate, high startup | Task retry from immutable shards; intermediates on DFS | DFS per stage | Multi-PB commodity | Write amplification stalls |
+| **Spark/Flink DAG** | 10–100x MapReduce via RAM pipelining | Lineage recompute / checkpoints; final to DFS | Memory, spill locally | Multi-stage ETL, iterative ML/graph | Skew OOMs executor |
+| **Broadcast hash join** | O(N) streaming, zero shuffle | Task retry | Zero intermediate | Big fact + <500 MB dim | Dim exceeds mapper RAM |
+| **Sort-merge join** | Shuffle+sort heavy | Reducer retry from mapper files | Network + disk | Two huge unpartitioned tables | Hot key parks on one reducer |
+| **Warehouse SQL (Trino/BigQuery/Snowflake)** | Vectorized columnar | Node retry | Micro-partitions/object store | Interactive + ETL SQL on lakehouse | Row-wise/iterative logic, cost |
+| **Workflow orchestration (Airflow/Dagster/Prefect)** | Scheduling overhead only | Retry/mark-failed/backfill at job granularity | DFS/object store decoupling | 50–100-job DAGs across teams | Per-task backpressure lost vs. piped handoff |
 
 ```text
-Decision Tree for Distributed Batch Architecture:
-1. Does the dataset fit comfortably within the RAM and NVMe storage of a single large machine (<1 TB)?
-   ├── YES: Use DuckDB or Unix pipelines on a high-memory multi-core cloud VM (Avoids cluster networking overhead).
-   └── NO (Distributed multi-node processing required):
-        ├── Is the workload interactive SQL querying over analytical data lakehouses (S3 / Iceberg)?
-        │    └── YES: Use Trino / Presto with vectorized columnar execution.
-        └── Is the workload large-scale multi-stage ETL, data transformation, or feature engineering?
-             ├── Joining a massive table with a small dimension table (<500 MB)?
-             │    └── YES: Force a Broadcast Hash Join (Zero-shuffle map-side join).
-             └── Joining two massive multi-terabyte tables without shared partitioning?
-                  └── YES: Use Sort-Merge Join on Apache Spark with Adaptive Query Execution (AQE) enabled.
+Decision Tree:
+1. Fits single large VM (<1 TB)? -> DuckDB / Unix pipes.
+2. SQL over lakehouse (S3/Iceberg)? -> Trino/Presto/BigQuery/Snowflake.
+3. Multi-stage ETL/ML/graph? -> Spark/Flink/Daft.
+   - Small dim (<500 MB)? Force broadcast hash join.
+   - Two huge tables? Sort-merge + AQE + salting.
+4. Multi-job dependencies across teams/schedules? -> Airflow/Dagster/Prefect DAG over DFS/object-store handoffs.
+5. Serve to live traffic? -> Kafka buffer or bulk SST import, never row-wise direct writes.
 ```
 
 ---
 
 ## 6. Jargon Buster & Key Terminology
 
-- **Batch Processing:** An offline data processing paradigm that executes long-running computational jobs over bounded, static, historical datasets, optimizing for total throughput rather than response time.
-- **Data Locality:** An architectural technique (pioneered by HDFS) that schedules compute tasks on the physical machine hosting the target data blocks, avoiding network transfers.
-- **External Merge-Sort:** A sorting algorithm designed for datasets that exceed physical RAM, sorting chunks in memory, spilling sorted runs to disk, and merging runs in streaming passes.
-- **Mapper:** A batch processing function that processes raw input records and projects them into intermediate key-value pairs.
-- **Reducer:** A batch processing function that iterates over all intermediate values associated with a specific key to compute an aggregated output.
-- **Shuffle:** The phase in MapReduce and distributed dataflow engines where intermediate records are partitioned, transferred across the network, and sorted before delivery to reducers.
-- **Straggler:** A single computational task within a distributed batch job that executes significantly slower than peer tasks, delaying overall job completion.
-- **Speculative Execution:** A resilience mechanism where the cluster coordinator detects straggling tasks and launches duplicate speculative copies on other nodes, committing whichever copy finishes first.
-- **Broadcast Hash Join (Map-Side Join):** A distributed join optimization where a small dimension table is broadcast to all mappers and loaded into memory, eliminating the shuffle phase entirely.
-- **Resilient Distributed Dataset (RDD):** Spark's core abstraction representing an immutable, partitioned collection of records that can be recomputed on failure via its lineage graph.
+- **Batch processing:** Offline jobs over bounded immutable inputs producing fresh derived outputs; throughput over latency.
+- **Human fault-tolerance / time travel:** Fix code, rerun; or swap output directories/prefixes via object-store/table-format versioning.
+- **Distributed filesystem (DFS):** HDFS/GlusterFS/CephFS/JuiceFS — huge blocks, data-node daemons, NameNode/metadata service, page-cache tiers, replication/erasure coding.
+- **Object store:** S3/GCS/Azure Blob/Swift — bucket+key, GET/PUT immutability, prefix-list ~ recursive ls, zero-byte dir markers, copy+delete renames, decoupled compute/storage; S3 Express One Zone for ms/KV-like access.
+- **Data locality vs. disaggregation:** Run where replica lives (HDFS era) vs. scale compute/storage independently (object-store era).
+- **Job orchestration vs. workflow orchestration:** YARN/Kubernetes/Spark schedule tasks; Airflow/Dagster/Prefect (successors to Oozie/Azkaban) order jobs in DAGs with retries/backfill/lineage.
+- **Task executor / resource manager / scheduler:** NodeManager/kubelet; global inventory (ZooKeeper/etcd); central + app-specific (ApplicationMasters/operators) placement; fairness (DRF/FIFO/quota/bin-pack) vs. efficiency; gang scheduling hazards; NP-hard.
+- **Spot/preemptible instances:** Cheap low-priority VMs (EC2 spot, Azure spot, GCP preemptible); batch-friendly but expect kills.
+- **Backpressure:** Piped producer blocks when in-memory buffer fills; decoupled DFS handoffs trade this for time-independence.
+- **Mapper / reducer / shuffle:** Per-record extract; per-key aggregate; hash-partition + sort + merge repartitioning (not random).
+- **Secondary sort:** Order DOB-record first then timestamped events within a key.
+- **Sort-merge / broadcast / bucketed joins:** Shuffle both; ship small side; rely on co-partitioning.
+- **Query languages / optimizers:** Hive/Trino/Spark/Flink SQL + cost-based join choice/ordering; Pig/Morel/jq/JSONPath/Gremlin niches.
+- **DataFrames:** R/Pandas-style stepwise relational calls; local eager/ordered vs. distributed lazy/unordered; Spark plan+optimizer; Daft client/server; Arrow shared columnar; BigQuery DataFrames, Snowpark+Pandas.
+- **ETL / ELT:** Extract-transform-load vs. load-then-transform in warehouse; embarrassingly parallel transforms; scheduler retries; data mesh/contract/fabric ownership; lakehouse (Iceberg/Unity, SparkSQL/Trino/DuckDB) convergence.
+- **Serving derived data:** Kafka-buffered ingestion vs. bulk SST import (Lightning/Pinot/RocksDB/Venice hybrid); hide-until-complete for atomicity.
 
 ---
 
 ## 7. System Design & Practical Engineering Takeaways
 
 ### 7.1 Production Engineering Checklist
-1. **Enable Speculative Execution on Large Batch Clusters:** Configure `spark.speculation = true` to automatically mitigate stragglers caused by degraded cloud hardware or noisy neighbors.
-2. **Force Broadcast Joins for Small Dimension Tables:** When joining large fact tables with lookup tables $<100\ \text{MB}$, explicitly hint or configure `spark.sql.autoBroadcastJoinThreshold = 104857600` to prevent unnecessary all-to-all shuffles.
-3. **Pre-Filter and Prune Projections Before Shuffling:** Never execute a global shuffle before filtering. Always push filters (`WHERE`) and column projections (`SELECT colA, colB`) directly to the source scan operator (predicate pushdown).
-4. **Tune Garbage Collection for Off-Heap Memory:** In Apache Spark, configure off-heap memory allocation (`spark.memory.offHeap.enabled = true`) to minimize JVM garbage collection pauses on multi-hundred-gigabyte worker nodes.
-5. **Mitigate Skew via Salted Keys:** In reduce-side joins, monitor partition sizes. If a single key dominates $>5\%$ of total records, salt the key with a random suffix (`0..31`) and replicate the matching join record across 32 buckets.
-
----
+1. **Default to decoupled handoffs, pipe only inside a job:** Cross-job via DFS/object store + workflow orchestration (Airflow/Dagster/Prefect); intra-job pipelining via Spark/Flink memory handoff.
+2. **Force broadcast joins under ~100 MB** (`spark.sql.autoBroadcastJoinThreshold`); salt keys dominating >5% of rows.
+3. **Push filters/projections before shuffles** (predicate pushdown); never shuffle raw wide rows.
+4. **Run batch on spot/preemptible** with task-granular retries; expect preemptions more than hardware faults.
+5. **Serve via Kafka or bulk import,** never row-wise client writes; hide staged output until job-complete notification.
+6. **Version outputs for time travel** (separate prefixes/Iceberg snapshots) to get human fault-tolerance.
 
 ### 7.2 System Design Interview Strategy
-- **Treat Immutability as the Superpower of Batch Systems:** When asked how batch systems recover from mid-job worker crashes, highlight the contrast with OLTP: *"OLTP systems require complex WAL undo logging and 2PC. Batch systems treat inputs as immutable and operations as pure deterministic functions; recovery simply re-executes the failed task on another node without side effects."*
-- **Explain the Mechanics of Distributed Joins:** Do not just say *"We join the tables."* Specify the exact join type based on data sizes: *"Because the user profile table is small (50 MB), we will use a Broadcast Hash Join to load it into mapper memory, completely bypassing the network shuffle and reducer phase."*
-- **Capacity Sketching for Shuffle Bandwidth:**
-  $$\text{Shuffle Network Volume} = \text{Total Input Records} \times \text{Intermediate Key-Value Bytes}$$
-  $$\text{Reducer Memory Required} = \text{Max Key Cardinality Records} \times \text{Avg Record Size} \times \text{Skew Multiplier}$$
-
----
+- Lead with immutability: "Inputs immutable, functions pure → recovery is task rerun, no WAL undo/2PC, unlike OLTP."
+- Name the join: "50 MB dim → broadcast hash, zero shuffle; multi-TB unpartitioned → sort-merge + AQE + salting."
+- Distinguish schedulers: "YARN/K8s places tasks; Airflow/DAG orders jobs, retries, backfills 50–100-job lineage."
+- Sketch shuffle math: `shuffle bytes = records × intermediate size`; `reducer RAM = max-key rows × row size × skew`.
 
 ### 7.3 Mastery Self-Assessment Questions
 
-#### Question 1 (Conceptual Depth)
-*Why does a Broadcast Hash Join (Map-Side Join) achieve orders-of-magnitude higher throughput and lower resource consumption than a Sort-Merge Join (Reduce-Side Join), and what is its fundamental architectural limitation?*
-- **Answer:** 
-  A **Sort-Merge Join (Reduce-Side Join)** is a heavy, multi-stage operation. It requires scanning both datasets, emitting records tagged with source identifiers, hashing every record across $R$ reducers, executing an all-to-all network shuffle across cluster racks, spilling intermediate partition files to disk, executing an external merge-sort to order records by join key, and invoking reducers to merge streams. The shuffle stage consumes massive network switch bandwidth, disk write IOPS, and CPU serialization cycles.
-  A **Broadcast Hash Join (Map-Side Join)** eliminates the shuffle, the sorting stage, and the reducer stage entirely. The smaller dataset is broadcast once over the network to all mapper workers, where each mapper loads the data into a local in-memory hash table. As mappers stream through their local chunks of the massive fact dataset, they perform an $O(1)$ memory lookup against the hash table for every row. The join executes in a single streaming pass ($O(N)$ time), bounded only by raw input read bandwidth.
-  The **fundamental limitation** of a Broadcast Hash Join is memory capacity: the smaller dataset **must fit entirely within the physical RAM** allocated to each individual mapper process. If the dimension table exceeds available memory, mappers crash with JVM `OutOfMemoryError` or enter severe OS swap thrashing.
+#### Question 1 (Conceptual)
+*Why is broadcast hash orders faster than sort-merge, and its hard limit?*
+- **Answer:** Sort-merge scans both sides, hashes every row across R reducers, all-to-all shuffles, spills/sorts/merges — network + IOPS + CPU. Broadcast ships the small side once, probes in O(1) per big row in one streaming pass O(N). Limit: small side must fit mapper RAM or all mappers OOM/thrash.
 
-#### Question 2 (Failure Scenario & Edge Cases)
-*An engineering team runs an Apache Spark batch job that processes 500 million web analytics sessions daily. The pipeline performs an aggregation: `sessions.groupBy("ip_address").count()`. During a DDoS attack, a single botnet IP address generates 150 million requests. The Spark job consistently fails after running for 2 hours with an `ExecutorLostFailure: Container killed by YARN for exceeding memory limits`. Diagnose the failure mechanism and prescribe the production architectural fix.*
-- **Answer:**
-  - *Failure Mechanism:* The failure is caused by **Extreme Key Skew (The Straggler OOM Collapse)**.
-    - During the `groupBy("ip_address")` shuffle, Spark hashes the `ip_address` to determine the target reducer task: `reducer_id = hash(ip_address) % num_reducers`.
-    - All 150 million records for the botnet IP address route to the exact same reducer task on a single worker executor.
-    - The reducer attempts to buffer and aggregate the 150 million records in its in-memory hash map or append them to its shuffle spill buffer.
-    - The memory footprint of the single task exceeds the worker container's physical memory limit (`yarn.nodemanager.vmem-pmem-ratio`). YARN detects the memory boundary violation and forcefully terminates the container with `SIGKILL`.
-    - Spark attempts to reschedule the task on another worker up to `spark.task.maxFailures = 4`, where it crashes each worker consecutively until the entire job fails.
-  - *Prescribed Remediation:*
-    1. *Two-Stage Aggregation (Salting):*
-       - *Stage 1 (Partial Aggregation with Salt):* In the mapper, append a random integer salt from $0$ to $31$ to the key: `salted_ip = ip_address + "_" + rand(0, 31)`. Execute a `groupBy("salted_ip").count()`. This scatters the 150 million botnet records uniformly across 32 separate reducers, parallelizing the aggregation and keeping each task's memory footprint small.
-       - *Stage 2 (Final Aggregation):* Strip the salt suffix from the intermediate keys: `original_ip = salted_ip.split('_')[0]`. Execute a second `groupBy("original_ip").sum("count")`. Because Stage 1 collapsed the 150 million records into just 32 pre-aggregated rows, Stage 2 processes only 32 numbers for the botnet IP, executing in milliseconds without memory strain.
+#### Question 2 (Failure)
+*Spark `groupBy("ip")` OOMs on one executor during a DDoS (150M rows one IP, `ExecutorLostFailure`). Diagnose + fix.*
+- **Answer:** Key skew: `hash(ip)%N` parks 150M rows on one reducer, exceeding YARN container memory → SIGKILL → 4 retries fail. Fix two-stage salted aggregation: `salted=ip+"_"+rand(0,31)`, partial `groupBy(salted)`, strip suffix, final `groupBy(ip).sum` — 150M → 32 partial rows, ms final stage.
 
-#### Question 3 (Trade-Off & Capacity Estimation)
-*An advertising platform processes 10 billion ad click events per day (average event size = 200 bytes uncompressed). An analytics job joins these clicks against a 20 GB advertiser dimension table to compute daily revenue per advertiser. Calculate: (A) The network shuffle volume and minimum disk I/O required if the job is executed as a Reduce-Side Sort-Merge Join, vs. (B) The network and disk I/O required if executed as a Broadcast Hash Join across 100 mapper workers. Show exact derivations.*
-- **Answer:**
-  - *Input Volume Metrics:*
-    - Click Events: $10 \times 10^9\ \text{events} \times 200\ \text{bytes} = 2,000 \times 10^9\ \text{bytes} = \mathbf{2\ \text{TB}}$.
-    - Dimension Table: $\mathbf{20\ \text{GB}}$.
-  - *Approach A: Reduce-Side Sort-Merge Join*
-    - *Map Phase:*
-      - Mappers read 2 TB of clicks and 20 GB of dimensions off storage:
-        $$\text{Disk Read (Mappers)} = 2\ \text{TB} + 0.02\ \text{TB} = \mathbf{2.02\ \text{TB}}$$
-      - Mappers emit intermediate key-value pairs (assume intermediate projection size is 100 bytes per event):
-        $$\text{Intermediate Map Output} = 10 \times 10^9 \times 100\ \text{bytes} = \mathbf{1\ \text{TB}}$$
-      - Mappers sort and spill intermediate data to local disk:
-        $$\text{Disk Write (Mapper Spills)} = \mathbf{1\ \text{TB}}$$
-    - *Shuffle Phase:*
-      - Reducers pull intermediate data over the network from all mappers:
-        $$\text{Network Shuffle Volume} = \mathbf{1\ \text{TB}}$$
-    - *Reduce Phase:*
-      - Reducers merge and sort spilled partition files off disk:
-        $$\text{Disk Read (Reducers)} = \mathbf{1\ \text{TB}}$$
-      - Reducers write final joined output (assume output size is 50 GB):
-        $$\text{Disk Write (Final Output)} = \mathbf{50\ \text{GB}}$$
-    - *Totals for Reduce-Side Join:*
-      - **Total Network Shuffle:** $\mathbf{1\ \text{TB}}$
-      - **Total Disk I/O:** $2.02\ \text{TB (read)} + 1\ \text{TB (map write)} + 1\ \text{TB (reduce read)} + 0.05\ \text{TB (write)} = \mathbf{4.07\ \text{TB}}$
-  - *Approach B: Broadcast Hash Join across 100 Mappers*
-    - *Broadcast Phase:*
-      - The 20 GB dimension table is broadcast across the network to 100 mapper workers:
-        $$\text{Network Broadcast Volume} = 100\ \text{mappers} \times 20\ \text{GB} = \mathbf{2,000\ \text{GB}} = \mathbf{2\ \text{TB}}$$
-      - (Note: With peer-to-peer BitTorrent broadcast protocols used in Spark, network overhead is distributed, but total traffic across nodes is $\sim 2\ \text{TB}$).
-    - *Map Phase:*
-      - Mappers read their 2 TB chunk of clicks directly off storage:
-        $$\text{Disk Read (Mappers)} = \mathbf{2\ \text{TB}}$$
-      - Mappers query their local in-memory 20 GB hash table (zero intermediate spills).
-      - Mappers stream joined results directly to final storage:
-        $$\text{Disk Write (Final Output)} = \mathbf{50\ \text{GB}}$$
-    - *Totals for Broadcast Hash Join:*
-      - **Total Network Shuffle:** $\mathbf{0\ \text{TB}}$ (Replaced by 2 TB broadcast).
-      - **Total Intermediate Disk I/O:** $\mathbf{0\ \text{TB}}$ (Saves 2 TB of intermediate spill/read disk traffic).
-      - **Total Disk I/O:** $2\ \text{TB (read)} + 0.05\ \text{TB (write)} = \mathbf{2.05\ \text{TB}}$
-  - *Quantitative Comparison:*
-    - Broadcast Hash Join cuts total disk I/O from **$4.07\ \text{TB}$ to $2.05\ \text{TB}$** (a **$50\%$ reduction in physical disk wear and I/O bus contention**).
-    - Broadcast Hash Join completely eliminates the complex, CPU-heavy external merge-sort phase, converting a multi-hour shuffle-heavy job into a blazing, single-pass streaming map operation.
-
+#### Question 3 (Capacity)
+*10B clicks/day × 200 B = 2 TB + 20 GB dim, 100 mappers. Shuffle + I/O for sort-merge (100 B intermediate/row, 50 GB output) vs. broadcast?*
+- **Answer:** Sort-merge: mappers read 2.02 TB, emit 1 TB, spill 1 TB, shuffle 1 TB, reducers reread 1 TB, write 50 GB → ~1 TB network, ~4.07 TB disk. Broadcast: 20 GB × 100 = 2 TB broadcast traffic, read 2 TB, write 50 GB → 0 shuffle, ~2.05 TB disk, no merge-sort. Halves disk I/O, removes sort CPU.
 
 ---
 > [!NAV] **Chapter Navigation**

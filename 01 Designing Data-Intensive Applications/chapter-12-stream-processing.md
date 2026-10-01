@@ -5,152 +5,129 @@
 > [!NAV] **Chapter Navigation**
 > ⬅️ **Previous:** [[chapter-11-batch-processing|Chapter 11: Batch Processing]] | 🏠 **Index:** [[00-Master-Reading-Dashboard|Master Dashboard]] | ➡️ **Next:** [[chapter-13-a-philosophy-of-streaming-systems|Chapter 13: A Philosophy of Streaming Systems]]
 
-
 ---
 
 ## 1. Executive Summary & Core Engineering Problem
 
-- **Core Thesis:** The fundamental limitation of batch processing is latency: waiting for a bounded dataset to accumulate (e.g., hourly or daily batches) inherently delays business reactions to data. **Stream Processing** inverts this paradigm by treating data as an **unbounded, continuously arriving stream of immutable events**, processing records incrementally with sub-second latency. A stream-processing architecture unifies the durability of storage with the low-latency reactivity of messaging. By formalizing the **Stream-Table Duality** (a table is a cached snapshot of state; a stream is the changelog of state mutations), modern architectures solve the chronic consistency defects of distributed dual-writes through **Change Data Capture (CDC)** and deliver deterministic, fault-tolerant stateful aggregations across asynchronous time windows.
-- **Problem Statement:** Naively attempting to keep multiple storage systems in sync using application-level "dual-writes" guarantees silent, permanent data corruption. A classic production catastrophe occurs when an e-commerce service updates both an operational relational database (MySQL) and a secondary full-text search index (Elasticsearch) (Figure 12-4): Client 1 issues an update setting item $X = A$. Concurrently, Client 2 issues an update setting $X = B$. In MySQL, Client 1's transaction commits first, followed by Client 2 ($X = B$ wins). However, due to network latency jitter, Client 2's HTTP request arrives at Elasticsearch *before* Client 1's request ($X = A$ wins in Elasticsearch). The database and search index permanently diverge without throwing errors. Furthermore, if the application crashes between updating MySQL and calling Elasticsearch, the search index remains permanently stale.
-- **Historical & Industry Context:** Early real-time architectures in the 1990s and 2000s relied on traditional enterprise message brokers (JMS, RabbitMQ, ActiveMQ). While suitable for asynchronous RPC task dispatch, traditional message brokers delete messages immediately upon delivery, destroy message ordering upon redelivery, and collapse under fan-out scale. In 2011, LinkedIn created **Apache Kafka**, pioneering the **Log-Based Message Broker** model: an append-only, partitioned, durable disk log where consumers independently read streams via persistent offsets. In the 2010s, stream processing engines evolved from low-level, at-least-once tuple processors (Apache Storm) to stateful, event-time-aware, exactly-once stream processors (**Apache Flink**, Apache Spark Structured Streaming). In the 2020s (2nd Edition inflection), the widespread adoption of **Debezium** for log-based Change Data Capture and cloud streaming lakehouse architectures (Apache Iceberg streaming sinks) established stream processing as the primary architectural nervous system of data-intensive enterprises.
+> *"A complex system that works is invariably found to have evolved from a simple system that works."*
+> — **John Gall**, *Systemantics* (1975)
+
+- **The Big Picture:** Batch waits for tomorrow's newspaper; stream watches live news. Chapter 11 froze time into bounded immutable datasets. Real systems don't pause: card swipes, GPS pings, DB writes arrive continuously. Stream processing treats data as an unbounded immutable event flow, computing incrementally with sub-second latency while keeping batch-like fault-tolerance and determinism.
+- **Core Thesis:** Batch latency is structural — you wait for bounds to accumulate. Stream inverts it: unbounded streams + incremental state + stream-table duality (table = cached snapshot, stream = changelog). Durable partitioned logs plus Change Data Capture (CDC) fix dual-write corruption; event-time windows + watermarks + stateful joins deliver deterministic analytics over asynchronous arrivals.
+- **Problem Statement:** Dual-writes guarantee divergence. App writes MySQL then Elasticsearch: Client 1 sets X=A, Client 2 sets X=B. MySQL orders A→B (B wins); network jitter orders B→A at Elasticsearch (A wins). Crash between writes = permanent staleness. No error is raised. The chapter's answer is single-write + log tailing, not double application writes.
+- **Historical Context:** 1990s–2000s JMS/RabbitMQ/ActiveMQ deleted on ACK, scrambled order on redelivery, choked on fan-out. 2011 LinkedIn Kafka pioneered log-based brokers: append-only partitioned durable logs, consumer-held offsets, zero-copy fan-out, replay. 2010s engines moved Storm (at-least-once tuples) → Flink / Spark Structured Streaming (stateful, event-time, effectively-once). 2020s Debezium WAL-tailing + Iceberg streaming sinks made streams the enterprise nervous system.
+
+| Alice (dual-write) | Bob (log-centric) |
+| :--- | :--- |
+| "Update DB then POST to index in code." | "Write DB once, tail WAL via Debezium into Kafka, index consumes ordered log." |
+| "Processing-time hourly counts look fine." | "Mobile offline bursts spike one window; use event-time + watermarks or lie." |
 
 ---
 
 ## 2. In-Depth Technical Concepts & Internal Mechanics
 
-### 2.1 Messaging Systems: Traditional AMQP vs. Log-Based Brokers
-- **The Event Abstraction:** An **event** is a small, self-contained, immutable object containing the details of something that occurred at a specific point in physical time (e.g., a credit card swipe, a GPS location ping, or an inventory deduction).
-- **Architectural Divergence in Messaging:**
+### 2.1 Transmitting Event Streams — Messaging Systems (p.512)
 
-#### 1. Traditional Message Brokers (JMS, RabbitMQ, AMQP)
-- *Topology:* Producers send messages to an exchange; the exchange routes messages to queues. Multiple consumers pull from a queue (Load Balancing, Figure 12-1a).
-- *Delivery Semantics:* When a consumer receives message $M$, the broker marks $M$ as invisible. When the consumer processes $M$, it sends an acknowledgment (`ACK`). The broker immediately deletes $M$ from storage.
-- *The Out-of-Order Redelivery Disaster (Figure 12-2):*
-  - Consumer 1 processes message $M_1$; Consumer 2 processes message $M_2$; Consumer 3 processes message $M_3$.
-  - Consumer 2 crashes or times out while processing $M_2$.
-  - The broker returns $M_2$ to the head of the queue. Consumer 1 finishes $M_1$ and dequeues $M_2$.
-  - *Result:* $M_3$ was already processed by Consumer 3 before $M_2$ finished. **Message ordering is permanently scrambled**.
-- *Memory Bottleneck:* Traditional brokers keep unacknowledged messages in RAM buffers. If consumers lag, memory fills, and brokers enter disk-paging stalls, destroying throughput.
+Event = small immutable fact at a physical time (swipe, ping, deduction).
 
-#### 2. Log-Based Message Brokers (Apache Kafka, Apache Pulsar - Figure 12-3)
-- *Topology:* A hybrid combining durable log-structured storage with publish-subscribe messaging. A topic is split into multiple **Partitions**.
-- *Storage Layout:* Each partition is an append-only, sequentially written file on disk. The broker assigns a strictly monotonically increasing 64-bit integer **Offset** to each message.
-- *Consumer Mechanics:*
-  - Messages are **not deleted** when read.
-  - Each consumer tracks its own progress via a single scalar pointer: its **Consumer Offset** (stored in an internal Kafka topic `__consumer_offsets`).
-  - *Zero Memory Overhead Fan-Out:* 50 independent consumer groups can read from the exact same partition at completely different rates and offsets. The broker simply streams raw disk blocks via the Linux kernel's zero-copy `sendfile()` system call, saturating 100 Gbps network interfaces without memory bloat.
-  - *Replayability:* If an application bug is discovered in a downstream service, the consumer can reset its offset back to the beginning of time (`offset = 0`), reprocessing weeks of historical data deterministically.
+#### 2.1.1 Traditional brokers vs. log-based brokers (p.513)
 
----
+**Traditional (JMS/RabbitMQ/AMQP):** Producer → exchange → queues; consumers load-balance. Broker marks M invisible on delivery, deletes on ACK. Redelivery destroys order: C1 gets M1, C2 gets M2, C3 gets M3; C2 crashes on M2 → broker requeues M2 to head; C1 finishes M1 and takes M2 after M3 already processed. Permanent scramble. RAM holds unacked messages; lagging consumers force paging stalls.
 
-### 2.2 Databases and Streams: Change Data Capture (CDC)
-- **The Dual-Write Problem (Figure 12-4):**
-  - Application code attempts to write to two systems sequentially:
-    ```python
-    db.execute("UPDATE products SET price = 99 WHERE id = 101")
-    search_index.put("/products/101", {"price": 99})
-    ```
-  - *Catastrophic Failure Modes:*
-    1. *Concurrent Update Race:* Two clients update the same record in reverse order across the two systems, permanently corrupting index state.
-    2. *Partial Faults:* If the app process crashes after the DB commit but before the HTTP call to Elasticsearch, the search index permanently loses the update.
-- **Change Data Capture (CDC) Architecture (Figure 12-5):**
-  - All application mutations write **only to the database of record**.
-  - A CDC daemon (e.g., Debezium) tails the database's internal transaction log (PostgreSQL WAL, MySQL Binlog) at the storage layer.
-  - Every committed insert, update, and delete is converted into an ordered event stream and pushed to a partitioned log-based broker (Kafka).
-  - Downstream systems (Elasticsearch, Redis, Snowflake) consume the Kafka CDC topic and update their local derived state asynchronously.
-  - *Guarantees:* **Total ordering, zero dual-write race conditions, and complete crash atomicity.**
+**Log-based (Kafka/Pulsar, p.519):** Topic split into partitions; each partition an append-only sequential file with monotonic 64-bit offsets. No delete-on-read. Each consumer tracks its own offset (`__consumer_offsets`). 50 groups read the same partition at different offsets via Linux `sendfile()` zero-copy — no per-consumer broker memory. Reset to 0 replays weeks deterministically. Strict order within a partition; scale by adding partitions.
 
----
+| Dimension | RabbitMQ/JMS/SQS | Kafka/Pulsar log-based |
+| :--- | :--- | :--- |
+| **Retention** | Delete on ACK | Days/indefinite on disk |
+| **State** | Broker RAM in-flight | Consumer scalar offset |
+| **Order** | Scrambled on retry | Total order per partition |
+| **Fan-out** | Copy per queue, RAM bloat | Unlimited groups, zero-copy |
+| **Replay** | Impossible | Rewind to 0/timestamp |
+| **Under lag** | Swap death | Zero broker penalty |
+| **Use** | RPC/task queues | Sourcing, CDC, analytics backbone |
 
-### 2.3 The Duality of Streams and Tables (Figure 12-7)
-- **Foundational Theory:** Tables and streams are two perspectives on the exact same underlying data:
-  $$\text{Table} = \int \text{Stream} \, dt \quad (\text{A table is the integral of a stream over time})$$
-  $$\text{Stream} = \frac{d(\text{Table})}{dt} \quad (\text{A stream is the derivative of a table over time})$$
-  - A **Table** holds current state (a snapshot of reality at a discrete instant).
-  - A **Stream** holds history (a changelog of every mutation that produced current state).
-- **Log Compaction (Figure 12-6):**
-  - In a standard log-based broker, old segments are deleted when retention time expires (e.g., after 7 days).
-  - Under **Log Compaction**, the broker guarantees that it retains **at least the latest value for every primary key** indefinitely.
-  - Overwritten records are discarded during background segment merges; deleted records are purged via explicit **Tombstones** (`key = K, value = null`).
-  - *The Architectural Superpower:* A new consumer joining the cluster can rebuild the entire current database table state by reading the compacted topic from offset 0, without querying or locking the primary operational database!
+Partitioning rule that matters: key = entity ID (`user_id`, `order_id`) → `hash(key) % partitions` → all mutations for that entity land same partition, one consumer thread, causal order preserved.
 
----
+#### 2.1.2 Backpressure, load shedding, reactive streams (the gap most summaries miss)
 
-### 2.4 Reasoning About Time: Event Time vs. Processing Time
-- **The Temporal Dichotomy:**
-  - **Event Time:** The exact physical time when the event occurred on the source device/client (recorded in the event payload).
-  - **Processing Time:** The physical time when the event is processed by a stream processing node (determined by the server's local clock).
-- **Why Processing-Time Windowing Fails (Figure 12-8):**
-  - If a mobile client goes offline into a subway tunnel for 30 minutes, it buffers events locally.
-  - When the client regains 5G connectivity, it flushes 30 minutes of buffered events in a single 2-second burst.
-  - If the stream processor windows by **Processing Time**, all 30 minutes of activity land in a single 1-minute window, generating a massive artificial traffic spike while previous windows appear empty.
-  - *Core Invariant:* **Stream processing analytics must be windowed by Event Time to reflect true operational reality.**
-- **The Challenge of Late-Arriving Events & Watermarks:**
-  - In an asynchronous network, events arrive out of chronological order.
-  - A stream processor computing a 5-minute event-time window ($12:00\text{--}12:05$) cannot know when all events for that window have arrived.
-  - **Watermarks:** A heuristic progress metric emitted into the stream indicating: *"We believe all events with event time $\le t_w$ have been observed."*
-  - *Handling Late Events:*
-    1. *Drop:* Discard events with event time $< t_w$.
-    2. *Update / Retract:* Re-open the window, recompute the aggregation, and emit a retraction message (e.g., Apache Flink side outputs).
+The book returns to backpressure four times in this chapter for a reason. Fast producers + slow consumers need explicit policy, not hope:
 
----
+- **Backpressure:** Consumer signals "slow down". Unix pipes block the producer on a full buffer; Spark/Flink direct handoffs do the same over network/memory; reactive streams (Reactive Streams spec, Project Reactor, Akka Streams) formalize demand (`request(n)`) so sources emit only what downstream can hold.
+- **Load shedding:** When backpressure can't propagate (mobile bursts, traffic spikes), drop or degrade deliberately: sample, aggregate early, route to dead-letter/side output, serve stale cache. Alternative to OOM is controlled loss with audit.
+- **Bounded queues + watermarks:** Flink/Spark bound window state and use watermarks to close windows; late data goes to side outputs rather than growing state forever.
+- **Kafka as shock absorber:** Durable log decouples rate: producers append at line rate, consumers lag without broker penalty, catching up from disk. This is why CDC + Kafka replaces synchronous dual-writes under burst.
 
-### 2.5 Windowing Strategies
-Stream processing breaks unbounded streams into discrete bounded subsets using three primary windowing models:
+Failure without it: unbounded RocksDB/JVM buffers OOM on a 30-min offline flush; RabbitMQ paging stalls; rebalance storms when `max.poll.interval.ms` is exceeded by slow processing.
 
-1. **Tumbling Windows:**
-   - Fixed-size, non-overlapping intervals (e.g., 5-minute tumbling windows: $12:00\text{--}12:05$, $12:05\text{--}12:10$).
-   - Every event belongs to exactly one window.
-2. **Hopping (Sliding) Windows:**
-   - Fixed-size, overlapping intervals defined by window length and hop step (e.g., a 5-minute window that hops every 1 minute).
-   - An event belongs to multiple concurrent windows ($5$ windows in this example), providing smooth rolling metric aggregations.
-3. **Session Windows:**
-   - Dynamic, variable-duration intervals based on user activity.
-   - Defined by an inactivity timeout gap (e.g., 30 minutes). If no events arrive for user $U$ within 30 minutes, the session window closes. Captures human behavior accurately.
+### 2.2 Databases and Streams — Keeping Systems in Sync, CDC, State/Streams/Immutability (p.524)
 
----
+#### 2.2.1 Keeping systems in sync / dual-write hazard (p.525)
 
-### 2.6 Stateful Stream Joins
-Stream processing supports three fundamental join topologies:
+```python
+db.execute("UPDATE products SET price=99 WHERE id=101")
+search_index.put("/products/101", {"price": 99})
+```
 
-#### 1. Stream-Stream Join (Windowed Join)
-- *Scenario:* Joining an ad-impression stream with an ad-click stream to calculate conversion rates.
-- *Mechanics:*
-  - A click can occur minutes after an impression.
-  - The stream processor maintains in-memory state (backed by RocksDB):
-    - When an impression arrives, buffer it in state for 1 hour.
-    - When a click arrives, search the impression state buffer. If matched, emit `(Impression + Click)` and purge state.
-  - Requires bounded event-time windows to prevent state memory from growing to infinity.
+Fails two ways: concurrent race (reverse arrival orders → permanent fork) and partial fault (crash after DB commit, before HTTP → stale index). Outbox-in-same-transaction mitigates but still needs relay; log-tailing removes app coordination entirely.
 
-#### 2. Stream-Table Join (Enrichment Join)
-- *Scenario:* Enriching a raw clickstream event with the user's demographic profile (age, country).
-- *Mechanics:*
-  - The stream processor consumes the clickstream (stream) and the user database CDC changelog (table).
-  - The CDC stream continuously updates a local in-memory RocksDB table.
-  - As clicks arrive, the engine executes a fast $O(1)$ local memory lookup against the RocksDB state store, enriching the click record in sub-millisecond time without querying the remote database.
+#### 2.2.2 Change Data Capture (p.527)
 
-#### 3. Table-Table Join (Materialized View Maintenance)
-- *Scenario:* Maintaining a materialized view of user orders and billing addresses across two continuous CDC changelogs. Both inputs are tables represented as streams, updating local join indices incrementally.
+Write only to the system of record. Debezium tails Postgres WAL / MySQL binlog at storage layer, converts committed inserts/updates/deletes into ordered Kafka events. Elasticsearch/Redis/Snowflake consume and converge. Guarantees: total order matching DB commits, crash atomicity (no half-writes), zero app race. Envelope carries `before`/`after`/`source`; schema changes must be versioned or downstream deserializers break.
 
----
+#### 2.2.3 State, streams, immutability + log compaction + event sourcing (p.532)
 
-### 2.7 Fault Tolerance & Exactly-Once Processing
-- **Delivery Guarantees Defined:**
-  - *At-Most-Once:* Messages dropped on failure; zero retries. Unacceptable for business data.
-  - *At-Least-Once:* Messages retried until acknowledged. Prone to duplicate processing (e.g., charging credit cards twice).
-  - *Effectively-Once (Exactly-Once):* The final state after recovery is mathematically identical to an execution where every event was processed exactly once.
-- **The Chandy-Lamport Distributed Snapshot Algorithm (Apache Flink):**
-  - Rather than pausing stream processing, the engine injects special **Checkpoint Barrier** markers into the message stream at the sources.
-  - As barriers flow through the DAG operators alongside data records:
-    1. An operator aligns barriers from all input channels.
-    2. The operator pauses processing on aligned channels, writes a snapshot of its local state (e.g., RocksDB memtable) to distributed cloud storage (S3/HDFS), and forwards the barrier downstream.
-    3. Processing resumes immediately.
-  - *Recovery:* On worker crash, all operators in the DAG roll back their local state to the latest globally completed checkpoint, and message brokers reset source offsets to the corresponding checkpoint barrier.
-- **End-to-End Exactly-Once Invariant:**
-  - Requires three coordinated layers:
-    1. *Replayable Source:* Log-based broker (Kafka) that can rewind offsets.
-    2. *Deterministic Stateful Processing:* Checkpointed state snapshots (Flink).
-    3. *Idempotent or Two-Phase Commit Sink:* Sinks must either support natural idempotency (`UPSERT` by primary key) or implement Two-Phase Commit (Kafka Transactions via `KafkaProducer.sendOffsetsToTransaction()`).
+Duality:
+
+```text
+Table = integral of stream over time
+Stream = derivative of table over time
+```
+
+Table = snapshot; stream = history. **Log compaction:** normal retention drops old segments after days; compacted topics keep at least the latest value per key, dropping overwritten versions during segment merges, purging deletes via tombstones (`key=K, value=null`). New consumer replays from 0 and rebuilds current table without touching the primary. **Event sourcing:** store every state change as immutable events; current state by replay; audit/free schema evolution by reprocessing. Immutability gives deterministic retry and time travel.
+
+### 2.3 Processing Event Streams — Uses, Time, Joins, Fault Tolerance (p.537)
+
+#### 2.3.1 Uses of stream processing (p.538)
+
+Fraud scoring, live dashboards, CDC-driven search/caches/warehouses, notifications, ML feature pipelines, IoT rollups — anywhere reaction can't wait for the daily batch and where the log is also the audit trail.
+
+#### 2.3.2 Reasoning about time — event vs. processing, watermarks, windows (p.542)
+
+- **Event time** = when it happened on device (payload timestamp). **Processing time** = when server handles it (local clock).
+- Processing-time windows lie under delay: subway-tunnel phones buffer 30 min, flush in 2 s → one 1-min window spikes, prior windows empty. Business metrics must window by event time.
+- Out-of-order arrivals force heuristics. For window `[12:00,12:05)` you never know all events arrived. **Watermark** = "we believe all events ≤ tw observed". `W(t) = max observed event time − bounded lateness`. Late policy: drop, or update/retract (Flink side outputs, changelog retractions).
+- Windows: **tumbling** (fixed non-overlapping, e.g., 5-min; exactly one window per event), **hopping/sliding** (fixed overlapping, e.g., 5-min every 1-min → 5 windows per event, smooth rollups, 5x state), **session** (activity bursts until gap timeout e.g., 30 min; per-user, retroactive merges on late arrivals), **global** (infinite, custom triggers).
+
+Worked watermark: 5-min tumbling `[12:00,12:05)`, 2-min allowance. A(12:03:00) → W=12:01:00 accumulate; B(12:04:30) → W=12:02:30 accumulate; C(12:07:00) → W=12:05:00 ≥ window end → emit 150, close; D(12:03:30) arriving 12:08:15 has event time < W → late → side output/retraction (150→225).
+
+| Window | Bounds | Overlap | State | Late hit | Fit |
+| :--- | :--- | :--- | :--- | :--- | :--- |
+| **Tumbling** | Fixed consecutive | Zero | Low | Drop/side | Billing, telemetry means |
+| **Hopping** | Length + hop | duration/hop | High | Hits many slices | Rolling errors, moving averages, SLAs |
+| **Session** | Gap timeout | Zero per user | Timers/user | Merges sessions | Click paths, carts |
+| **Global** | Infinite | N/A | Unbounded w/o purge | Trigger logic | Thresholds, anomaly counts |
+
+#### 2.3.3 Stream joins — expanded (three join types the book demands)
+
+Stream joins are stateful lookups over time, not one-shot hash builds. All need bounds or state grows forever.
+
+**1. Stream–stream (windowed) join.** Ad impressions × clicks for conversion. Click may lag impression minutes. Engine buffers impressions in RocksDB for 1 h; on click arrival probes buffer, emits joined pair, purges. Requires event-time window bound + watermark expiry, else infinite retention. Symmetric: either side buffers until mate or timeout. Late mate → side output.
+
+**2. Stream–table (enrichment) join.** Clickstream × user-profile CDC table. CDC stream maintains local RocksDB replica; each click does O(1) local lookup for age/country/tier, no remote DB call, sub-ms. Handles slowly changing dimensions; must version lookups temporally or a late click enriches with the wrong era's profile.
+
+**3. Table–table / stream–table temporal join (materialized-view maintenance).** Two CDC changelogs (orders + addresses) incrementally maintain a joined view. Each input is a table-as-stream; engine keeps join indices per key and emits upserts/retractions on either side's change. Temporal variant: `FOR SYSTEM_TIME AS OF click.event_time` picks the dimension version valid at that moment — fixes retroactive enrichment errors.
+
+| Join | Left | Right | State | Expiry | Pitfall |
+| :--- | :--- | :--- | :--- | :--- | :--- |
+| **Stream–stream** | Impressions | Clicks | Both buffers | Window + watermark | Unbounded without bound |
+| **Stream–table** | Clicks | CDC profile replica | Table replica | Compacted, versioned | Wrong-era enrichment |
+| **Table–table / temporal** | Orders CDC | Addresses CDC | Dual indices | Tombstone purge | Retraction storms |
+
+#### 2.3.4 Fault tolerance — checkpoints, savepoints, exactly-once, idempotence (p.550)
+
+Guarantees: **at-most-once** (drop on fail — unacceptable), **at-least-once** (retry → duplicates — double charges), **effectively/exactly-once** (post-recovery state identical to once). Flink's Chandy-Lamport barriers: sources inject checkpoint barriers; operators align barriers, snapshot RocksDB to S3/HDFS, forward barrier, resume — no global pause. Recovery rolls all operators to last complete checkpoint and rewinds Kafka offsets to barrier positions. Spark microbatch gets the same via deterministic RDD lineage recompute at 500–2000 ms granularity vs. Flink's 10–50 ms per-record.
+
+End-to-end exactly-once needs three legs: replayable source (Kafka rewind), deterministic checkpointed processing, idempotent/transactional sink (`UPSERT` by PK or Kafka transactions `sendOffsetsToTransaction`). Without the sink, "exactly-once processing" still double-writes.
 
 ---
 
@@ -160,21 +137,65 @@ Stream processing supports three fundamental join topologies:
 >
 > | Book Fig | PDF page | What to compare |
 > |---|---|---|
-> | Fig 12-1 | PDF p.517 | Load-balance vs fan-out |
+> | Fig 12-1 | PDF p.516 | Load-balance vs fan-out |
 > | Fig 12-2 | PDF p.518 | Crash redelivery m3 |
 > | Fig 12-3 | PDF p.520 | Partition append/consume |
 > | Fig 12-4 | PDF p.526 | Concurrent item update |
 > | Fig 12-5 | PDF p.527 | DB CDC propagation |
-> | Fig 12-6 | PDF p.529 | Stream processor |
+> | Fig 12-6 | PDF p.529 | Compaction mew/purr |
 > | Fig 12-7 | PDF p.533 | State vs stream |
-> | Fig 12-8 | PDF p.544 | Processing-time windows |
+> | Fig 12-8 | PDF p.543 | Processing-time windows |
 
+### Figure 12-1: Load Balancing vs. Fan-Out (PDF p.516)
+- **Figure Reference:** `Figure 12-1: (a) Load balancing shares work among consumers; (b) fan-out delivers each message to multiple consumers`
+- **Original PDF:** Fig 12-1 → PDF p.516
+- **Mermaid:**
 
-### Figure 12-3: Partitioned Log-Based Message Broker (Kafka Architecture)
-- **Figure Reference:** `Figure 12-3: Producers append to a topic partition file; consumers sequentially read via offsets (reconstructed from text p. 453)`
-- **Original PDF:** Fig 12-3 → PDF p.520 — open the PDF at page 520 to compare with the Mermaid reconstruction below.
-- **Visual Flow & Description:** Shows a topic partitioned across 3 append-only disk files. Producers append messages with monotonic offsets. Independent Consumer Groups read from partitions at their own pace, maintaining independent offset pointers.
-- **Mermaid Flowchart:**
+```mermaid
+flowchart LR
+  subgraph LB["(a) Load Balancing"]
+    direction TB
+    Q["Queue: m1 m2 m3"]
+    C1["Consumer 1<br/>gets m1"]
+    C2["Consumer 2<br/>gets m2"]
+    C1b["Consumer 1<br/>gets m3 later"]
+    Q --> C1
+    Q --> C2
+    Q -.-> C1b
+  end
+  subgraph FO["(b) Fan-Out"]
+    direction TB
+    T["Topic: m1 m2 m3"]
+    G1["Group A<br/>all msgs"]
+    G2["Group B<br/>all msgs"]
+    T --> G1
+    T --> G2
+  end
+```
+
+### Figure 12-2: Redelivery Scrambles Order (PDF p.518)
+- **Figure Reference:** `Figure 12-2: Consumer 2 crashes while processing m3, redelivered to consumer 1 after m4`
+- **Original PDF:** Fig 12-2 → PDF p.518
+- **Mermaid:**
+
+```mermaid
+sequenceDiagram
+  autonumber
+  participant Q as Queue (m1 m2 m3 m4)
+  participant C1 as Consumer 1
+  participant C2 as Consumer 2
+  Q->>C1: m1 (ACK, ok)
+  Q->>C2: m2/m3 (crash on m3)
+  Q->>C1: m4 (processed)
+  Note over Q,C1: m3 requeued to head
+  Q->>C1: m3 (late, after m4!) 
+  Note over C1,Q: Order now m1 m2 m4 m3
+```
+
+### Figure 12-3: Partitioned Log Broker (PDF p.520)
+- **Figure Reference:** `Figure 12-3: Producers append to partition file; consumers read via offsets`
+- **Original PDF:** Fig 12-3 → PDF p.520
+- **Mermaid:**
 
 ```mermaid
 flowchart LR
@@ -182,493 +203,314 @@ flowchart LR
     P1["Producer A"]
     P2["Producer B"]
   end
-
-  subgraph BROKER["Log-Based Broker: Topic Partition 0 (Append-Only Log File)"]
+  subgraph PART["Partition 0 (Append-Only)"]
     direction LR
-    M0["Offset 0: m0"]
-    M1["Offset 1: m1"]
-    M2["Offset 2: m2"]
-    M3["Offset 3: m3"]
-    M4["Offset 4: m4"]
-    M5["Offset 5: m5 (Latest)"]
+    M0["off 0: m0"]
+    M1["off 1: m1"]
+    M2["off 2: m2"]
+    M3["off 3: m3"]
+    M4["off 4: m4"]
+    M5["off 5: m5"]
     M0 --- M1 --- M2 --- M3 --- M4 --- M5
   end
-
-  subgraph CG1["Consumer Group 1 (Real-Time Service)"]
-    C1["Consumer 1 (Current Offset = 5)"]
+  subgraph CGS["Consumers"]
+    C1["Group1<br/>offset=5 live"]
+    C2["Group2<br/>offset=2 lagging"]
   end
-
-  subgraph CG2["Consumer Group 2 (Batch Archiver / Data Lake)"]
-    C2["Consumer 2 (Current Offset = 2)"]
-  end
-
   P1 -->|"Append"| M5
   P2 -->|"Append"| M5
-
-  M5 -.->|"Live Reads"| C1
-  M2 -.->|"Lagging Historical Reads"| C2
+  M5 -.->|"Live"| C1
+  M2 -.->|"Historical"| C2
 ```
 
-- **Key Takeaway:** Log-based brokers decouple consumers completely: fast real-time microservices and lagging batch archivers consume the exact same physical log concurrently without resource contention.
-
----
-
-### Figure 12-4: The Dual-Write Concurrency Race Condition
-- **Figure Reference:** `Figure 12-4: Concurrent dual-writes lead to permanent database and search index divergence (reconstructed from text p. 458)`
-- **Original PDF:** Fig 12-4 → PDF p.526 — open the PDF at page 526 to compare with the Mermaid reconstruction below.
-- **Visual Flow & Description:** Client 1 writes $X=A$; Client 2 concurrently writes $X=B$. Due to network latency variance, MySQL commits $X=A$ then $X=B$, while Elasticsearch commits $X=B$ then $X=A$. The two systems permanently diverge.
-- **Mermaid Sequence Diagram:**
+### Figure 12-4: Dual-Write Race (PDF p.526)
+- **Figure Reference:** `Figure 12-4: X=A then B in DB, B then A in index — permanent fork`
+- **Original PDF:** Fig 12-4 → PDF p.526
+- **Mermaid:**
 
 ```mermaid
 sequenceDiagram
   autonumber
-  actor C1 as Client 1 (Sets X = A)
-  actor C2 as Client 2 (Sets X = B)
-  participant DB as Primary Database (MySQL)
-  participant Search as Search Index (Elasticsearch)
-
-  C1->>DB: 1. UPDATE items SET val = 'A' WHERE id = 101
-  activate DB
-  Note over DB: Commits X = A
-  deactivate DB
-
-  C2->>DB: 2. UPDATE items SET val = 'B' WHERE id = 101
-  activate DB
-  Note over DB: Commits X = B (Final DB State = B)
-  deactivate DB
-
-  par Uncoordinated Network Path
-    C2->>Search: 3. PUT /items/101 {val: 'B'} arrives FIRST!
-    activate Search
-    Note over Search: Sets X = B
-    deactivate Search
-  and Delayed Network Path
-    C1-.->Search: 4. PUT /items/101 {val: 'A'} arrives SECOND (Delayed)!
-    activate Search
-    Note over Search: Overwrites with X = A! (Final Index State = A)
-    deactivate Search
-  end
-
-  Note over DB,Search: SILENT DIVERGENCE: MySQL has X='B' while Elasticsearch has X='A'!
+  actor C1 as Client 1 (X=A)
+  actor C2 as Client 2 (X=B)
+  participant DB as MySQL
+  participant ES as Elasticsearch
+  C1->>DB: UPDATE X=A (commits first)
+  C2->>DB: UPDATE X=B (commits second, B wins)
+  C2->>ES: PUT B (arrives first, B)
+  C1->>ES: PUT A (delayed, overwrites! A wins)
+  Note over DB,ES: DB=B vs ES=A — silent divergence
 ```
 
-- **Key Takeaway:** Application-level dual-writes lack a shared total order, making permanent silent state divergence an inevitable mathematical certainty under concurrency.
-
----
-
-### Figure 12-5: Change Data Capture (CDC) Architecture
-- **Figure Reference:** `Figure 12-5: Propagating committed database changes to downstream systems via CDC (reconstructed from text p. 459)`
-- **Original PDF:** Fig 12-5 → PDF p.527 — open the PDF at page 527 to compare with the Mermaid reconstruction below.
-- **Visual Flow & Description:** Applications write strictly to the primary database. A CDC engine tails the database transaction log, streaming ordered change events into Kafka. Consumers update Elasticsearch, caches, and analytical stores deterministically.
-- **Mermaid Flowchart:**
+### Figure 12-5: CDC Propagation (PDF p.527)
+- **Figure Reference:** `Figure 12-5: Taking DB commits and propagating via CDC to downstream`
+- **Original PDF:** Fig 12-5 → PDF p.527
+- **Mermaid:**
 
 ```mermaid
 flowchart LR
-  APP["Application Clients"] -->|"1. Exclusive Single Write"| DB[("Primary Database (PostgreSQL / MySQL)")]
-
-  subgraph STORAGE_LAYER["Database Engine Storage Internals"]
-    WAL[("Write-Ahead Log (Binlog / WAL)")]
-    DB -->|"Commits Transaction"| WAL
-  end
-
-  CDC["CDC Connector (Debezium)"] -->|"2. Tails Log Directly"| WAL
-
-  KAFKA[("Log-Based Message Broker (Kafka CDC Topic)")]
-  CDC -->|"3. Publishes Ordered Change Stream"| KAFKA
-
-  subgraph DOWNSTREAM["Derived Read Stores (Consumers)"]
-    direction TB
-    ES[("Elasticsearch (Search Index)")]
-    REDIS[("Redis (In-Memory Cache)")]
-    WH[("Snowflake / S3 (Data Lakehouse)")]
-  end
-
-  KAFKA -->|"4. Async Update"| ES
-  KAFKA -->|"4. Async Update"| REDIS
-  KAFKA -->|"4. Async Update"| WH
+  APP["App<br/>single write"] -->|"UPDATE"| DB[("Primary DB")]
+  DB -->|"commit"| WAL[("WAL / Binlog")]
+  CDC["Debezium<br/>tails log"] -->|"tail"| WAL
+  CDC -->|"ordered events"| KAF[("Kafka CDC Topic")]
+  KAF -->|"async"| ES[("Elasticsearch")]
+  KAF -->|"async"| RD[("Redis")]
+  KAF -->|"async"| WH[("Snowflake / S3")]
 ```
 
-- **Key Takeaway:** CDC establishes the primary database's commit log as the single source of truth, guaranteeing that all downstream derived stores converge to identical state without race conditions.
-
----
-
-### Figure 12-6: Log Compaction in Apache Kafka
-- **Figure Reference:** `Figure 12-6: Log compaction retains only the most recent value for each key (reconstructed from text p. 461)`
-- **Original PDF:** Fig 12-6 → PDF p.529 — open the PDF at page 529 to compare with the Mermaid reconstruction below.
-- **Visual Flow & Description:** Tracks compaction across segment files. Intermediate updates to keys (`mew`, `purr`) are discarded; only the latest value is preserved. Deleted keys are purged when tombstones expire.
-- **Mermaid Flowchart:**
+### Figure 12-6: Log Compaction (PDF p.529)
+- **Figure Reference:** `Figure 12-6: Key = cat-video ID (mew/purr); keep latest per key`
+- **Original PDF:** Fig 12-6 → PDF p.529
+- **Mermaid:**
 
 ```mermaid
 flowchart TD
-  subgraph UNCOMPACTED["Dirty Log Segment (Before Compaction)"]
+  subgraph DIRTY["Dirty Segment"]
     direction LR
-    U1["Offset 0: ('mew', v1)"]
-    U2["Offset 1: ('purr', v1)"]
-    U3["Offset 2: ('mew', v2)"]
-    U4["Offset 3: ('hiss', v1)"]
-    U5["Offset 4: ('purr', TOMBSTONE)"]
-    U6["Offset 5: ('mew', v3)"]
+    U1["off0 (mew,v1)"]
+    U2["off1 (purr,v1)"]
+    U3["off2 (mew,v2)"]
+    U4["off3 (hiss,v1)"]
+    U5["off4 (purr,tombstone)"]
+    U6["off5 (mew,v3)"]
     U1 --- U2 --- U3 --- U4 --- U5 --- U6
   end
-
-  COMPACTOR["Background Log Cleaner (Compaction Thread)"]
-
-  subgraph COMPACTED["Clean Log Segment (After Compaction)"]
+  CL["Cleaner Thread"]
+  subgraph CLEAN["Compacted"]
     direction LR
-    C1["Offset 3: ('hiss', v1)"]
-    C2["Offset 5: ('mew', v3)"]
+    C1["(hiss,v1)"]
+    C2["(mew,v3)"]
     C1 --- C2
   end
-
-  UNCOMPACTED ==> COMPACTOR
-  COMPACTOR ==> COMPACTED
-
-  NOTE["'purr' purged via tombstone; older 'mew' versions (v1, v2) deleted!"] -.-> COMPACTED
+  DIRTY ==> CL
+  CL ==> CLEAN
 ```
 
-- **Key Takeaway:** Log compaction turns an event stream into a persistent, self-healing key-value store, allowing fresh consumers to restore current application state by replaying from offset 0.
+- **Key Takeaway:** Older `mew` versions dropped; `purr` purged via tombstone; replay from 0 rebuilds table.
 
----
-
-### Figure 12-7: The Stream-Table Duality
-- **Figure Reference:** `Figure 12-7: The mathematical relationship between application state and event streams (reconstructed from text p. 464)`
-- **Original PDF:** Fig 12-7 → PDF p.533 — open the PDF at page 533 to compare with the Mermaid reconstruction below.
-- **Visual Flow & Description:** Demonstrates that a table is state integrated over time, while a stream is the continuous derivative of table mutations.
-- **Mermaid Flowchart:**
+### Figure 12-7: State vs. Stream Derivative (PDF p.533)
+- **Figure Reference:** `Figure 12-7: State differentiated by time gives stream; stream integrated gives state`
+- **Original PDF:** Fig 12-7 → PDF p.533
+- **Mermaid:**
 
 ```mermaid
 flowchart LR
-  STREAM["Event Stream:
-  [Insert Alice $50] -> [Update Alice $70] -> [Insert Bob $30]"]
-
-  subgraph INTEGRATION["Integration Over Time (Replay Log)"]
-    INT["Table = \int Stream dt"]
-  end
-
-  subgraph DIFFERENTIATION["Differentiation Over Time (CDC / Trigger)"]
-    DIFF["Stream = d(Table) / dt"]
-  end
-
-  TABLE[("Materialized Table State:
-  Alice: $70
-  Bob:   $30")]
-
-  STREAM -->|"Apply mutations sequentially"| INT
-  INT --> TABLE
-  TABLE -->|"Extract mutations via CDC"| DIFF
+  STREAM["Stream<br/>Insert Alice 50 → Update 70 → Insert Bob 30"]
+  INT["Integrate<br/>Table = ∫ Stream dt"]
+  TBL[("Table<br/>Alice 70<br/>Bob 30")]
+  DIFF["Differentiate<br/>Stream = d(Table)/dt"]
+  STREAM -->|"replay"| INT
+  INT --> TBL
+  TBL -->|"CDC"| DIFF
   DIFF --> STREAM
 ```
 
-- **Key Takeaway:** State and streams are duals: you can deterministically transform a stream into a table, and a table into a stream, bridging transactional and streaming architectures.
-
----
-
-### Figure 12-8: Processing-Time vs. Event-Time Windowing
-- **Figure Reference:** `Figure 12-8: Windowing by processing time introduces artificial spikes due to network delays (reconstructed from text p. 473)`
-- **Original PDF:** Fig 12-8 → PDF p.544 — open the PDF at page 544 to compare with the Mermaid reconstruction below.
-- **Visual Flow & Description:** Compares events generated steadily at 12:01, 12:02, and 12:03. A 5-minute network outage delays delivery. Processing-time windowing lumps all events into 12:06, whereas event-time windowing assigns them to their true historical windows.
-- **Mermaid Flowchart:**
+### Figure 12-8: Processing-Time Artifacts (PDF p.543)
+- **Figure Reference:** `Figure 12-8: Windowing by processing time introduces artifacts from delay variations`
+- **Original PDF:** Fig 12-8 → PDF p.543
+- **Mermaid:**
 
 ```mermaid
 flowchart TD
-  subgraph REALITY["Source Device Event Time (True Reality)"]
+  subgraph REAL["Source Event Time"]
     direction LR
-    E1["Event 1 (t = 12:01)"]
-    E2["Event 2 (t = 12:02)"]
-    E3["Event 3 (t = 12:03)"]
+    E1["12:01"]
+    E2["12:02"]
+    E3["12:03"]
     E1 --- E2 --- E3
   end
-
-  OUTAGE["=== 5-Minute Network Outage / Subsea Cable Glitch ==="]
-
-  subgraph PROC_TIME["Processing-Time Windowing (BROKEN)"]
+  OUT["5-min outage"]
+  subgraph BROKEN["Processing-Time (wrong)"]
     direction TB
-    W_OLD["Window 12:00-12:05: [ EMPTY ] (0 events)"]
-    W_NEW["Window 12:05-12:10: [ Event 1, Event 2, Event 3 ] (Spike: 3 events!)"]
+    W0["12:00-12:05 EMPTY"]
+    W1["12:05-12:10 has all 3 (spike)"]
   end
-
-  subgraph EVENT_TIME["Event-Time Windowing (CORRECT)"]
+  subgraph FIXED["Event-Time (correct)"]
     direction TB
-    EW_1["Window 12:00-12:05: [ Event 1, Event 2, Event 3 ] (Accurate count: 3)"]
-    EW_2["Window 12:05-12:10: [ EMPTY ] (Accurate count: 0)"]
+    V0["12:00-12:05 has all 3"]
+    V1["12:05-12:10 EMPTY"]
   end
-
-  REALITY --> OUTAGE
-  OUTAGE -.->|"Evaluated by server clock"| PROC_TIME
-  OUTAGE ==>|"Evaluated by event payload timestamps"| EVENT_TIME
+  REAL --> OUT
+  OUT -.->|"server clock"| BROKEN
+  OUT ==>|"payload timestamps"| FIXED
 ```
-
-- **Key Takeaway:** Processing-time windows are corrupted by variable network delays; reliable metrics require event-time windowing governed by watermarks.
 
 ---
 
 ## 4. Real-World Systems, Case Studies & Code Examples
 
-### 4.1 Industry Implementations & Architectural Divergence
-- **Apache Kafka & Redpanda (Log-Based Streaming Storage):** High-throughput distributed event store. Organizes partitions into segment files, enforcing sequential disk appends and zero-copy reads. Redpanda implements the Kafka protocol natively in C++ using a thread-per-core (Seastar) architecture, bypassing JVM garbage collection entirely.
-- **Apache Flink (Stateful Stream Processing):** True event-by-event stream processor (unlike Spark's microbatching). Implements the Chandy-Lamport distributed snapshotting algorithm to achieve sub-second state checkpointing and deterministic exactly-once processing. Uses embedded RocksDB for multi-gigabyte local state management.
-- **Debezium (Log-Based CDC Platform):** Built on top of Kafka Connect. Captures row-level database changes directly from transaction logs across PostgreSQL, MySQL, SQL Server, and Oracle, publishing JSON or Avro envelopes with `before`, `after`, and `source` metadata.
-- **Apache Iceberg & Delta Lake Streaming Sinks:** Modern streaming engines stream events directly into open table formats on cloud object storage (S3). Sinks execute micro-commits via atomic catalog metadata CAS updates, allowing lakehouses to act as real-time analytical repositories.
+### 4.1 Industry Implementations
+- **Kafka / Redpanda:** Segment files, sequential appends, zero-copy reads; Redpanda C++/Seastar thread-per-core, no JVM GC.
+- **Flink:** True per-record streaming, Chandy-Lamport snapshots to S3/HDFS, embedded RocksDB for GBs of window/join state, side outputs for late data.
+- **Spark Structured Streaming:** Microbatch lineage recompute, unified batch/stream code at 0.5–2 s latency cost.
+- **Debezium on Kafka Connect:** WAL/binlog → `before`/`after`/`source` envelopes for Postgres/MySQL/SQL Server/Oracle.
+- **Iceberg / Delta streaming sinks:** Micro-commits via catalog CAS, lakehouse as real-time store.
 
----
-
-### 4.2 Production Implementation: Sliding Event-Time Window Aggregator
+### 4.2 Sliding Event-Time Window Aggregator
 
 ```python
 import collections
-from typing import List, Tuple, Dict, Any, Iterator
+from typing import Dict, List, Tuple, Iterator
 
 class StreamEvent:
     def __init__(self, key: str, value: float, event_time_ms: int):
-        self.key = key
-        self.value = value
-        self.event_time_ms = event_time_ms
+        self.key = key; self.value = value; self.event_time_ms = event_time_ms
 
 class SlidingEventTimeWindowAggregator:
-    """
-    Implements a stateful sliding event-time window aggregator with watermark tracking.
-    Computes SUM(value) grouped by key over a window of size window_size_ms,
-    sliding every slide_step_ms, handling late-arriving events within allowed_lateness_ms.
-    """
-    def __init__(self, window_size_ms: int, slide_step_ms: int, allowed_lateness_ms: int):
-        self.window_size_ms = window_size_ms
-        self.slide_step_ms = slide_step_ms
+    def __init__(self, window_size_ms: int, slide_ms: int, allowed_lateness_ms: int):
+        self.window_size_ms = window_size_ms; self.slide_ms = slide_ms
         self.allowed_lateness_ms = allowed_lateness_ms
         self.watermark_ms = 0
-        # (window_start_ms, key) -> sum_value
-        self.window_state: Dict[Tuple[int, str], float] = collections.defaultdict(float)
+        self.state: Dict[Tuple[int, str], float] = collections.defaultdict(float)
 
-    def update_watermark(self, current_event_time_ms: int):
-        # Monotonic watermark tracking (assumes max delay heuristic)
-        self.watermark_ms = max(self.watermark_ms, current_event_time_ms - self.allowed_lateness_ms)
+    def process(self, e: StreamEvent):
+        self.watermark_ms = max(self.watermark_ms, e.event_time_ms - self.allowed_lateness_ms)
+        if e.event_time_ms < self.watermark_ms:
+            return []  # late beyond bound -> caller routes to DLQ/side output
+        first = ((e.event_time_ms - self.window_size_ms + self.slide_ms) // self.slide_ms) * self.slide_ms
+        out = []
+        s = max(0, first)
+        while s <= e.event_time_ms:
+            if e.event_time_ms < s + self.window_size_ms:
+                self.state[(s, e.key)] += e.value
+                out.append((s, s + self.window_size_ms, e.key, self.state[(s, e.key)]))
+            s += self.slide_ms
+        return out
 
-    def process_event(self, event: StreamEvent) -> List[Tuple[int, int, str, float]]:
-        """Processes an incoming event and updates matching overlapping sliding windows."""
-        self.update_watermark(event.event_time_ms)
-        
-        # Check if event is too late to be accepted
-        if event.event_time_ms < self.watermark_ms:
-            # Dropped: Late event exceeds allowed lateness bound
-            return []
-
-        # Find all sliding windows that cover this event's timestamp
-        # Window starts must satisfy: event_time - window_size < w_start <= event_time
-        # and w_start % slide_step == 0
-        first_window_start = (
-            (event.event_time_ms - self.window_size_ms + self.slide_step_ms) // self.slide_step_ms
-        ) * self.slide_step_ms
-
-        updated_windows = []
-        w_start = max(0, first_window_start)
-        while w_start <= event.event_time_ms:
-            w_end = w_start + self.window_size_ms
-            if event.event_time_ms < w_end:
-                self.window_state[(w_start, event.key)] += event.value
-                updated_windows.append((w_start, w_end, event.key, self.window_state[(w_start, event.key)]))
-            w_start += self.slide_step_ms
-
-        return updated_windows
-
-    def emit_and_purge_closed_windows(self) -> Iterator[Tuple[int, int, str, float]]:
-        """Emits and purges windows that have fallen behind the watermark."""
-        closed_keys = []
-        for (w_start, key), total in list(self.window_state.items()):
-            w_end = w_start + self.window_size_ms
-            # Window is closed if its end time plus allowed lateness is past watermark
-            if w_end <= self.watermark_ms:
-                yield (w_start, w_end, key, total)
-                closed_keys.append((w_start, key))
-                
-        for k in closed_keys:
-            del self.window_state[k]
+    def emit_closed(self) -> Iterator[Tuple[int, int, str, float]]:
+        for (s, k), tot in list(self.state.items()):
+            if s + self.window_size_ms <= self.watermark_ms:
+                yield (s, s + self.window_size_ms, k, tot)
+                del self.state[(s, k)]
 ```
 
----
-
-### 4.3 Production Implementation: Stream-Table Enrichment Joiner
+### 4.3 Stream–Table Enrichment Joiner (temporal-safe sketch)
 
 ```python
 from typing import Dict, Any, Optional
 
 class StreamTableJoiner:
-    """
-    Demonstrates a Stream-Table Join:
-    Tails a CDC changelog topic to maintain local state (the table),
-    and enriches an incoming high-velocity click event stream in real time.
-    """
     def __init__(self):
-        # In-memory representation of the database table (replicated via CDC)
-        self.user_table_state: Dict[str, Dict[str, Any]] = {}
+        self.profiles: Dict[str, Dict[str, Any]] = {}  # CDC replica
 
-    def process_cdc_event(self, cdc_payload: Dict[str, Any]):
-        """Processes database WAL mutations: INSERT, UPDATE, DELETE."""
-        op = cdc_payload["op"]  # "c" = create, "u" = update, "d" = delete
-        user_id = cdc_payload["user_id"]
-
+    def cdc(self, p: Dict[str, Any]):
+        op, uid = p["op"], p["user_id"]
         if op in ("c", "u"):
-            self.user_table_state[user_id] = cdc_payload["after"]
+            self.profiles[uid] = p["after"]
         elif op == "d":
-            self.user_table_state.pop(user_id, None)
+            self.profiles.pop(uid, None)
 
-    def process_click_event(self, click_event: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-        """Enriches an incoming click event with user demographic metadata."""
-        user_id = click_event["user_id"]
-        user_profile = self.user_table_state.get(user_id)
-
-        enriched_event = dict(click_event)
-        if user_profile:
-            enriched_event["user_age"] = user_profile.get("age")
-            enriched_event["user_country"] = user_profile.get("country")
-            enriched_event["user_tier"] = user_profile.get("membership_tier")
-        else:
-            enriched_event["user_age"] = None
-            enriched_event["user_country"] = "UNKNOWN"
-            enriched_event["user_tier"] = "STANDARD"
-
-        return enriched_event
+    def enrich(self, click: Dict[str, Any]) -> Dict[str, Any]:
+        prof = self.profiles.get(click["user_id"], {})
+        return {**click,
+                "user_age": prof.get("age"),
+                "user_country": prof.get("country", "UNKNOWN"),
+                "user_tier": prof.get("membership_tier", "STANDARD")}
+# Production hardening: version profiles by commit ts and join
+# FOR SYSTEM_TIME AS OF click.event_time for temporal correctness.
 ```
 
----
+### 4.4 Backpressure / Load-Shedding Wrapper (reactive-streams style)
 
-### 4.4 Production War Story: The Dual-Write Inventory Catastrophe
-- **The Context:** A major omnichannel retail brand operated an online flash-sale portal. When an order was placed, the application service updated the primary PostgreSQL inventory database and immediately published an event to a RabbitMQ queue to alert the warehouse dispatch system.
-- **The Pathological Incident:** During a Black Friday flash sale for high-end gaming consoles ($1,000\ \text{consoles in stock}$), the database server experienced a transient 15-second write lock stall due to a foreign-key deadlock.
-- **The Dual-Write Failure:**
-  - The application executed the PostgreSQL transaction: `UPDATE inventory SET stock = stock - 1 WHERE item_id = 99`. The database transaction committed.
-  - However, immediately after the database commit, the application container encountered an Out-Of-Memory (OOM) `SIGKILL` before its thread could invoke `channel.basicPublish()` to RabbitMQ.
-  - The inventory was decremented in PostgreSQL, but **zero message was published to the warehouse queue**.
-  - Concurrently, for other transactions, the application successfully published to RabbitMQ, but the database connection timed out; the application returned an error to the user, yet the warehouse received the dispatch message and shipped products without charging the customer!
-- **The Disaster:** Over 350 consoles were physically shipped from warehouses without matching financial records, while 200 legitimate purchasing customers had their money debited but never received tracking numbers, resulting in a \$350,000 inventory write-down.
-- **Remediation & Architecture Lessons:**
-  1. *Eliminate Dual-Writes via the Transactional Outbox Pattern:* Rewrote the service to store outgoing events inside an `outbox` table within the **exact same database transaction** that decrements inventory.
-  2. *Deploy Log-Based CDC:* Deployed Debezium to read the PostgreSQL WAL directly, streaming outbox events to Apache Kafka with guaranteed at-least-once delivery, eliminating application-level dual-write coordination forever.
+```python
+import queue
+from typing Callable if False else None
+class BoundedProcessor:
+    """Demand-driven handoff: bounded queue + drop-to-side-output."""
+    def __init__(self, maxsize: int = 10000):
+        self.q: queue.Queue = queue.Queue(maxsize=maxsize)
+        self.dropped = 0
+
+    def on_event(self, e, side_output: list) -> bool:
+        try:
+            self.q.put_nowait(e)
+            return True
+        except queue.Full:
+            # Load shedding: preserve availability, audit loss
+            self.dropped += 1
+            side_output.append(e)
+            return False
+```
+
+### 4.5 War Story: Dual-Write Flash Sale (€350k Lesson)
+
+Postgres decrement + RabbitMQ publish per order. Deadlock stalls DB 15 s; one container OOMs after commit before publish → warehouse never ships but money taken (200 customers). Other path publishes but DB times out → ships without charge (350 consoles). Fix: transactional outbox in same DB txn + Debezium WAL → Kafka at-least-once; warehouse consumes idempotently. No app-level dual coordination ever again.
 
 ---
 
 ## 5. Architectural Trade-Off Matrix
 
-| Streaming Architecture / Component | Latency Profile | Fault Tolerance & Replayability | Ordering Guarantees | Memory & Fan-Out Scalability | Best Workload Fit | Catastrophic Failure Mode |
-| :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- |
-| **Traditional Broker (RabbitMQ / SQS)** | Sub-millisecond (Pushed directly to active sockets) | **Poor** (Messages deleted upon ACK; no historical replay) | **Destroyed on Redelivery** (Failed message redelivered out of order) | **Poor** (Unread messages saturate broker RAM buffers) | Task queues; asynchronous RPC dispatch; discrete job distribution | Lagging consumers saturate broker RAM, stalling entire queue |
-| **Log-Based Broker (Apache Kafka / Pulsar)** | Low ($5\text{--}20\ \text{ms}$; bounded by sequential disk write & page cache) | **Optimal** (Persistent disk retention; replayable from offset 0) | **Strict Total Order** per partition | **Infinite Fan-Out** (Zero broker memory cost per consumer group) | Event sourcing; stream processing; Change Data Capture (CDC) | Slow consumer group triggers storage exhaustion if retention long |
-| **Change Data Capture (Debezium + Kafka)** | Low ($20\text{--}100\ \text{ms}$ lag behind DB commit) | **Optimal** (Tails durable DB WAL; zero lost transactions) | **Strict Total Order** matching database transactions | Decoupled (Consumers read from Kafka, not DB) | Keeping caches, search indexes, and data warehouses in sync | Schema alterations in database break downstream consumer deserializers |
-| **Event-Time Stream Processor (Apache Flink)** | True Streaming ($10\text{--}50\ \text{ms}$ continuous processing) | **Effectively-Once** (Chandy-Lamport state snapshots to S3) | Preserved via watermarks and event timestamps | **High** (RocksDB off-heap state holds terabytes of window state) | Stateful fraud detection; complex event-time aggregations; streaming joins | Unbounded out-of-order delay causes state buffer OOM exhaustion |
-| **Microbatch Stream Processor (Spark Streaming)** | Moderate ($500\text{--}2,000\ \text{ms}$ microbatch intervals) | **Effectively-Once** (Deterministic RDD lineage recomputation) | Preserved within microbatch boundaries | Moderate (Buffers microbatch partitions in JVM RAM) | High-throughput streaming ETL; unifying batch and stream codebases | Microbatch scheduling latency too slow for sub-second reactive alerting |
-
----
-
-### Concrete Decision Heuristics
+| Component | Latency | Replay | Order | Fan-out / memory | Fit | Fails when |
+| :--- | :--- | :--- | :--- | :--- | :--- | :--- |
+| **RabbitMQ / SQS** | Sub-ms push | None (deleted) | Scrambled on retry | RAM per unacked | Task queues, RPC | Lag pages broker to death |
+| **Kafka / Pulsar** | 5–20 ms disk+cache | From 0 | Per-partition total | Infinite groups, zero-copy | Sourcing, CDC, streams | Retention exhausts disk |
+| **Debezium CDC** | 20–100 ms behind commit | WAL-anchored | DB commit order | Decoupled via Kafka | Sync caches/index/warehouse | Schema change breaks serde |
+| **Flink event-time** | 10–50 ms streaming | Checkpoints to S3 | Watermarks | RocksDB TBs state | Fraud, windows, joins | Unbounded lateness OOMs |
+| **Spark microbatch** | 0.5–2 s batches | Lineage recompute | Per-batch | JVM buffers | ETL, unified code | Too slow for reactive alerts |
 
 ```text
-Decision Tree for Stream Architecture:
-1. Does the application require keeping derived stores (Elasticsearch, Redis, Snowflake) in sync with an operational database?
-   ├── CRITICAL MANDATE: NEVER use dual-writes in application code!
-   └── MANDATORY ARCHITECTURE: Use Log-Based Change Data Capture (Debezium reading DB WAL into Kafka).
-2. For Event Transmission & Messaging:
-   ├── Need transient task queueing where messages are deleted immediately and ordering doesn't matter? -> Use RabbitMQ / SQS.
-   └── Need durable event logging, ordered partitions, independent consumer replay, or stream processing inputs? -> Use Apache Kafka / Redpanda.
-3. For Stream Processing Engine:
-   ├── Requires sub-100ms processing latency and complex event-time windowing? -> Use Apache Flink.
-   └── Organization already standardizes on Apache Spark and 1-second microbatch latency is acceptable? -> Use Spark Structured Streaming.
+Decisions:
+1. Sync derived stores? NEVER dual-write -> Debezium WAL -> Kafka.
+2. Messaging: transient unordered tasks -> RabbitMQ/SQS; durable ordered replay/stream inputs -> Kafka/Redpanda.
+3. Engine: sub-100ms + event-time/windows/joins -> Flink; Spark-standard + 1s ok -> Structured Streaming.
+4. Overload: bounded queues + request(n) backpressure; shed to side outputs/DLQ with audit; never grow state unbounded.
+5. Joins: stream-stream windowed with TTL; stream-table via CDC replica + temporal versioning; table-table via dual CDC + retractions.
 ```
 
 ---
 
 ## 6. Jargon Buster & Key Terminology
 
-- **Stream Processing:** The continuous, real-time computation and transformation of unbounded, append-only datasets as events arrive.
-- **Event:** A small, self-contained, immutable data record detailing a discrete business occurrence at a specific point in physical time.
-- **Change Data Capture (CDC):** An architectural technique that extracts row-level data modifications directly from a database's transaction write-ahead log and streams them as ordered events.
-- **Log Compaction:** A storage optimization in log-based brokers where old segments are cleaned to retain strictly the most recent value for each primary key, discarding overwritten records.
-- **Tombstone:** A message with a valid key and a `null` payload published to a compacted topic to indicate that the key has been deleted.
-- **Stream-Table Duality:** The fundamental mathematical property that a table is state integrated over time, and a stream is the continuous derivative of table mutations.
-- **Event Time:** The timestamp when an event originally occurred on the producer client device, recorded inside the event payload.
-- **Processing Time:** The timestamp when a stream processing server receives and executes logic on an event, determined by local server clocks.
-- **Watermark:** A temporal heuristic flowing through a stream processor indicating that no further events with event time $\le t_w$ are expected to arrive.
-- **Tumbling Window:** A fixed-length, contiguous, non-overlapping time window where every event belongs to exactly one window.
-- **Chandy-Lamport Algorithm:** A distributed snapshot protocol that injects checkpoint barriers into event streams to capture global consistent state across operators without pausing stream execution.
+- **Stream processing:** Continuous computation over unbounded append-only events.
+- **Event:** Immutable fact at a physical time.
+- **Traditional vs. log-based broker:** Delete-on-ACK queues vs. partitioned durable logs with consumer offsets.
+- **Partition / offset:** Shard of a topic; monotonic seq per partition; parallelism + order unit.
+- **Consumer group / load balancing vs. fan-out:** Share partitions for scale vs. each group gets all messages.
+- **Change Data Capture (CDC):** WAL/binlog tailing (Debezium) into ordered Kafka topics; `before`/`after` envelopes.
+- **Dual-write hazard:** App writes two systems → race + partial-fault divergence.
+- **Log compaction / tombstone:** Keep latest per key, drop overwrites, purge deletes via null; replay rebuilds table.
+- **Stream-table duality:** Table = ∫ stream; stream = d(table)/dt.
+- **Event sourcing:** Persist events, derive state by replay.
+- **Event time / processing time:** Device occurrence vs. server handling; only event time is truthful under delay.
+- **Watermark:** "No events ≤ tw expected"; bounded lateness; triggers window close.
+- **Tumbling / hopping / session / global windows:** Non-overlapping fixed; overlapping fixed; gap-based dynamic; infinite+trigger.
+- **Stream–stream / stream–table / table–table (temporal) joins:** Windowed buffering; CDC-replica enrichment; dual-changelog view maintenance with retractions.
+- **Backpressure / load shedding / reactive streams:** Demand signaling (`request(n)`), deliberate drop/sample to DLQ, bounded state.
+- **Checkpoint barrier / savepoint:** Chandy-Lamport markers snapshotting RocksDB to durable store without pausing.
+- **At-most/at-least/effectively-once:** Drop; retry-duplicate; checkpoint+replay+idempotent/transactional sink equivalence.
+- **Idempotent sink / transactions:** `UPSERT` by PK or `sendOffsetsToTransaction` for end-to-end exactly-once.
 
 ---
 
 ## 7. System Design & Practical Engineering Takeaways
 
 ### 7.1 Production Engineering Checklist
-1. **Never Execute Application-Level Dual-Writes:** Always implement the Transactional Outbox pattern or log-based CDC (Debezium) to synchronize databases with message queues and search indexes.
-2. **Always Window Streaming Aggregations by Event Time:** Never use processing time for business metrics; network latency, mobile offline buffering, and consumer restarts corrupt processing-time windows.
-3. **Configure Partition Keys to Preserve Causal Ordering:** In Apache Kafka, always set the message key to the entity ID (e.g., `user_id` or `order_id`). Kafka guarantees strict ordering **only within a single partition**; records sharing the same key land on the same partition.
-4. **Implement Allowed Lateness and Dead-Letter Sinks for Late Events:** When configuring watermarks, define an explicit `allowedLateness` threshold. Late-arriving events exceeding this threshold must be routed to a dead-letter queue (DLQ) for audit rather than silently dropped.
-5. **Tune Kafka Consumer `max.poll.interval.ms` to Prevent Rebalance Storms:** Ensure `max.poll.interval.ms` is significantly larger than the maximum time a consumer thread takes to process a batch of records. Exceeding this threshold causes the broker to presume the consumer dead, triggering continuous cluster-wide rebalancing storms.
-
----
+1. **Never dual-write:** Outbox or Debezium WAL → Kafka; key by entity ID for order.
+2. **Window by event time,** bound lateness explicitly, route late to DLQ/side output — never silently drop.
+3. **Bound all state:** Window TTLs, compaction + tombstones, RocksDB capacity planning; backpressure + shedding under burst.
+4. **Version temporal joins:** `FOR SYSTEM_TIME AS OF` enrichment; emit retractions on dimension change.
+5. **Tune consumer liveness:** `max.poll.interval.ms` >> max batch processing time or face rebalance storms.
+6. **Close the exactly-once loop:** Replayable source + checkpointed engine + idempotent/transactional sink together.
 
 ### 7.2 System Design Interview Strategy
-- **Advocate for the Stream-Table Duality:** In system design interviews (e.g., designing real-time ride-sharing matching, fraud detection, or newsfeed ranking), show Staff-level maturity by invoking the duality: *"We will model user location updates as an append-only event stream, and project them into an in-memory materialized table using log compaction for sub-millisecond driver lookup."*
-- **Attack Dual-Writes Proactively:** When an interviewer asks *"How do you update the cache after saving to MySQL?"*, immediately point out the race condition and partial failure risks of dual-writes, and propose CDC via Debezium: *"Dual-writes guarantee divergence under network partitions. We will write to MySQL, capture the binlog with Debezium, and stream CDC mutations to Kafka to asynchronously update Redis."*
-- **Capacity Sketching for Kafka Partitions:**
-  $$\text{Required Partitions} = \max\left( \frac{\text{Target Write Throughput (MB/s)}}{\text{Single-Partition Write Bandwidth (e.g., 10 MB/s)}}, \frac{\text{Target Read Throughput (MB/s)}}{\text{Single-Consumer Processing Bandwidth (e.g., 5 MB/s)}} \right)$$
-
----
+- Open by killing dual-writes: draw Fig 12-4 race, replace with Fig 12-5 CDC total order.
+- Invoke duality: "Locations as stream, driver lookup as compacted table for ms reads."
+- Partition math: `partitions = max(write_TP/single-partition BW, read_TP/single-consumer BW)`; scale partitions for parallelism, keys for order.
+- Name the join: "Impression×click windowed stream–stream with 1 h TTL; clicks×profiles stream–table via CDC replica; orders×addresses table–table with retractions."
 
 ### 7.3 Mastery Self-Assessment Questions
 
-#### Question 1 (Conceptual Depth)
-*Why does a traditional message broker (RabbitMQ) lose total message ordering when multiple consumers read from a shared queue concurrently, and how does a log-based broker (Kafka) guarantee strict message ordering while scaling read throughput across multiple consumers?*
-- **Answer:** 
-  A **traditional message broker** implements a shared queue model where multiple consumer threads pull messages concurrently (load balancing, Figure 12-1a). Message $M_1$ goes to Consumer 1, $M_2$ goes to Consumer 2, and $M_3$ goes to Consumer 3. If Consumer 2 encounters a transient error, network glitch, or slow dependency, it sends a negative acknowledgment (`NACK`) or its visibility timeout expires. The broker re-inserts $M_2$ at the head of the queue. However, by that time, Consumer 3 has already processed and committed message $M_3$. Message $M_2$ is processed *after* $M_3$, completely scrambling the original causal sequence. Traditional message brokers cannot maintain ordering under concurrent multi-consumer execution.
-  A **log-based message broker** (Kafka) guarantees strict ordering by **partitioning the log and enforcing the single-consumer-per-partition invariant**. Within a Consumer Group:
-  1. Each partition is assigned to **exactly one consumer thread**.
-  2. The consumer reads messages sequentially in strict append order, advancing its offset monotonically ($0, 1, 2, 3, \dots$).
-  3. Messages sharing the same business key (e.g., `user_id = 42`) are guaranteed to hash to the exact same partition (`hash(key) % num_partitions`).
-  4. Consequently, all mutations for user 42 are processed in strict sequential order by a single consumer thread.
-  To scale throughput, the cluster simply adds more partitions: a topic with 64 partitions can be processed in parallel by 64 independent consumer threads across a fleet of machines, combining parallel scale with strict per-entity causal ordering.
+#### Question 1 (Conceptual)
+*Why does RabbitMQ lose order with concurrent consumers while Kafka keeps per-entity order at scale?*
+- **Answer:** Shared-queue pull assigns M1→C1, M2→C2, M3→C3. C2 NACK/timeout requeues M2 at head after M3 committed — M2 after M3 forever. Kafka assigns each partition to exactly one thread in a group, reads offsets monotonically, colocates same key via `hash(key)%N` — per-entity serialization + partition-count parallelism.
 
-#### Question 2 (Failure Scenario & Edge Cases)
-*An engineering team implements an event-time hourly analytics pipeline in Apache Flink: `clicks.keyBy("ad_id").window(TumblingEventTimeWindows.of(Time.hours(1))).sum("count")`. The watermark is configured as `BoundedOutOfOrderness(Time.minutes(5))`. At 12:00:00, a mobile carrier experiences a transient 45-minute cellular tower failure affecting 50,000 mobile devices. The devices buffer click events locally and flush them at 12:45:00. Describe the exact fate of these 50,000 events, explain the resulting data corruption, and specify the architecture to recover accurate metrics.*
-- **Answer:**
-  - *The Fate of the Events:*
-    - The events generated between 12:00:00 and 12:05:00 carry event timestamps $\approx 12:02:00$.
-    - However, other devices on non-impacted networks continued transmitting events normally throughout the hour.
-    - By 12:10:00, Flink had observed events with event time 12:10:00. The watermark progressed:
-      $$\text{Watermark} = 12:10:00 - 5\ \text{minutes} = 12:05:00$$
-    - Because the watermark crossed 12:00:00 (the end of the 11:00--12:00 window) and 12:05:00, the 11:00--12:00 window was formally closed, evaluated, and purged from Flink's RocksDB state.
-    - When the 50,000 buffered events arrive at 12:45:00, their event timestamps are $\approx 12:02:00$.
-    - Flink compares the event timestamps against the current watermark ($12:45:00 - 5\ \text{min} = 12:40:00$).
-    - Because $12:02:00 < 12:40:00$, the events are classified as **Late Events Beyond Allowed Lateness** and are **unconditionally dropped and discarded**.
-  - *Data Corruption:* The ad impressions and clicks from those 50,000 mobile users are permanently omitted from daily billing reports, causing a massive under-counting of advertiser revenue.
-  - *Architectural Recovery:*
-    1. *Side Outputs (Dead-Letter Retraction):* Configure Flink's `sideOutputLateData(lateTag)` to capture dropped events into a separate dead-letter Kafka topic rather than discarding them.
-    2. *Lambda / Kappa Replay Architecture:* Because Kafka retains raw event logs for 14 days, the engineering team can launch a secondary batch or catch-up streaming job that processes the historical topic with an expanded lateness bound (or re-aggregates using Apache Spark), emitting an incremental correction/retraction update to the downstream billing data warehouse.
+#### Question 2 (Failure)
+*Flink hourly tumbling + 5-min bounded lateness; 50k phones offline 45 min (12:00–12:45), events ~12:02 flushed 12:45. Fate? Fix?*
+- **Answer:** Non-impacted traffic advances watermark past 12:05 by 12:10; 11–12 window closed/purged. 12:45 watermark ≈12:40; 12:02 < watermark → late beyond allowance → dropped. Billing undercounts. Fix: `sideOutputLateData` to dead-letter Kafka + Lambda/Kappa replay from 14-day Kafka retention with wider lateness, emitting corrections/retractions to warehouse.
 
-#### Question 3 (Trade-Off & Capacity Estimation)
-*An e-commerce platform processes 10,000 orders per second. An architect evaluates two approaches to maintain a real-time Redis cache and an Elasticsearch search index: (A) Application-Level Dual-Writes with 3 HTTP/TCP calls per transaction (MySQL commit + Redis write + Elasticsearch write), vs. (B) Log-Based Change Data Capture (Debezium + Kafka) streaming changes asynchronously to Redis and Elasticsearch consumers. Calculate: (A) The p99 latency amplification and failure probability imposed on the checkout API under dual-writes assuming each external service call has a 99th percentile latency of 15 ms and a 0.1% independent transient network error rate, vs. (B) The latency and fault-isolation profile under CDC. Show exact derivations.*
-- **Answer:**
-  - *Approach A: Application-Level Dual-Writes*
-    - The checkout web server must execute 3 sequential or parallel external network operations for every single customer order:
-      1. MySQL commit ($p = 0.001$ error rate, $p99 = 15\ \text{ms}$).
-      2. Redis cache write ($p = 0.001$ error rate, $p99 = 5\ \text{ms}$).
-      3. Elasticsearch document index ($p = 0.001$ error rate, $p99 = 25\ \text{ms}$).
-    - *Failure Probability per Transaction:*
-      - If each operation has an independent failure probability $p = 0.001$:
-        $$P(\text{success}) = (1 - 0.001)^3 = (0.999)^3 \approx 0.997003$$
-        $$P(\text{failure}) = 1 - P(\text{success}) \approx \mathbf{0.003} \ (0.3\%)$$
-      - At $10,000\ \text{orders/sec}$, an error rate of $0.3\%$ results in:
-        $$\text{Failed/Inconsistent Orders} = 10,000 \times 0.003 = \mathbf{30\ orders\ per\ second!}$$
-        Every second, 30 orders encounter partial failures where MySQL commits but Redis or Elasticsearch fails, creating catastrophic state divergence.
-    - *p99 Latency Amplification:*
-      - If executing in parallel, the total client response time is bounded by the **slowest of the 3 calls**.
-      - The probability that *at least one* call experiences its tail latency ($p99$) is:
-        $$P(\text{slow}) = 1 - (1 - 0.01)^3 = 1 - (0.99)^3 \approx \mathbf{2.97\%}$$
-      - The checkout API's observed p99 response time spikes to $\approx \mathbf{25\text{--}35\ \text{ms}}$ because it is tethered to Elasticsearch's search cluster I/O.
-  - *Approach B: Log-Based CDC (Debezium + Kafka)*
-    - *Checkout API Latency & Reliability:*
-      - The checkout application executes **only 1 operation**: the MySQL database commit.
-      - Failure probability per transaction drops from $0.3\%$ to $\mathbf{0.1\%}$ ($3\times$ reduction in transaction failures).
-      - p99 checkout response time is strictly bounded by MySQL local transaction commit: $\mathbf{10\text{--}15\ \text{ms}}$ (a **$50\%\text{--}60\%$ latency reduction** for checkout users).
-    - *Downstream Isolation:*
-      - Debezium reads the MySQL binlog asynchronously off disk.
-      - If Elasticsearch experiences a 30-second GC pause or crashes completely, **the checkout API is 100% unaffected**: customers continue buying products without interruption.
-      - Events queue durably in Kafka's partitioned disk logs. When Elasticsearch recovers, the consumer catches up sequentially at line rate with zero data loss and zero dual-write race conditions.
-
+#### Question 3 (Capacity)
+*1M events/s × 500 B = 500 MB/s write; 3 consumer groups each 100 MB/s read; single-partition 10 MB/s write, 5 MB/s per consumer. Partitions? Retention disk for 7 days? Backpressure plan?*
+- **Answer:** Write needs 500/10=50; reads need (3×100)/5=60 → max 60 partitions (round to 72 for balance). Storage: 500 MB/s × 604800 s ≈ 302 TB before replication/compaction — provision accordingly or shorten retention + tier to S3. Backpressure: bounded Flink queues with `request(n)`, Kafka absorbs bursts, shed expired windows to side outputs, alert on consumer lag, scale partitions/consumers before `max.poll.interval` fires.
 
 ---
 > [!NAV] **Chapter Navigation**

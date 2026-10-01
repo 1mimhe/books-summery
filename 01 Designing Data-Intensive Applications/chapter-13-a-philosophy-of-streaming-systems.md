@@ -1,1256 +1,704 @@
 # Chapter 13: A Philosophy of Streaming Systems — Definitive Technical Summary
+*From: Designing Data-Intensive Applications (2nd Edition) by Martin Kleppmann and Chris Riccomini*
+*Source PDF: pp. 563–608 (673-page PDF) — figures below cite PDF pages.*
+
 > [!NAV] **Chapter Navigation**
 > ⬅️ **Previous:** [[chapter-12-stream-processing|Chapter 12: Stream Processing]] | 🏠 **Index:** [[00-Master-Reading-Dashboard|Master Dashboard]] | ➡️ **Next:** [[chapter-14-doing-the-right-thing|Chapter 14: Doing the Right Thing]]
-
-
-> *"If a thing be ordained to another as to its end, its last end cannot consist in the preservation of its being. Hence a captain does not intend as a last end, the preservation of the ship entrusted to him, since a ship is ordained to something else as its end, viz. to navigation. (Often quoted as: If the highest aim of a captain was to preserve his ship, he would keep it in port forever.)"*
-> — St. Thomas Aquinas, *Summa Theologica* (1265–1274)
 
 ---
 
 ## 1. Executive Summary & Core Engineering Problem
 
-Throughout the study of distributed data architectures, systems engineering repeatedly encounters a core tension: specialized tools excel at narrow access patterns, yet modern applications demand combinations of capabilities that no single monolithic database can deliver. A system frequently requires sub-millisecond point lookups by primary key (LSM-tree key-value store), full-text fuzzy token search (inverted index), real-time aggregated metrics across millions of dimensions (columnar OLAP), graph traversal for social connections or fraud detection, and distributed memory caching to protect storage layers.
+> *"If the highest aim of a captain was to preserve his ship, he would keep it in port forever."*
+> — **St. Thomas Aquinas**, *Summa Theologica* (1265–1274), paraphrased epigraph of Chapter 13
 
-When architects attempt to force all of these workloads into a single "general-purpose" relational database, the engine collapses under conflicting concurrency controls, index maintenance overhead, and compromised query planners. Conversely, when engineers deploy a best-of-breed polyglot persistence architecture and synchronize disparate databases via application-level **dual writes**, the system inevitably diverges due to partial network failures, out-of-order concurrent writes, and lack of atomic distributed isolation.
+- **The Big Picture:** Chapters 4–12 gave you storage engines, replication, partitioning, transactions, batch, streams. Real apps need all of them at once: OLTP point reads, full-text search, graph traversals, caches, OLAP. Forcing everything into one monolith buckles; writing to many systems from app code causes dual-write divergence (Ch.12). This opinionated chapter proposes the unifying philosophy: **unbundle the database** — externalize the WAL, indexes, caches as streams and specialized stores wired by ordered logs.
+- **Core Thesis:** A database is a bundle: WAL for total order, secondary indexes, caches, execution engine, locks. Unbundle it across the enterprise: one durable partitioned log (Kafka) as the WAL, stream processors (Flink) as triggers/stored procedures, best-of-breed derived stores (Postgres, Elasticsearch, Redis, Snowflake/ClickHouse) as materialized views. Single ordered writes in, deterministic asynchronous derived data out. Data integration becomes dataflow reasoning, not distributed transactions.
+- **Problem Statement:** Dual-writes across Postgres + Elasticsearch + Redis fork on races and partial faults; XA/2PC across heterogeneous stores blocks on coordinators, spikes tail latency, amplifies failures. Meanwhile total-order logs don't scale trivially (single leader bottleneck, cross-region ordering, per-service state, offline clients) and causality (unfriend → message) can be lost across stores. The chapter works toward a middle ground: asynchronous derived data with stronger end-to-end guarantees.
+- **Historical Context:** Single-machine relational era → 2010s polyglot persistence without discipline → late-2010s/2020s Debezium CDC + event sourcing + Flink making unbundling practical. Saltzer-Reed-Clark end-to-end argument + stream-table duality let architects separate timeliness (lag) from integrity (invariants).
 
-```
-       Monolithic Polyglot Hazard (Dual Writes)
-       =========================================
-       Client ---> [ App Server ] --+--> (DB Primary)      [OK]
-                                    +--> (Elasticsearch)   [FAILED: Network Timeout]
-                                    +--> (Redis Cache)     [RACE: Wrote stale value]
-                                    ===> Silent Permanent State Drift!
-
-       The Unbundled Database Architecture (Derived Data Streams)
-       ===========================================================
-       Client ---> [ App Server ] ---> [ Durable Append-Only Event Log ] (Total Order)
-                                                      |
-                    +---------------------------------+--------------------------------+
-                    |                                 |                                |
-                    v (CDC Stream)                    v (CDC Stream)                   v (CDC Stream)
-            [ Secondary B-Tree ]              [ Inverted Index ]              [ Columnar OLAP ]
-             (OLTP Point Reads)                (Full-Text Search)              (Analytical Aggs)
-                    ^                                 ^                                ^
-                    +------------------ [ Reads ] ----+--------------------------------+
-```
-
-Chapter 13 synthesizes the entire discipline of distributed systems into an overarching architectural philosophy: **Unbundling the Database**. A database is not an indivisible black box; it is an integrated composition of modular primitives:
-1. A **write-ahead log (WAL)** that establishes a deterministic, total order of state changes.
-2. A collection of **materialized views and secondary indexes** optimized for specific read access patterns.
-3. A **cache invalidation engine** that keeps read-side views coherent with write-side changes.
-4. A **replication and consensus protocol** that guarantees durability and fault tolerance.
-
-By externalizing these internal database components using scalable, partitioned, append-only event logs (e.g., Apache Kafka, Apache Pulsar) and stream processors (e.g., Apache Flink), software engineers can construct an **unbundled database across the enterprise**. In this paradigm:
-- Writes enter a single, append-only, durable log that acts as the authoritative recording of intent.
-- All specialized data stores (caches, search indexes, graph databases, data warehouses) are treated as **derived data views**, maintained asynchronously and deterministically by consuming the change stream.
-- The fundamental principle of **Saltzer, Reed, and Clark's End-to-End Argument** is applied to data systems: low-level protocols (such as TCP checksums or two-phase commit coordinators) cannot guarantee application correctness; true correctness must be enforced by end-to-end request identifiers, deterministic state transformations, and continuous asynchronous verification.
-- The age-old conflation of **timeliness** (lag, recency, linearizability) and **integrity** (absence of corruption, preservation of invariants, exact reconciliation) is dismantled. Scalable distributed architectures gracefully tolerate violations of timeliness (eventual consistency) while maintaining absolute, uncompromising mathematical integrity through immutable ledgers and compensating transactions.
+| Alice (federated monolith) | Bob (unbundled dataflow) |
+| :--- | :--- |
+| "Query Postgres+Elastic+Redis live via Trino scatter-gather with 2PC writes." | "Commit once to Kafka log, stream into Postgres view + Elastic index + Redis cache. Reads hit prebuilt views." |
+| "Require linearizable reads everywhere." | "Tolerate ms lag (timeliness), never tolerate forked truth (integrity); audit continuously." |
 
 ---
 
 ## 2. In-Depth Technical Concepts & Internal Mechanics
 
-### 2.1 Data Integration: Dual Writes vs. Change Data Capture (CDC)
+### 2.1 Data Integration — Combining Specialized Tools by Deriving Data (p.563)
 
-When an application must maintain data across multiple specialized systems (e.g., PostgreSQL for transactions, Elasticsearch for search, Redis for low-latency session caching), the most common architectural mistake is **dual writes**: the application service executes an `INSERT`/`UPDATE` to PostgreSQL, and upon return, issues a corresponding write to Elasticsearch and Redis.
+No single engine covers all access patterns well — log-structured vs. B-tree vs. columnar, single-leader vs. multi-leader vs. leaderless all trade off. Even "general-purpose" databases target a pattern. Vendors won't tell you their anti-patterns; earlier chapters gave you the questions to expose them.
 
-#### The Dual-Write Catastrophe
-Dual writes fail catastrophically in two fundamental failure modes:
-1. **Partial Failures & Lack of Atomicity**: If the write to PostgreSQL succeeds, but the subsequent network call to Elasticsearch times out or fails (e.g., due to an Elasticsearch node GC pause or network partition), the two stores permanently diverge. Reversing the write via application rollback is subject to crash failure of the application server itself.
-2. **Concurrent Race Conditions (Out-of-Order Execution)**: Suppose Client A attempts to update key $K$ to value $V_1$, and Client B attempts to update key $K$ to value $V_2$ nearly simultaneously. Due to variable network transmission delays and thread scheduling:
-   - In PostgreSQL: Write $V_1$ arrives at $t_1$, Write $V_2$ arrives at $t_2$. Final state: $V_2$.
-   - In Elasticsearch: Write $V_2$ arrives at $t_1'$, Write $V_1$ arrives at $t_2'$. Final state: $V_1$.
-   The primary database and search index now reflect diametrically opposed states for key $K$, with no automated mechanism to detect or heal the silent corruption.
+Complex apps inevitably compose tools: OLTP Postgres + full-text index (Postgres FTS suffices for simple apps, specialist IR for real search; indexes are poor systems of record), plus warehouses, batch/stream processors, denormalized caches, ML ranking, notification fan-out. More representations = harder data integration.
 
-```
-DUAL WRITE RACE CONDITION
-Client A (Update K -> V1) -----\ /-----------------> DB: V1 then V2 ===> DB State = V2
-                                X
-Client B (Update K -> V2) -----/ \-----------------> ES: V2 then V1 ===> ES State = V1
-                                                     (PERMANENT SILENT DIVERGENCE)
-```
+**Reasoning about dataflows.** Be explicit: where is data written first, what derives from what, in what order? Gold pattern: write to system-of-record DB, capture changes via CDC, apply to index in log order. If CDC is the only index writer, the index is provably derived and consistent barring bugs. Letting the app write both DB and index reintroduces Fig 12-4: two clients' conflicting writes order differently in each store, neither store decides order, permanent fork. Funnel all input through one ordering point and derive the rest in that order — state-machine replication applied at enterprise scope. Whether CDC or event-sourcing log matters less than total order. Log-derived updates can be deterministic + idempotent, so recovery is easy.
 
-#### Total Order via Change Data Capture
-The solution is to establish a **single source of truth** by routing all writes to a primary log-structured system (or capturing the database's write-ahead log via CDC tools like Debezium) and publishing changes to an ordered, partitioned message log.
-- Every state mutation is assigned a monotonically increasing log offset $L_i$.
-- Secondary indexers, caches, and analytical replicas consume the log sequentially per partition.
-- Because all downstream consumers process mutations in identical total order, all derived stores converge deterministically to the identical terminal state $V_2$.
+**Derived data vs. distributed transactions.** Abstractly both aim at multi-system correctness: atomic commit vs. deterministic retry + idempotence. Difference: transactions promise read-your-writes immediately; derived data is async by default. XA has poor fault-tolerance/perf and won't be widely replaced soon. Log-based derived data is the pragmatic integration path — but "eventual consistency, deal with it" without guidance is unproductive. The rest of the chapter builds stronger guarantees atop async derivation.
 
----
+**Limits of total ordering.** Single-leader logs order trivially, but scale breaks it: single-leader throughput caps force sharded logs with ambiguous cross-shard order; multi-region needs per-DC leaders (cross-DC sync too slow); microservices isolate durable state per service (cross-service order undefined); offline-first clients see different orders than servers. Total-order broadcast = consensus; most consensus handles single-node throughput, not shared ordering work. Where no causal link exists, arbitrary order is fine; same-object updates can pin to one shard (`hash(id)`). Subtle causality hurts: unfriend then rude-message-to-remaining-friends splits friendship store vs. message store; notification join may process message before unfriend and notify the ex. This is a temporal join problem with no simple fix. Starting points: logical timestamps (total order without coordination, but out-of-order handling + metadata), log-the-read-state + reference its ID for later causal links, conflict resolution for state (not for external side effects like sends). Future app patterns may capture causality without total-order bottlenecks.
 
-### 2.2 Unbundling the Database: Composition vs. Federation
+**Batch and stream for data integration (p.568).** Goal: right data, right form, right place. Inputs → transform/join/filter/aggregate/train/evaluate → outputs. Batch + stream share principles; difference is bounded vs. unbounded inputs. Outputs are derived datasets: indexes, materialized views, recommendations, metrics. Both favor deterministic pure functions, immutable inputs, append-only outputs — functional flavor that simplifies fault-tolerance and org-wide dataflow reasoning, whether the derived data is an index, model, or cache. Sync secondary-index maintenance (like relational DBs do in-txn) is possible, but async event logs contain faults locally while 2PC aborts globally and amplifies failure. Cross-shard secondary indexes (term- vs. document-partitioned) also prefer async. Reprocessing for app evolution favors retained logs: deploy new code, replay from 0, build v2 views, cut over — batch for backfill, streams for live.
 
-Traditional database management systems (DBMS) bundle query processing, transaction management, lock orchestration, storage layout, indexing, and logging into a tightly coupled, closed environment.
+Data integration in one line: every extra representation should have exactly one ordered upstream.
 
-```
-TRADITIONAL BUNDLED DBMS:
-+-----------------------------------------------------------+
-| SQL Parser & Query Optimizer (Declarative Relational API) |
-+-----------------------------------------------------------+
-| Concurrency Control (2PL / SSI Locks & Latches)           |
-+-----------------------------------------------------------+
-| Execution Engine (Hash Joins, Nested Loops, Sort)         |
-+-----------------------------------------------------------+
-| Secondary Indexes (B-Tree, GiST, GIN, Hash)               |
-+-----------------------------------------------------------+
-| Buffer Pool Manager & In-Memory Page Cache                |
-+-----------------------------------------------------------+
-| Write-Ahead Log (WAL) & Storage Subsystem (Aries / Heap)  |
-+-----------------------------------------------------------+
-```
+#### 2.1.1 Combining Specialized Tools by Deriving Data (p.564) — CQRS, ETL/CDC, Search Index, Cache
+- **Why data integration is unavoidable:** This is a data integration chapter because no single engine serves OLTP point lookups, full-text search, graph traversals, columnar OLAP, vector similarity, and edge caching well. Data integration means mapping each workload to its best store, then wiring ordered dataflows so every copy converges. Without explicit data integration discipline, teams dual-write from app code and fork.
+- **OLTP + search (book example p.564):** Postgres handles transactions; Postgres FTS suffices for simple `LIKE`/ranking, but specialist information-retrieval (Elasticsearch/OpenSearch, Solr) wins for stemming, BM25, facets, highlighting. Search indexes are poor systems of record (no transactions, no durability story) — so data integration pairs them: Postgres as system of record, CDC log as the ordered bridge, search index as derived data. The derived data index is rebuilt by replay, never written directly.
+- **CQRS (Command Query Responsibility Segregation):** Write model (normalized OLTP) separated from read models (denormalized views per query). Each read model is derived data fed by the same log. Example: `orders` table → `orders_by_customer` materialized view, `orders_search` index, `orders_daily_revenue` cube — three derived data copies, one upstream. CQRS makes the derived-data fan-out explicit instead of hidden N+1 queries.
+- **ETL/CDC pipeline (Ch.11→12→13 thread):** Batch ETL (nightly Spark) + streaming CDC (Debezium tailing Postgres WAL → Kafka) are both data integration transports. CDC preserves commit order per shard; ETL snapshots + backfills history. Gold rule from §2.1: if CDC is the only index writer, the index is provably derived data consistent with the record — no Fig 12-4 fork. Allow app direct writes and you lose the proof.
+- **Caches as derived data:** Redis/Memcached session objects, CDN edge renders, and UI DTO aggregations are derived data too — pre-joined, TTL'd, invalidated by log offsets, not by timeouts alone. Treating cache as derived data (with upstream log + transform version + lag SLO) turns "cache invalidation is hard" into "replay the derived-data pipeline."
+- **ML/ranking/notifications as derived data:** Feature stores, embedding indexes, recommendation lists, and notification outboxes are all derived datasets subscribed to the same ordered log. Data integration therefore covers training (batch) + serving (stream) + alerting (filter) under one ordering principle.
+- **Derived data mantra (repeat for audit):** Every derived data copy declares (1) upstream log, (2) offset/LSN, (3) transform code version. Derived data without lineage is technical debt. Derived data with lineage is reprocessable, auditable, healable — the foundation for §2.6–2.7 correctness.
 
-When building large-scale, heterogeneous architectures, two competing philosophies emerge:
+#### 2.1.2 Batch and Stream Processing for Data Integration (p.568) — Bounded/Unbounded, Lambda/Kappa, Reprocessing
+- **Goal restated:** Data integration must get the right data, in the right form, to the right place. Batch processors (Spark, Flink-batch, SQL warehouses) and stream processors (Flink, Kafka Streams, Samza) are the tools; outputs are always derived data / derived datasets (indexes, views, recommendations, metrics).
+- **Bounded vs unbounded (Ch.11 vs 12):** Batch inputs are bounded (known size, finite files/tables); stream inputs are unbounded (infinite event logs). Same functional core: deterministic pure functions, immutable inputs, append-only derived data outputs. Unbounded needs managed fault-tolerant state (RocksDB checkpoints) + event-time windowing; bounded can re-sort/re-shuffle freely. Both produce derived data by replayable transforms.
+- **Lambda architecture (historical):** Speed layer (streaming, low-latency approximate derived data) + batch layer (nightly recompute, correct derived data) + merge on read. Problems [11–12]: dual codebases diverge, merge logic complex, testing doubles. Book marks it fallen out of use.
+- **Kappa architecture (recommended):** Single log + single engine (Flink/Beam/Dataflow) handles both live tail and historical replay. Reprocessing = replay retained log through new code to build v2 derived data, cut over atomically. Requires: replayable broker (Kafka retention), exactly-once stream semantics (discard partials on fail, see §2.6), event-time windowing (Beam API) so reprocessing history yields same windows as live.
+- **Reprocessing for evolution + railway gauge story (p.569 sidebar):** 19th-century England's competing rail gauges → 1846 standard gauge → dual-gauge third rail let old+new trains coexist during years-long migration; BART still nonstandard. Same for derived data: keep v1 + v2 views side-by-side on the same log, shift 1%→10%→100% traffic, drop v1. Every stage reversible; risk low, velocity high [8–10]. Without retained logs + reprocessing, schema evolution limits to optional-field adds; with them, full model restructures are safe.
+- **Cross-shard secondary indexes (p.569):** Term-partitioned (send writes to N shards) vs document-partitioned (scatter reads to all shards) — both prefer async derived-data maintenance over sync 2PC. Async contains faults locally; sync aborts globally and amplifies failure.
+- **Data integration summary:** Batch for backfill, streams for live, one ordered log for both, deterministic idempotent transforms for all derived data. That is the data integration contract this chapter's unbundling builds on.
 
-| Dimension | Federated Databases (Polystores) | The Unbundled Database (Dataflow Architecture) |
+### 2.2 Unbundling Databases — Composing Bespoke Storage from Streams (p.570)
+
+A bundled DBMS packs parser/optimizer, 2PL/SSI concurrency, hash/nested-loop/sort execution, B-tree/GiST/GIN/hash indexes, buffer pool, WAL/Aries/heap into one process. Two philosophies compete for heterogeneous needs:
+
+| Dimension | Federated / polystore (Trino/Drill) | Unbundled (log + streams) |
 | :--- | :--- | :--- |
-| **Architectural Model** | Unified query interface routing ad-hoc queries down to underlying storage engines (e.g., Presto/Trino, Apache Drill). | Disaggregated storage and processing components wired together via durable, asynchronous change streams. |
-| **Write Coordination** | Distributed Two-Phase Commit (2PC / XA) across disparate backends; highly vulnerable to coordinator failure and tail latencies. | Single partitioned commit log (total order); all downstream views update asynchronously and deterministically. |
-| **Read Path** | Distributed query engine performs runtime federated joins, scatter-gather network calls, and cross-engine data transfers. | Reads hit pre-computed, pre-joined, denormalized materialized views optimized for specific access patterns. |
-| **Coupling & Availability** | Tight temporal and operational coupling: query fails if any underlying federated storage node is degraded. | Asynchronously decoupled: read views remain 100% available even if the write log or ingestion pipeline is temporarily offline. |
-| **Analogy** | Monolithic operating system kernel trying to support all hardware drivers internally. | **Unix Philosophy**: small, specialized tools (grep, awk, sort) composed via standard, uniform pipes (`|`). |
+| **Model** | One SQL front, scatter-gather to engines | Disaggregated stores wired by durable streams |
+| **Writes** | 2PC/XA, coordinator SPOF, tail latency | One partitioned log, async deterministic views |
+| **Reads** | Runtime federated joins, cross-engine transfers | Pre-joined denormalized materialized views |
+| **Coupling** | Fails if any backend degrades | Views serve even if log/ingest pauses |
+| **Analogy** | Monolithic kernel with all drivers | Unix pipes: small tools, uniform interface |
 
-In an unbundled database:
-$$\text{Enterprise Architecture} \equiv \text{Database Internals Externalized}$$
-- **Kafka / Distributed Log** $\longleftrightarrow$ The Database Write-Ahead Log (WAL).
-- **Stream Processors (Flink)** $\longleftrightarrow$ The Database Stored Procedure & Trigger Engine.
-- **Elasticsearch / Redis / Snowflake** $\longleftrightarrow$ Secondary Indexes, Materialized Views, and Columnar Data Stores.
+Unbundled mapping: Kafka ↔ WAL; Flink ↔ triggers/stored procedures; Elasticsearch/Redis/Snowflake ↔ secondary indexes/views/columnars. Enterprise ≡ database internals externalized.
 
----
+**Composing storage (bespoke index/storage/compute).** Don't ask one engine to be a KV + search + graph + OLAP store. Compose: Postgres for OLTP point reads, Elasticsearch for inverted search, Redis for session cache, ClickHouse/Snowflake for columnar OLAP, Neo4j/graph for traversals — each hydrated from the same ordered log. This is why Firebase/Supabase are instructive contrasts: Firebase bundles auth + realtime DB + Firestore + functions into an opinionated backend-as-a-service — superb velocity for CRUD/realtime apps, but the bundle decides indexing, consistency, and query shape. Supabase (Postgres + PostgREST + Realtime CDC + Auth + Storage) is a thinner bundle that already leans unbundled: Postgres remains system of record, CDC/log feeds realtime and edge caches. The book's direction pushes further: keep the log public and pluggable so any bespoke index, storage layout, or compute engine can subscribe without forking write paths.
 
-### 2.3 Designing Applications Around Dataflow: The Read/Write Trade-off
+**Designing applications around dataflow (p.575).** Writes-meet-reads boundary defines cost: `total work = W_write + W_read`. CRUD does O(1) appends on write, O(N) scans/joins on read. Dataflow inverts for high read/write ratios (100:1 to 10000:1): stream processors pre-join/pre-aggregate into denormalized objects on write (O(K) index fan-out), reads become O(1) point lookups on RocksDB/Redis with zero runtime joins. Materialized caching is the lever.
 
-The boundary where writes meet reads defines the core operational characteristic of any data system. In traditional CRUD applications, writes perform minimal work (writing raw rows to a normalized table), forcing the read path to bear the heavy computational burden of multi-table joins, aggregations, and filtering.
+**Observing derived state / where writes meet reads (p.579) — Figure 13-1.** Search-index example: no write precomputation → O(N) scan per query; full inverted-posting precomputation on write → fast intersect + BM25/TF-IDF ranking on read. Figure 13-1 names the boundary and its lag: derived views trail the log by consumer lag. Correctness must therefore distinguish lag (timeliness) from fork (integrity) — next section.
 
-In a streaming, dataflow-oriented architecture, this balance is deliberately inverted:
-$$\text{Total System Work} = W_{\text{write}} + W_{\text{read}}$$
+Derived data checklist from this section: every derived dataset declares its upstream log + offset, its transform version, and its lag SLO; backfills replay from retained logs; new logic builds v2 in parallel.
 
-```
-Write-Heavy vs. Read-Heavy Processing Continuum:
+#### 2.2.1 Unbundling Databases in Depth (p.570) — Index/Storage/Compute Separation, Bespoke Stores
+- **What unbundling means:** Unbundling a database means externalizing its internals — WAL → Kafka/Pulsar durable log, triggers/stored procedures → Flink/Kafka Streams, B-tree/GIN/GiST indexes → Elasticsearch/Redis/columnars — as independently deployable services wired by streams. Unbundling does not kill databases; it composes them. The book's unbundling thesis: breadth (many workloads well) over depth (one workload perfectly).
+- **Why unbundling (vs one engine):** CREATE INDEX internals already prove the pattern: scan snapshot → sort → backfill backlog → keep up-to-date on writes (same as follower bootstrap p.201 + CDC snapshot p.504). Unbundling generalizes that built-in derived-data pipeline across team and vendor boundaries. Unbundling trades operational pieces (more to run) for workload fit (each read served by its ideal layout).
+- **Bespoke index/storage/compute (compose, don't stretch):** Bespoke index = Elasticsearch inverted + pg_trgm + vector HNSW per query shape. Bespoke storage = Postgres row heap for OLTP, S3 Parquet/Iceberg for scan, RocksDB for stream state, Redis for hot keys. Bespoke compute = Flink for joins/aggregates, Spark for backfills, GPU batch for embeddings. Unbundling lets each bespoke piece subscribe to the same log instead of forcing one engine to fake all layouts. A bespoke store without an ordered upstream is just another fork — unbundling requires the log.
+- **Federated (unifying reads) vs unbundled (unifying writes):** Federated/polystore (Trino, Presto, Drill, Postgres FDW, Hoptimator, Xorq) gives one SQL front over many engines — elegant semantics, hard implementation, read-only; writes still need XA. Unbundling gives one log front over many engines — Unix-philosophy small tools + pipes [20], shell-like composition [14]; writes flow once, derive everywhere. Federation maps models on read; unbundling syncs state on write. The chapter bets on unbundling for writes because cross-system 2PC is the harder problem.
+- **Making unbundling work (p.573):** Transactions inside one engine are fine; across heterogeneous engines prefer ordered log + idempotent consumers [5]. Exactly-once inside a stream processor via 2PC is fine; across vendor boundaries the log abstraction wins. Loose coupling pays twice: system-level (slow consumer buffers, fault contained, catch-up on fix — vs 2PC escalating local faults globally) and human-level (teams ship independently behind a durable ordered interface strong enough for causality but general enough for any payload).
+- **When not to unbundle (p.574):** Single engine that covers you → use it. Fewer moving parts, better predictable perf on its sweet spot [21], no premature scale-out. Unbundling is for when no single product spans your read/write needs. Debezium + Kafka protocol + incremental view maintenance (p.516) keep lowering the composition cost.
+- **Unbundling count-up (for term audit):** Unbundling appears here as architecture, as operation, as team pattern, as write-unifier, as Unix analogy, as fault container, as evolution enabler — unbundling is the chapter's organizing noun, distinct from mere data integration or derived data plumbing.
 
-[ Write Path: Zero Precomputation ]                                  [ Read Path: Zero Computation ]
-Raw Appends Only                                                     Fully Materialized Read Views
----------------------------------------------------------------------------------------------------->
-Write Latency: O(1) sequential append                                Write Latency: O(K) index updates
-Read Latency:  O(N) table scan & runtime joins                       Read Latency:  O(1) direct key-value lookup
-```
+#### 2.2.2 Firebase vs Supabase — Bundle Spectrum (bespoke lesson)
+- **Firebase (thick bundle):** Auth + Realtime DB/Firestore + Cloud Functions + Hosting + Analytics in one opinionated BaaS. Velocity superb for CRUD/realtime/chat; bundle decides indexing (limited compound queries), consistency (eventual document sync), and query shape (collection/group). Escaping the bundle for bespoke analytics/search means exporting (and losing ordering guarantees).
+- **Supabase (thin bundle leaning unbundled):** Postgres remains system of record + PostgREST (auto-API) + Realtime (CDC/log tail) + Auth + Storage. Because the log (Postgres WAL via logical decoding) is public, any bespoke index (Elastic), cache (Redis), or warehouse (Snowflake) can subscribe without forking writes. Closer to unbundling: keep the record centralized, the derived data pluggable.
+- **Book direction beyond both:** Make the log itself the API (Kafka topic + schema registry), not just the DB. Then Firebase-like velocity (subscribe + materialize) coexists with bespoke freedom (any engine, any team, same order). Unbundling generalizes Supabase's CDC insight to the whole enterprise.
 
-By shifting computational work from the read path to the write path via stream processors:
-1. **Materialized Caching**: Writes continuously compute denormalized domain objects (e.g., an assembled customer profile with all orders, credit ratings, and preferences pre-joined).
-2. **Sub-millisecond Read Servicing**: User-facing queries require zero runtime joins; they execute simple, single-partition point lookups or key range scans against local in-memory storage (e.g., RocksDB embedded in a Flink task or a Redis cluster).
-3. **Graceful Handling of High Read-to-Write Ratios**: In consumer web applications where reads outnumber writes by $100:1$ to $10,000:1$, shifting computation to the write path reduces aggregate CPU and IOPS expenditure across the fleet by orders of magnitude.
+### 2.3 Designing Applications Around Dataflow (p.575) — Derivation Functions, Code/State Separation, Streams vs Services
 
----
+- **Spreadsheet intuition (VisiCalc 1979 [23]):** Formula cell `=SUM(C:C)` auto-recomputes when inputs change — derivation without polling. Dataflow generalizes that to the enterprise: record change → stream operator → derived data refresh (index, cache, model) automatically. Databases should learn from spreadsheets [22]; difference is fault-tolerance, scale, durability, and cross-team heterogeneity.
+- **Derivation functions (what transforms derived data):** Secondary index (pick fields + sort), full-text index (detect language → segment words → stem/lemmatize → spell/synonym → invert), ML model (feature extract + statistical fit; inference derives from input + learned params), UI cache (aggregate fields the screen needs; UI change → repopulate rule + rebuild). CREATE INDEX is the cookie-cutter case; the rest need custom code with domain knowledge (linguistics, feature engineering [24]).
+- **Separation of application code and state (Church/state joke [26]):** DBs as deployment environments (triggers/procedures/UDFs) lose to K8s/Docker/Mesos/YARN on deps, versioning, rolling upgrades, metrics, and network calls. Trend: stateless services (any server handles any request) + remote DB as mutable shared variable (durable, concurrent, fault-tolerant) [25]. DB as passive variable you poll — no subscribe; observer pattern hand-rolled, not built-in. Dataflow renegotiates this: code reacts to state changes by emitting new state changes (CDC, actors, triggers, incremental view maintenance p.516) across caches, indexes, ML, analytics via streams.
+- **Log properties derived data needs:** Ordered state changes (all views process same order → mutually consistent) + fault tolerance (single lost message = permanent derived-data drift). Both delivery and state updates must be reliable. Modern stream processors provide ordering + reliability at scale cheaper and more robustly than distributed transactions; operators compose like Unix pipes (streams in, streams out).
+- **Stream processors vs services (currency example pp.578–579 [27–29]):** Purchase in one currency, pay in another, needs FX rate. Microservices: query `exchange-rate-service` synchronously per purchase (network hop, tail latency, outage coupling). Dataflow: subscribe to `fx_updates` stream ahead of time, materialize local FX table; purchase handler joins locally (same process/machine). Faster (no network — "fastest request is no request") + robust (works when FX service down, serving last known rate). Cache-polling converges to the same design — dataflow makes it explicit. Time-dependence remains: reprocessing old purchases needs historical FX at original time (p.525 joins); both approaches must handle it. Subscribing moves toward spreadsheet reactivity; open questions on time-joins remain but direction is promising.
+- **Derived data lens:** Every paragraph above is about derived data: FX table is derived data, search posting is derived data, UI cache is derived data. Designing around dataflow = designing around derived data freshness, lineage, and cost.
 
-### 2.4 The End-to-End Argument for Data Systems
+### 2.4 Observing Derived State (p.579) — Figure 13-1, Write/Read Paths, Offline Clients, Reads-as-Events
 
-In 1981, Jerome Saltzer, David Reed, and David Clark published a foundational paper in distributed computing: *"End-to-End Arguments in System Analysis"*. The thesis states:
+- **Write path vs read path (Fig 13-1, p.579):** Write path = precompute eagerly on ingest (batch/stream stages updating every derived data copy, e.g. tokenize→invert→SSTable for search). Read path = compute lazily on request (parse query, intersect, rank). Derived dataset is where they meet (Fig 13-1 boundary). Eager ≈ functional eager evaluation; lazy ≈ lazy evaluation. Trade-off knob: shift work between paths.
+- **Index/cache/materialized-view as boundary slider (pp.580–581):** No index: zero write work, O(N) grep scan per read. Full inverted index: O(K) write fan-out, O(1)-ish reads (Boolean AND/OR + BM25). Precompute-all-queries: zero read work, infinite write work (impossible — query space exponential). Cache of top-N queries: middle ground, a materialized view refreshed on new docs. Social home timelines (p.34) already slid this boundary per user (celebrity vs ordinary) — 500 pages later the pattern returns as derived-data design.
+- **Stateful offline-capable clients (pp.581–582):** Browsers/mobile evolved from stateless (reload to refresh, offline = dead scroll) to stateful (JS SPAs, local storage, on-device SQLite). On-device state = cache of server state; pixels = materialized view of local models; models = replica of datacenter state [31]. Sync engines/local-first (p.220) make this a derived-data problem all the way to the edge.
+- **Pushing state changes (Server-Sent Events/WebSockets):** Classic web: browser polls (RSS = fancy poll), state stale until reload. SSE/EventSource + WebSockets keep TCP open, server pushes deltas, extending the write path to the device. First load uses read path; thereafter stream of derived-data updates. Same log-consumer-offset trick as p.498 lets offline devices resync without missing events [30,32].
+- **End-to-end event streams + why not everywhere (p.583):** React/Elm already re-render on state change; natural to push server deltas into that pipeline: device interaction → event logs → derived data → stream processors → other device UI in <1 s (IM/games already do "real-time"). Blocker: request/response assumptions baked into DBs/libs/frameworks/protocols — few stores serve subscribe-to-changes; rethinking toward publish/subscribe dataflow [31] costs effort but buys responsiveness + offline.
+- **Reads are events too (pp.583–584):** Today writes go via log, reads are transient RPCs to shard holders. Alternative: log read requests as events through the same stream processor (stream-table join: route read event by key to shard, emit result to output stream [35–36]). One-off read = transient join; subscribe = persistent join over past+future. Logging reads enables causal tracking (what shipping/inventory did the buyer see before ordering? [4]) and provenance, at storage/I/O cost — open research [2], but if you already log requests operationally, making the log the source is small.
+- **Multishard data processing (pp.584–585):** Single-shard reads via streams = overkill; multishard joins shine: Storm distributed RPC counted URL viewers as union of follower sets across shards [37]; fraud scoring joins purchase event against sharded IP/email/address reputation DBs [38]; warehouse shuffle joins look identical. If a DB already does it, use it; streams are the escape hatch past conventional limits.
+- **Figure 13-1 anchor:** All of §2.4 is the elaboration of Fig 13-1 (p.579): writes meet reads at derived data; lag lives at the boundary; timeliness vs integrity (§2.5.3) decides whether lag matters.
 
-> *A function or reliability feature can only be completely and correctly implemented with the knowledge and help of the application standing at the endpoints of the communication system. Providing that feature as a low-level primitive in the communication subsystem is not possible, nor is it sufficient on its own.*
+### 2.5 Aiming for Correctness — End-to-End, Constraints, Timeliness vs. Integrity, Trust-but-Verify (p.585)
 
-#### Application to Database Transactions
-Database architects frequently assume that relying on an ACID database or a distributed two-phase commit (2PC) transaction guarantees that application data will not be duplicated, lost, or corrupted. This assumption is provably false due to boundary failures:
+#### 2.5.1 The end-to-end argument (p.586) — exactly-once (1/7), duplicate suppression, request IDs
 
-```
-THE END-TO-END TRANSACTION GAP
-+--------------------+        HTTP POST /transfer        +--------------------+
-|  Client Browser /  | --------------------------------> | Application Server |
-|    Mobile App      |                                   +--------------------+
-|                    |                                             |
-|                    |                                             v BEGIN TRANSACTION;
-|                    |                                             | UPDATE accounts ...;
-|                    |                                             | COMMIT;
-|                    |                                             v [Database Commits Successfully]
-|                    | <----------------- [CRASH / TIMEOUT] -------+
-+--------------------+   (TCP Connection Reset / Network Drop)
-```
+Saltzer-Reed-Clark (1981): reliability needs endpoint help; low-level primitives alone are insufficient. DB ACID/2PC can't deduplicate a retried `POST /transfer`: server debits/credits + commits, TCP drops before `200 OK`, client retries, second commit debits again — both txns "correct", business catastrophically wrong ($2000 vs $1000). Fix is end-to-end: client UUID idempotency key first, `processed_requests` insert guarded by unique constraint, cached response replay on duplicate. Exactly-once business semantics over at-least-once transport. Same pattern underlies outbox + CDC + idempotent consumers: end-to-end deduplication, not just broker acks.
+- **Exactly-once execution (1/7, p.586):** Exactly-once (effectively-once) means retry-after-fault has the same final effect as no fault — charging once, counting once. At-least-once + idempotence is the implementation: maintain operation-ID set, fence on failover (p.373), deduplicate. Exactly-once stream checkpoints give the same for derived data pipelines.
+- **Duplicate suppression beyond streams (pp.587–588):** TCP sequence numbers suppress duplicates within one connection (reorder + retransmit + dedup before handing to app). But transaction tied to TCP breaks on reconnect: client sends `COMMIT`, network drops before ack (Fig 9-1), client reconnects outside TCP suppression scope and retries Example 13-1 (`UPDATE accounts +11 WHERE 1234; -11 WHERE 4321; COMMIT`) — nonidempotent, transfers $22 not $11. Real banks never do this [3]. 2PC breaks 1:1 TCP↔txn mapping (coordinator reconnects to resolve in-doubt) yet still cannot suppress end-user double-POST (weak signal → error page → manual retry; Post/Redirect/Get [43] doesn't help on timeout). Browser retry = new request + new transaction from server/DB view.
+- **Uniquely identifying requests (Example 13-2, p.588):** Pass UUID/hash from client form through app to DB: `ALTER TABLE requests ADD UNIQUE(request_id); BEGIN; INSERT INTO requests(request_id,from,to,amount) VALUES('0286FDB8-…',4321,1234,11.00); UPDATE…; COMMIT;`. Duplicate `INSERT` violates unique constraint even under weak isolation (where app check-then-insert races, p.303) and aborts the second effect. `requests` table doubles as event log for sourcing/CDC; balance updates can move downstream as long as the event is processed exactly-once via the same request ID.
+- **End-to-end argument quoted (p.589 [44]):** "Can completely and correctly be implemented only with knowledge and help of the application standing at the endpoints…" TCP dedup, Ethernet checksums, WiFi encryption, DB txns, and exactly-once stream processors are useful incomplete versions (reduce fault probability, e.g. TCP reordering saves HTTP daily) but cannot alone prevent user double-submit, disk-bitrot, or app-bug corruption. End-to-end checksums/encryption/duplicate-suppression close the gap. Application-level fault tolerance is hard and rarely wrapped cleanly — transactions collapse faults to commit/abort but cost too much across heterogeneous stores (p.328), forcing hand-rolled app mechanisms that usually corrupt. Hence the search for scalable end-to-end correctness abstractions continues into §2.5.2.
 
-1. The client issues an HTTP `POST /transfer` request to transfer \$1,000.
-2. The application server begins a transaction, debits Account A, credits Account B, and executes `COMMIT`. The database commits the transaction to disk with full durability.
-3. Before the application server can return the `200 OK` HTTP response to the client, the cellular tower drops the TCP connection, or the application container suffers an out-of-memory (OOM) kill.
-4. From the client's perspective, the request timed out. Did the payment execute, or did it fail?
-5. The end-user (or the client application's automatic retry policy) resubmits the HTTP `POST /transfer`.
-6. Without end-to-end deduplication, the database processes the payment a second time. The ACID transaction executed perfectly both times, yet the business state is catastrophic: \$2,000 was debited instead of \$1,000.
+#### 2.5.2 Enforcing constraints without 2PC — single-partition serialization + sagas (p.590) — Figure 13-2 — exactly-once (2/7), (3/7)
 
-#### The End-to-End Solution
-Lower-level database transactions cannot solve this problem because the failure boundary lies outside the database engine. Correctness requires an end-to-end protocol:
-- **Client-Generated Idempotency Keys**: The client generates a unique transaction identifier (e.g., UUIDv4 or cryptographic hash of user ID + client timestamp + nonce) *before* issuing the network call.
-- **Atomic Intent Ingestion**: The application inserts the idempotency key and payload into a dedicated `processed_requests` table or an append-only event log as the very first operation.
-- If a subsequent retry arrives with the identical idempotency key, the request is detected as a duplicate, bypassing processing and returning the cached response from the initial execution.
+Objection: "async can't enforce uniqueness/non-negative balances/seat booking." Answer: partition by constrained key.
 
----
+- **Single-leader partition for uniqueness:** `partition = hash(username) % N`; one worker per partition holds claimed-set in RocksDB, processes offsets sequentially: unclaimed → emit `Registered` + record; claimed → emit `Declined(DUPLICATE)`. No locks/deadlocks — total partition order is the concurrency control. Figure 13-2 shows the money variant: check source balance + atomically emit next-leg event; single-threaded shard makes check-and-reserve atomic.
+- **Cross-shard transfers via sagas + compensation:** X on P1 → Y on P2. P1 validates X≥100, debits, emits `Approved(tx)` routed by `hash(Y)`; P2 credits or emits `Aborted`; P1 compensates (refunds X) on abort. Money conserved, no XA blocking/SPOF. Multi-fee legs fan out similarly by `hash(fee_account)`.
+- Read-your-decision: user checks their transfer by reading their shard's outgoing `Approved`/`Declined` event, not by global query.
 
-### 2.5 Enforcing Constraints Without Distributed Locks or 2PC
+Alice→Bob $100 happy path: P1 debits Alice 500→400, emits `CreditPending` to P4; P4 validates Bob open, credits 200→300, emits `Completed`; sum 700 invariant holds. Frozen-Bob path: P4 emits `Aborted`, P1 refunds Alice 300→400. Zero distributed locks.
+- **Uniqueness requires consensus (p.591):** Distributed uniqueness (username, seat, request ID) needs agreement on which contender wins. Single leader decides; Raft re-elects on failure without split-brain. Scale by sharding on the constrained value (`hash(username)%N`, `hash(request_id)%N` for Example 13-2). Async multi-leader cannot immediately reject violations (concurrent leaders accept conflicting uniques). Synchronous coordination unavoidable for strict immediate rejection [45].
+- **Uniqueness in log-based messaging (pp.591–592):** Shared log = total-order broadcast = consensus (p.427). Shard log by constrained value; single-threaded stream processor per shard reads sequentially, keeps claimed-set in RocksDB, emits `Registered` or `Declined` deterministically. Same construction as Ch.10 log-consensus; scales by shard count. Any conflict-routed-to-same-shard constraint (balances, inventory, room overlaps) works with arbitrary validation logic.
+- **Multishard Fig 13-2 steps (pp.592–594 [47]):** (1) Client UUID request appended to source-account shard. (2) Source processor (derived DB of balances + seen IDs) checks funds; if ok, reserves + emits `outgoing` (own shard) + `incoming` (dest shard) + `incoming` (fees shard) carrying request ID. (3) Source loopback delivers `outgoing` back; processor executes + dedups by ID. (4) Dest/fees processors apply + dedup. Shards may colocate — requirement is only per-account log order + at-least-once + determinism. Crash → replay same decision, emit same IDs, downstream dedups. Atomicity = atomic append of the initial request; downstream follows eventually (with duplicates). Exactly-once stream semantics (2/7) ease this by keeping state + consumed offsets consistent on replay; user waits on source-shard `outgoing/declined` event for synchronous notification. Result: payer+payee applied exactly-once (3/7) without atomic commit.
+- **Loosely interpreted constraints / apologies (pp.597–598 [48–49]):** Strict uniqueness needs coordination, but business often prefers violation + compensation: oversold warehouse → reorder + discount/apology (forklift already forces this flow [3]); overbooked flight/hotel → refund/upgrade/neighbor-hotel (weather/strikes need it anyway); overdrawn ATM → fee + clawback (daily limits bound risk); cross-org settlement → correction entries (p.476). Unsending email impossible, follow-up correction cheap; double-charge refund costs fees + complaint; ATM cash needs collectors. If apology cost acceptable, validate optimistically after write, before irrecoverable action — integrity preserved, timeliness relaxed, same as Ch.8 conflict resolution (p.222).
+- **Coordination-avoiding systems (p.598 [45]):** Integrity without atomic commit/linearizability/sync cross-shard work + loose constraints = no coordination for most ops, strong integrity still. Multi-datacenter multi-leader async replication: any DC operates alone, weak timeliness (no linearizability), strong integrity. Serializable txns shrink to small scopes where they shine [6]; XA avoided; sync added only where irrecoverable (e.g. before firing missile). Coordination reduces inconsistency-apologies but increases outage-apologies — tune to the sweet spot, never zero.
 
-A central objection to asynchronous, stream-driven architectures is: *"How can a distributed system enforce uniqueness constraints (e.g., unique email addresses, non-negative bank balances, preventing flight seat double-booking) without distributed locking or Two-Phase Commit?"*
+#### 2.5.3 Timeliness vs. integrity (p.595) — exactly-once (4/7), (5/7)
 
-Kleppmann demonstrates that **single-partition deterministic stream serialization** enforces global business constraints at massive scale without distributed consensus or coordinator blocking.
+Relational "consistency" conflates two axes:
 
-#### Single-Leader Partitioning for Invariant Enforcement
-To enforce a uniqueness constraint on a field (e.g., username):
-1. **Hash-Partition by the Unique Key**: Route all registration requests for `username` to an event log partition determined deterministically by $\text{hash}(\text{username}) \pmod N$.
-2. **Single-Threaded Partition Consumer**: A stream processing worker consumes that partition sequentially. Because all operations for that specific `username` arrive at the exact same partition in a deterministic sequence:
-   - The stream worker maintains an internal hash index of claimed usernames (backed by an embedded state store such as RocksDB).
-   - If `username` is unassigned, the worker writes `UserRegistered(username, user_id)` to the outbound stream and records the reservation in its state store.
-   - If `username` is already assigned, the worker writes `RegistrationDeclined(username, reason="DUPLICATE")` to the outbound stream.
-3. **No Distributed Locks Required**: Concurrency control is achieved purely through the total order established by the log partition. No locks, no 2PC, no network deadlocks.
+| | Timeliness (recency/lag) | Integrity (invariants/truth) |
+| :--- | :--- | :--- |
+| **Asks** | Latest value this ms? | Valid, uncorrupted, conserved? |
+| **Caused by** | Replica/consumer lag, async sync | Dual-write races, lost updates, bit-rot, bugs |
+| **Heals?** | Self-heals when lag drains | Perpetual until repaired |
+| **Trade** | Sacrifice for AP/low write latency | Never sacrifice; logs + dedup + audits |
+| **Impact** | Refresh in 2 s | Double charges, lost audit |
 
-```
-COORDINATOR-FREE CONSTRAINT ENFORCEMENT
-Client A: "claim_alice" ---\
-                           +--> [ Partition 3 (hash("alice")) ] ---> [ Stream Processor Worker ]
-Client B: "claim_alice" ---/    (Offset 101: Client A)                1. Processes Offset 101: OK -> Registered
-                                (Offset 102: Client B)                2. Processes Offset 102: EXISTS -> Rejected!
-```
+Rule: timeliness violations are allowed under eventual consistency; integrity violations are perpetual. Integrity >> timeliness for almost all businesses. This is why async derived data is acceptable: 50 ms stale search is fine; forked balances are not.
+- **Correctness of dataflow systems (p.596):** ACID bundles timeliness (linearizability) + integrity (atomic commit); dataflow decouples them. Async streams give no timeliness unless client waits on output event (Fig 13-2 wait). But integrity is central: exactly-once/effectively-once (4/7) via fault-tolerant delivery + dedup/ide mpotence prevents loss/double-apply. Integrity recipe (5/7): single-message write (atomic, event-sourcing friendly) + deterministic derivation (stored-procedure-like) + end-to-end request ID (dedup/idempotence) + immutable reprocessable inputs (bug recovery by replay). Same correctness as distributed txns, far better perf/ops.
+- **Credit-card statement parable (p.596 [3]):** 24-h missing transaction = normal lag (timeliness); statement sum ≠ transactions + prior balance, or charged-without-merchant-paid = integrity failure (catastrophic). Data integration must never trade the second for the first.
 
-#### Multi-Shard Transfers via Asynchronous Sagas & Compensating Actions
-For cross-partition constraints (e.g., transferring money from Account X on Partition 1 to Account Y on Partition 2):
-1. Partition 1 receives `TransferInitiated(tx_id, from=X, to=Y, amount=100)`.
-2. Partition 1 consumer checks if Account X has $\ge \$100$. If sufficient:
-   - Debits Account X by \$100.
-   - Emits `TransferApproved(tx_id, from=X, to=Y, amount=100)`.
-3. Partition 2 consumes `TransferApproved` (routed by $\text{hash}(Y)$), credits Account Y by \$100, and emits `TransferCompleted(tx_id)`.
-4. If Partition 2 fails validation (e.g., Account Y is closed or restricted), it emits `TransferAborted(tx_id)`.
-5. Partition 1 consumes `TransferAborted` and executes a **compensating transaction** (refunding Account X by \$100).
-6. **Integrity is preserved unconditionally**: money is never created or destroyed out of thin air, and the system avoids the blocking latency and single-point-of-failure vulnerabilities of XA/2PC coordinators.
+#### 2.5.4 Trust but verify — continuous auditing, Merkle trees, tamper-proof logs (p.599) — exactly-once (6/7), (7/7)
 
----
+Blind trust in committed data ignores bit-rot (cosmic rays, DIMM flips, SSD firmware, RAID lies), migration/off-by-one bugs (0.001%/mo silent corruption), and dropped async events. Retain the append-only log as ground truth (S3 Object Lock/WORM for compliance), run an independent auditor re-deriving invariants, compare hierarchically:
 
-### 2.6 Timeliness vs. Integrity: The Foundational Dichotomy
+- Leaves `H_leaf = SHA256(record)`; parents `H_parent = SHA256(left‖right)`; one 32-B root summarizes billions of rows. Mismatched roots → binary-search halves in O(log N) round-trips to the divergent leaf, then replay that slice from the log to heal the view. 1M-record example: naive nightly diff ships 1.3 GB; Merkle isolates `acc_782103` (dropped during ES reboot) in 20 × 64 B ≈ 1.28 KB, replays one CDC event, roots match.
 
-Traditional relational database theory bundles two completely distinct operational dimensions into the concept of "Consistency":
-
-```
-               +-------------------------------------------------------------+
-               |                  DATABASE CONSISTENCY                       |
-               +-------------------------------------------------------------+
-                                       |
-                   +-------------------+-------------------+
-                   |                                       |
-                   v                                       v
-        +----------------------+               +----------------------+
-        |      TIMELINESS      |               |      INTEGRITY       |
-        |  (Recency / Lag)     |               | (Invariants / Truth) |
-        +----------------------+               +----------------------+
-        | Did I read the most  |               | Is the state valid?  |
-        | up-to-date value?    |               | Did we lose data?    |
-        |                      |               | Did balances drift?  |
-        | Violated by:         |               | Violated by:         |
-        | - Replication lag    |               | - Silent corruption  |
-        | - Eventual sync      |               | - Hardware bit-rot   |
-        | - Stale read replicas|               | - Software bugs      |
-        +----------------------+               +----------------------+
-```
-
-1. **Timeliness (Recency Guarantees)**:
-   - Concerns the *temporal coordinate* of observed state.
-   - Guarantees that a reader observes updates immediately after they are committed (Linearizability, Read-After-Write consistency).
-   - **Tolerable Violations**: If a follower replica or derived search index is 50 milliseconds behind the log head, timeliness is violated temporarily. The system is in an *eventual consistency* window. In 99.9% of real-world business domains, momentary timeliness violations are harmless.
-2. **Integrity (Safety & Correctness Guarantees)**:
-   - Concerns the *structural validity and truthfulness* of data.
-   - Guarantees that data is never silently dropped, corrupted, double-counted, or contradictory. Invariants (e.g., $\sum \text{debits} = \sum \text{credits}$) must hold across the system.
-   - **Intolerable Violations**: If a network split or software bug causes an account balance to drift by \$0.01, or drops an uncommitted payment silently, integrity is broken. Violations of integrity result in **perpetual corruption** that compounds over time and never heals on its own.
-
-> **The Architectural Rule of Stream Systems**:
-> *Violations of timeliness are allowed under eventual consistency; violations of integrity result in perpetual inconsistency. In almost all business systems, integrity is infinitely more important than timeliness.*
-
----
-
-### 2.7 Trust, but Verify: Continuous Auditing & Merkle Trees
-
-Traditional systems adopt a naive "blind trust" security and reliability posture: once an ACID transaction commits to PostgreSQL or an LSM-tree writes to disk, the engineering team assumes the data is permanently correct.
-
-In real-world hyperscale infrastructure, this assumption is continually undermined by:
-- **Silent Hardware Bit-Rot**: Cosmic ray strikes, uncorrectable bit flips in memory DIMMs, SSD controller firmware bugs, and corrupted RAID controllers that fail to trigger OS-level I/O errors.
-- **Software Logic & Migration Bugs**: An off-by-one error in a batch transformation, an unchecked edge case in a schema migration, or an unhandled null in an async event consumer corrupts 0.001% of records silently each month.
-
-```
-THE CONTINUOUS AUDITING PATTERN (MERKLE RECONCILIATION)
-======================================================
-[ Append-Only Event Log (Ground Truth) ] ----------------------------+
-               |                                                     |
-               v (Streaming CDC)                                     v (Continuous Auditor)
-    [ Derived Read Views ]                                 [ Deterministic Reducer ]
- (PostgreSQL, Redis, Elasticsearch)                                  |
-               |                                                     v
-               +-------------> [ Periodic Hash State ] <-------------+
-                                      |
-                                      v
-                             (Compare Root Hashes)
-                                  /       \
-                        (Match: OK)     (Mismatch: DRIFT DETECTED!)
-                                             |
-                                             v
-                                  [ Re-stream Slice from Log ]
-                                  [ Heal Derived View In-Place ]
-```
-
-#### The End-to-End Auditability Protocol
-A robust streaming architecture does not assume correctness; it continuously verifies it:
-1. **Immutable Log as Ground Truth**: The append-only event log is retained durably (or archived to immutable object storage like Amazon S3 with Object Lock).
-2. **Continuous Reconciliation Process**: An independent, asynchronous auditor continuously re-evaluates the mathematical invariant from the raw event stream.
-3. **Hierarchical Cryptographic Verification (Merkle Trees)**:
-   - Data entities are leaf nodes with cryptographic hashes: $H_{\text{leaf}} = \text{SHA256}(\text{record})$.
-   - Intermediate nodes hash their children: $H_{\text{parent}} = \text{SHA256}(H_{\text{left}} \parallel H_{\text{right}})$.
-   - A single 32-byte **Merkle Root Hash** represents the exact state of billions of records across a partition.
-   - By comparing the Merkle root of the derived read store against the Merkle root of the audit pipeline, systems detect localized data corruption in $O(\log N)$ network round-trips and pinpoint the exact divergent record without scanning the entire database.
+Exactly-once processing is the companion guarantee here: deterministic replay + idempotent sinks (upsert by key, tombstone deletes) plus exactly-once stream checkpoints mean reprocessing heals without double-applying. The book invokes exactly-once seven times in this chapter precisely to tie reprocessing safety to audit-driven repair.
+- **System-model humility (p.599):** Assume crashes, power loss, arbitrary net delay/drop; traditionally also assume fsync holds, RAM multiplies correctly. Reality is probabilistic: memory/disk/net corrupt (pp.44/283/379); at scale the unlikely happens. Exactly-once processing (6/7) assumes non-Byzantine faults; auditing covers the rest.
+- **Bugs beat hardware (p.600 [50–51]):** MySQL uniqueness + Postgres serializable both shipped violations despite maturity; app code (weak isolation misuse, missing FK/unique [25]) worse. ACID "consistent→consistent txn" assumes bug-free txns — unsafe assumption. Don't blindly trust promises; audit.
+- **Designing for auditability (pp.601–602):** Mutating txns hide why; event sourcing (single immutable input + deterministic repeatable derivation) exposes provenance. Hash the log, rerun derivations to verify, run redundant derivations in parallel, time-travel-debug by replay [4,55]. End-to-end checks across the whole derived-data pipeline implicitly cover every disk/net/service/algorithm on the path; confidence lets you move fast [56] like tests do. Exactly-once reprocessing (7/7) makes the repair safe to apply.
+- **Tools (pp.602–603):** App audit tables lack integrity; HSM-signed txn logs don't prove correct inputs. Blockchains (Bitcoin/Ethereum) = append-only event logs + stream-processor contracts + BFT consensus with mutual integrity checks — overkill overhead for most apps, but Merkle trees [57] (hash-tree proofs of inclusion), Certificate Transparency (append-only + Merkle, single leader, no consensus [58–59]), and ledger-style end-to-end audits port cheaply. Future data systems will be self-validating/self-auditing [54]; HDFS/S3 background scrubbers [52–53] + backup-restore drills already live this "trust, but verify."
+- **Summary echo (pp.603–604):** Data integration via systems-of-record + derived data transforms (indexes, views, models, summaries) over async loosely coupled flows → robustness + evolvability (re-derive on change, fix-and-reprocess on bug) → unbundled database → write/read-path observation to the edge → integrity without coordination (end-to-end IDs, async constraint checks, apologize when cheap) → audit everything. Blockchain techniques rhyme with event systems for a reason.
 
 ---
 
 ## 3. Important Figures, Diagrams & Visual Architecture
 
-> 📕 **Original figures quick index (source PDF, 673 pages):** open the PDF at the cited page to verify each reconstruction.
+> 📕 **Original figures quick index (source PDF, 673 pages):** open the PDF at the cited page to verify each reconstruction. This chapter has exactly 2 book figures.
 >
 > | Book Fig | PDF page | What to compare |
 > |---|---|---|
-> | Fig 13-1 | PDF p.580 | Unbundled DB vs monolith |
-> | Fig 13-2 | PDF p.593 | Tx check + atomic commit |
+> | Fig 13-1 | PDF p.579 | Search index: writes meet reads, lag boundary |
+> | Fig 13-2 | PDF p.592 | Funds check + atomic commit across shards |
 
+### Figure 13-1: Where Writes Meet Reads — Derived-State Lag (PDF p.579)
+- **Figure Reference:** `Figure 13-1: In a search index, writes (document updates) meet reads (queries)`
+- **Original PDF:** Fig 13-1 → PDF p.579 — open the PDF at page 579 to compare with the Mermaid reconstruction below.
+- **Visual Flow & Description:** Raw document → tokenize/stem → invert terms → SSTable segments on write; query → tokenize → intersect posting lists → rank on read. Boundary between them is the materialization point; derived-state lag is the distance behind the log head.
+- **Mermaid Flowchart:**
 
-### Figure 13-1: The Unbundled Database Engine vs. Monolithic Black Box
-> 📕 **Original figure:** Fig 13-1 → **PDF p.580** — search-index read/write meet point. Open PDF at page 580 to compare.
 ```mermaid
 flowchart TD
-    subgraph Monolith ["Monolithic Relational Database Engine"]
-        M_Client["Application Service"] --> M_SQL["SQL Parser & Optimizer"]
-        M_SQL --> M_Lock["Lock Manager (2PL/Latches)"]
-        M_Lock --> M_Engine["Execution Engine"]
-        M_Engine --> M_WAL["Internal Private WAL"]
-        M_Engine --> M_BTree["B-Tree Clustered Index"]
-        M_Engine --> M_Buffer["Private Buffer Pool"]
-    end
-
-    subgraph Unbundled ["The Unbundled Enterprise Database"]
-        U_Client["Application Service"] --> U_Log["Public Durable Event Log (Kafka / Pulsar)"]
-        U_Log --> U_Flink["Stream Processors (Triggers & Stored Procs)"]
-        U_Log --> U_CDC["Change Data Capture Pipeline"]
-        
-        U_CDC --> U_Elastic["Elasticsearch (Inverted Search Index)"]
-        U_CDC --> U_PG["PostgreSQL (Relational OLTP View)"]
-        U_CDC --> U_Redis["Redis (In-Memory Key-Value Cache)"]
-        U_CDC --> U_Snowflake["Snowflake / ClickHouse (Columnar OLAP)"]
-        
-        U_Reader["Query Client"] --> U_Elastic
-        U_Reader --> U_PG
-        U_Reader --> U_Redis
-        U_Reader --> U_Snowflake
-    end
-
-    style Monolith fill:#f9f9f9,stroke:#e74c3c,stroke-width:2px
-    style Unbundled fill:#eef9ff,stroke:#2980b9,stroke-width:2px
-    style U_Log fill:#fff3cd,stroke:#f39c12,stroke-width:3px
+  subgraph WP["Write Path (Precomputation)"]
+    direction TB
+    DOC["Doc 42<br/>Distributed stream systems"]
+    TOK["Tokenize + Stem"]
+    INV["Invert: distributed→42<br/>stream→42"]
+    SEG[("Segments / SSTables")]
+    DOC --> TOK --> INV --> SEG
+  end
+  subgraph BOUND["Materialization Boundary (Lag Lives Here)"]
+    LAG["Log head vs. indexed offset<br/>timeliness gap"]
+  end
+  subgraph RP["Read Path (Serving)"]
+    direction TB
+    Q["Query: stream systems"]
+    QP["Tokenize stream, systems"]
+    FE["Intersect posting lists"]
+    RK["BM25 / TF-IDF rank"]
+    TOP["Top-10 docs"]
+    Q --> QP --> FE --> RK --> TOP
+  end
+  SEG -.->|"serves"| FE
+  WP --> BOUND --> RP
 ```
-* **Structural & Semantic Walkthrough**: In the monolithic DBMS (left), all subsystems (parser, lock manager, WAL, indexes, memory buffers) are private, hidden, and tightly coupled inside a single process. In the unbundled architecture (right), the private WAL is replaced by a public, partitioned distributed event log (`U_Log`). Secondary stores (`U_Elastic`, `U_PG`, `U_Redis`, `U_Snowflake`) are externalized materialized views continuously hydrated via deterministic streaming CDC pipelines.
-* **Failure Mode & Edge-Case Analysis**: If a derived store (`U_Elastic`) crashes or suffers index corruption, the authoritative system remains 100% operational. A new Elasticsearch cluster can be provisioned, rewound to offset 0 on `U_Log`, and rebuilt completely from scratch with zero downtime to the primary write path.
+
+- **Key Takeaway:** No precomputation = O(N) scans; full precomputation = O(1)-ish lookups but async lag. Lag is expected; fork is not.
+- **Failure Mode:** 500k updates/s saturates tokenization/merge I/O; stream buffer absorbs spike, query latency holds, consumer lag grows until autoscale.
 
 ---
 
-### Figure 13-2: The Dual-Write Race Condition vs. Log-Based CDC Determinism
-> 📕 **Original figure:** Fig 13-2 → **PDF p.593** — funds check + atomic commit. Open PDF at page 593 to compare.
+### Figure 13-2: Single-Shard Funds Check + Atomic Forward Commit (PDF p.592)
+- **Figure Reference:** `Figure 13-2: Checking whether a source account has enough money and atomically committing the transfer leg`
+- **Original PDF:** Fig 13-2 → PDF p.592 — open the PDF at page 592 to compare with the Mermaid reconstruction below.
+- **Visual Flow & Description:** Three accounts on three shards (could colocate); source shard checks balance and atomically appends the next-leg event; downstream shards credit independently; aborts trigger compensations.
+- **Mermaid Flowchart:**
+
 ```mermaid
-sequenceDiagram
-    autonumber
-    participant ClientA as Client A
-    participant ClientB as Client B
-    participant DB as Relational Primary (Postgres)
-    participant ES as Search Index (Elasticsearch)
-
-    Note over ClientA,ES: FAILURE SCENARIO 1: Dual-Write Race Condition
-    ClientA->>DB: UPDATE user_1 SET status = 'ACTIVE'
-    ClientB->>DB: UPDATE user_1 SET status = 'SUSPENDED'
-    Note over DB: DB executes: ACTIVE, then SUSPENDED (Final = SUSPENDED)
-    
-    ClientB->>ES: UPDATE user_1 SET status = 'SUSPENDED'
-    Note over ClientA,ES: Client A network packet experiences 250ms TCP jitter
-    ClientA->>ES: UPDATE user_1 SET status = 'ACTIVE'
-    Note over ES: ES executes: SUSPENDED, then ACTIVE (Final = ACTIVE)
-    Note over DB,ES: FATAL: DB is SUSPENDED, ES is ACTIVE! Permanent silent divergence!
-
-    Note over ClientA,ES: HEALED SCENARIO 2: Log-Based CDC Total Ordering
-    ClientA->>DB: Write: status = 'ACTIVE'
-    ClientB->>DB: Write: status = 'SUSPENDED'
-    Note over DB: Write-Ahead Log records total order: [Tx1: ACTIVE, Tx2: SUSPENDED]
-    DB->>ES: Debezium CDC Log: Replay Tx1 (ACTIVE) -> Replay Tx2 (SUSPENDED)
-    Note over ES: ES deterministically converges to SUSPENDED. Zero drift!
+flowchart TD
+  subgraph SRC["Shard 1: Source (Alice)"]
+    direction TB
+    REQ["Transfer $100<br/>Alice → Bob<br/>tx_991"]
+    CHK{"Alice >= $100?"}
+    DEB["Debit Alice<br/>$500 → $400"]
+    FWD["Emit CreditPending<br/>to Shard 2<br/>hash(Bob)"]
+    REQ --> CHK
+    CHK -- No --> DEN["Emit Declined<br/>NSF"]
+    CHK -- Yes --> DEB --> FWD
+  end
+  subgraph DST["Shard 2: Dest (Bob)"]
+    direction TB
+    RCV["Receive CreditPending"]
+    VAL{"Bob open? длиной"}
+    CR["Credit Bob<br/>$200 → $300"]
+    DONE["Emit Completed tx_991"]
+    RCV --> VAL
+    VAL -- Yes --> CR --> DONE
+    VAL -- No --> AB["Emit Aborted<br/>to Shard 1"]
+  end
+  subgraph COMP["Compensation on Abort"]
+    AB2["Shard 1 receives Aborted<br/>refund Alice $300 → $400"]
+  end
+  FWD --> RCV
+  AB -.-> COMP
 ```
-* **Structural & Semantic Walkthrough**: Scenario 1 demonstrates the race condition inherent to application-managed dual writes: varying network delays invert the arrival order of mutations between PostgreSQL and Elasticsearch. Scenario 2 routes all writes through PostgreSQL's WAL, where transactions receive a strict, monotonic serial order ($Tx_1$ then $Tx_2$) that CDC replays deterministically to Elasticsearch.
-* **Failure Mode & Edge-Case Analysis**: If the application crashes halfway through dual writes in Scenario 1, Elasticsearch never receives the update. In Scenario 2, because CDC reads the committed database log asynchronously and tracks consumed offsets, transient failures in the replication worker result in automatic retries from the last checkpoint without data loss.
+
+- **Key Takeaway:** Check-and-reserve is atomic within one single-threaded partition; cross-shard atomicity comes from saga + compensation, not 2PC.
+- **Failure Mode:** Crash mid-credit replays `CreditPending` by tx_id with idempotent upsert — no double-credit on failover.
 
 ---
 
-### Supplementary Diagram 13.3 (not in book — study aid): Lambda Architecture vs. Kappa Architecture Dataflow
+### Supplementary Diagram (not in book — study aid): Lambda vs. Kappa
+
 ```mermaid
 flowchart LR
-    subgraph Lambda ["Lambda Architecture (Dual Pipeline Maintenance Overhead)"]
-        L_In["Incoming Events"] --> L_Speed["Speed Layer (Storm / Flink)"]
-        L_In --> L_Batch["Batch Layer (HDFS / MapReduce)"]
-        
-        L_Speed --> L_RealView["Real-Time Views (Low Latency, Approximate)"]
-        L_Batch --> L_BatchView["Batch Views (High Latency, Correct)"]
-        
-        L_Query["User Query"] --> L_Merge["Serving Layer (Merge Real-time + Batch)"]
-        L_RealView --> L_Merge
-        L_BatchView --> L_Merge
-    end
-
-    subgraph Kappa ["Kappa Architecture (Single Unified Stream Processing)"]
-        K_In["Incoming Events"] --> K_Log["Immutable Append-Only Log (Kafka / Pulsar)"]
-        K_Log --> K_Stream["Stream Processor (Apache Flink Engine)"]
-        K_Stream --> K_View["Materialized Read Views (Elastic, Redis, Postgres)"]
-        K_Query["User Query"] --> K_View
-        
-        K_Code["New Business Logic Code v2"] -.-> K_Replay["Reprocess from Offset 0"]
-        K_Log -.-> K_Replay
-        K_Replay -.-> K_NewView["New Materialized View v2"]
-    end
-
-    style Lambda fill:#fff0f0,stroke:#c0392b,stroke-width:2px
-    style Kappa fill:#f0fff0,stroke:#27ae60,stroke-width:2px
+  subgraph LAM["Lambda (dual pipelines)"]
+    LI["Events"] --> LS["Speed (Flink)"]
+    LI --> LB["Batch (Spark)"]
+    LS --> RV["Realtime views"]
+    LB --> BV["Batch views"]
+    RV --> M["Merge serve"]
+    BV --> M
+  end
+  subgraph KAP["Kappa (single log)"]
+    KI["Events"] --> KL[("Kafka log")]
+    KL --> KS["Flink"]
+    KS --> KV["Materialized views"]
+    KL -.->|"replay v2"| KV2["View v2"]
+  end
 ```
-* **Structural & Semantic Walkthrough**: The Lambda architecture (top) splits ingestion into two parallel pipelines: a batch layer (MapReduce/Spark) optimizing for complete historical correctness, and a speed layer (Storm/Flink) optimizing for low latency, requiring developers to write, test, and debug duplicate business logic across two different programming models. The Kappa architecture (bottom) eliminates the batch pipeline entirely, utilizing a single stream processing framework reading from an append-only log for both real-time ingestion and historical reprocessing.
-* **Failure Mode & Edge-Case Analysis**: When business logic changes in Lambda, bug fixes must be ported to both codebases simultaneously; discrepancy between batch and speed algorithms yields phantom jumps in serving views. In Kappa, developers deploy Code v2 as a parallel consumer reading from offset 0, build View v2 in isolation, verify parity, and atomically switch read traffic with zero divergence.
 
----
-
-### Supplementary Diagram 13.4 (not in book — study aid): Where Writes Meet Reads (The Search Index Materialization Trade-Off)
-```mermaid
-flowchart TD
-    subgraph WritePath ["The Write Path (Precomputation Spectrum)"]
-        Doc["Raw Document: {id: 42, text: 'Distributed stream systems'}"]
-        Doc --> Tokenizer["Tokenize & Stem Words"]
-        Tokenizer --> Invert["Invert Terms: 'distributed'->42, 'stream'->42"]
-        Invert --> Index["Write to Inverted Index on Disk (SSTable/Segment)"]
-    end
-
-    subgraph Intersection ["Materialization Boundary"]
-        Index -.-> Matched["Boundary: Where Writes Meet Reads"]
-    end
-
-    subgraph ReadPath ["The Read Path (Serving Cost vs Latency)"]
-        Query["User Search Query: 'stream systems'"]
-        Query --> QParse["Tokenize: ['stream', 'systems']"]
-        QParse --> Fetch["Intersect Posting Lists: Docs with BOTH terms"]
-        Index --> Fetch
-        Fetch --> Rank["TF-IDF / BM25 Ranking"]
-        Rank --> Response["Top 10 Document Results"]
-    end
-
-    style WritePath fill:#e8f8f5,stroke:#1abc9c,stroke-width:2px
-    style ReadPath fill:#fef9e7,stroke:#f39c12,stroke-width:2px
-    style Matched fill:#fadbd8,stroke:#e74c3c,stroke-dasharray: 5 5,stroke-width:2px
-```
-* **Structural & Semantic Walkthrough**: Figure 13-1 in the text illustrates where the write path meets the read path. If no precomputation is done on write, searching requires an $O(N)$ scan of all raw documents at query time. Precomputing inverted posting lists on the write path shifts computational complexity away from real-time user requests into background ingestion workers.
-* **Failure Mode & Edge-Case Analysis**: Under extreme write spikes (e.g., 500,000 document updates/sec), background tokenization and segment merges may saturate I/O. The stream buffer absorbs the surge, preventing client query latencies from degrading, while consumer lag temporarily increases until the indexing cluster autoscales.
-
----
-
-### Supplementary Diagram 13.5 (not in book — study aid): Synchronous RPC Microservices Cascade vs. Asynchronous Log-Stream Decoupling
+### Supplementary Diagram (not in book — study aid): Sync RPC Cascade vs. Log Decoupling
 ```mermaid
 flowchart LR
-    subgraph SynchRPC ["Synchronous REST / gRPC Cascade (Temporal Coupling)"]
-        OrderSvc["Order Service"] -->|HTTP POST| PaySvc["Payment Service"]
-        PaySvc -->|HTTP POST| FraudSvc["Fraud Service"]
-        FraudSvc -->|HTTP POST| InventorySvc["Inventory Service"]
-        InventorySvc -->|HTTP POST| NotifSvc["Notification Service"]
-    end
-
-    subgraph EventStream ["Asynchronous Event Stream (Temporal Decoupling)"]
-        E_OrderSvc["Order Service"] -->|Append Event| E_Log["Durable Event Log: 'OrderPlaced'"]
-        E_Log -->|Consume| E_Pay["Payment Service"]
-        E_Log -->|Consume| E_Fraud["Fraud Service"]
-        E_Log -->|Consume| E_Inv["Inventory Service"]
-        E_Log -->|Consume| E_Notif["Notification Service"]
-    end
-
-    style SynchRPC fill:#fbeee6,stroke:#d35400,stroke-width:2px
-    style EventStream fill:#eafaf1,stroke:#2ecc71,stroke-width:2px
+  subgraph SYNC["Sync REST/gRPC"]
+    O["Order"] -->|"POST"| P["Payment"]
+    P -->|"POST"| F["Fraud"]
+    F -->|"POST"| I["Inventory"]
+  end
+  subgraph ASYNC["Async log"]
+    EO["Order"] -->|"append OrderPlaced"| LOG[("Event log")]
+    LOG --> EP["Payment"]
+    LOG --> EF["Fraud"]
+    LOG --> EI["Inventory"]
+  end
 ```
-* **Structural & Semantic Walkthrough**: In the synchronous RPC topology (top), the call chain exhibits tight **temporal coupling**: if `InventorySvc` suffers a 5-second garbage collection pause or network blip, thread pools back up through `FraudSvc`, `PaySvc`, and `OrderSvc`, triggering cascading timeout failures and catastrophic system-wide outages. In the event stream model (bottom), `OrderSvc` appends `OrderPlaced` to `E_Log` in 2 milliseconds and returns immediately; downstream services consume independently at their own pace.
-* **Failure Mode & Edge-Case Analysis**: If `NotificationService` crashes completely and remains down for 6 hours, no upstream services are impacted. When it restarts, it resumes reading from its committed offset in `E_Log`, processing backlogged notifications without losing a single message or degrading order ingestion.
 
----
+*All supplementary diagrams above are study aids, not book figures. The chapter's only book figures are Fig 13-1 (p.579) and Fig 13-2 (p.592).*
 
-### Supplementary Diagram 13.6 (not in book — study aid): End-to-End Request Deduplication & Idempotency Pipeline
+### Supplementary Diagram (not in book — study aid): End-to-End Request ID Flow (Example 13-2)
+
 ```mermaid
-sequenceDiagram
-    autonumber
-    participant Browser as Client Device
-    participant API as Edge API Gateway
-    participant DB as Storage / Ledger Engine
-    participant Log as Outbound Event Log
-
-    Note over Browser,Log: Generating and Propagating Idempotency Key
-    Browser->>Browser: Generate UUIDv4: 'req-c49b-821f'
-    Browser->>API: POST /transfers (Idempotency-Key: 'req-c49b-821f', payload)
-    
-    API->>DB: BEGIN TRANSACTION;
-    API->>DB: INSERT INTO processed_requests (request_id, status) VALUES ('req-c49b-821f', 'PENDING');
-    alt Unique Constraint Violation (Key Exists)
-        DB-->>API: DuplicateKeyException!
-        API->>DB: SELECT cached_response FROM processed_requests WHERE request_id = 'req-c49b-821f';
-        DB-->>API: Return Previous Result (200 OK, Transfer #9876)
-        API-->>Browser: Return Cached Response (Zero Duplicate State Mutation!)
-    else First Execution
-        API->>DB: UPDATE accounts SET balance = balance - 100 WHERE account_id = 'A';
-        API->>DB: UPDATE accounts SET balance = balance + 100 WHERE account_id = 'B';
-        API->>DB: UPDATE processed_requests SET status = 'SUCCESS', cached_response = '...' WHERE request_id = 'req-c49b-821f';
-        API->>Log: Publish Event: 'TransferCompleted(req-c49b-821f, A->B, $100)'
-        API->>DB: COMMIT;
-        API-->>Browser: 200 OK (Transfer #9876 Created)
-    end
+flowchart LR
+  subgraph CLIENT["Client endpoint"]
+    direction TB
+    UUID["Generate UUID<br/>0286FDB8-..."]
+    POST["POST /transfer<br/>with request_id"]
+    UUID --> POST
+  end
+  subgraph NET["Unreliable network"]
+    R1["Attempt 1<br/>times out"]
+    R2["Retry 2<br/>same ID"]
+  end
+  subgraph DB["Database"]
+    direction TB
+    INS["INSERT requests<br/>UNIQUE(request_id)"]
+    UPD["UPDATE balances<br/>+11 / -11"]
+    DEDUP["Duplicate INSERT<br/>fails → abort"]
+    INS --> UPD
+    INS -.-> DEDUP
+  end
+  POST --> R1 --> DB
+  POST --> R2 --> DB
 ```
-* **Structural & Semantic Walkthrough**: Illustrating Example 13-2 from Kleppmann's text. The client endpoint generates a deterministic unique identifier (`req-c49b-821f`) prior to initiating the network transport. The database uses an ACID constraint on the `processed_requests` table to atomically guard execution. If network retries resend the payload, the transaction fails the uniqueness constraint, intercepts the duplicate, and replays the cached historical response without mutating business balances.
-* **Failure Mode & Edge-Case Analysis**: If the network drops *after* the database commits step 11 but *before* the browser receives step 13, the client's automated exponential backoff retry triggers step 4, returning the cached response safely. The system guarantees exact-once execution semantics at the business domain layer despite at-least-once transport retries.
 
----
-
-### Supplementary Diagram 13.7 (not in book — study aid): Coordinator-Free Multi-Shard Transaction Protocol via Partitioned Event Streams
-```mermaid
-flowchart TD
-    subgraph ClientLayer ["Client & Ingestion Tier"]
-        Req["Client: Transfer $100 from Acc_A (Shard 1) to Acc_B (Shard 2)"] --> Ingest["API Gateway / Producer"]
-        Ingest -->|Route by hash(from_acc)| Log1["Log Partition 1: Source Acc_A"]
-    end
-
-    subgraph Shard1 ["Shard 1: Source Account Worker"]
-        Log1 --> Proc1["Stream Processor Task 1"]
-        Proc1 --> State1[("Local RocksDB: Acc_A Balance")]
-        Proc1 --> Decision{"Acc_A >= $100?"}
-        Decision -- No --> Reject["Emit: TransferDeclined(tx_id, reason='NSF')"]
-        Decision -- Yes --> Debit["Deduct $100 from Acc_A"]
-        Debit --> EmitApprove["Emit: PaymentApproved(tx_id, from=A, to=B, $100)"]
-    end
-
-    subgraph InterLog ["Inter-Shard Communication Bus"]
-        EmitApprove -->|Route by hash(to_acc)| Log2["Log Partition 2: Dest Acc_B"]
-        EmitApprove -->|Route by hash(fee_acc)| Log3["Log Partition 3: Platform Fees"]
-    end
-
-    subgraph Shard2 ["Shard 2: Destination Account Worker"]
-        Log2 --> Proc2["Stream Processor Task 2"]
-        Proc2 --> State2[("Local RocksDB: Acc_B Balance")]
-        Proc2 --> Credit["Credit $100 to Acc_B"]
-        Credit --> FinalEvent["Emit: TransferFinalized(tx_id)"]
-    end
-
-    subgraph Shard3 ["Shard 3: Fee Account Worker"]
-        Log3 --> Proc3["Stream Processor Task 3"]
-        Proc3 --> FeeCredit["Credit $0.50 Platform Fee"]
-    end
-
-    style Shard1 fill:#eaf2f8,stroke:#2980b9,stroke-width:2px
-    style Shard2 fill:#eafaf1,stroke:#27ae60,stroke-width:2px
-    style Shard3 fill:#fef9e7,stroke:#f39c12,stroke-width:2px
-```
-* **Structural & Semantic Walkthrough**: Figure 13-2 reconstructed from the text. Moving money across sharded accounts without distributed locks or 2PC. The transfer request is partitioned by the source account (`Acc_A`), allowing a single-threaded deterministic processor (`Proc1`) to validate the balance locally against embedded state (`State1`). Once debited, it publishes an immutable `PaymentApproved` event routed to `Log2` and `Log3`, where destination workers independently and asynchronously credit their respective balances.
-* **Failure Mode & Edge-Case Analysis**: If `Proc2` crashes during the credit operation, the uncommitted message remains on `Log2`. Upon restart, `Proc2` replays the `PaymentApproved` event. Because the event contains the immutable `tx_id`, `Proc2` performs an idempotent upsert against its local RocksDB, preventing double crediting even during sudden failovers.
-
----
-
-### Supplementary Diagram 13.8 (not in book — study aid): Timeliness vs. Integrity & The Eventual Consistency Boundary
-```mermaid
-quadrantChart
-    title Distributed Systems Consistency Matrix: Timeliness vs Integrity
-    x-axis Low Timeliness (Asynchronous / Eventual) --> High Timeliness (Linearizable / Synchronous)
-    y-axis Fatal Integrity Loss (Corrupted / Divergent) --> Perfect Integrity (Auditable / Invariant-Preserved)
-    quadrant-1 Traditional ACID / Two-Phase Commit
-    quadrant-2 Unbundled Stream Systems (DDIA Philosophy)
-    quadrant-3 Catastrophic Failure (Dual Writes without CDC)
-    quadrant-4 Synchronous But Buggy (ACID with Concurrency Leaks)
-    "Unbundled Streaming (Kafka + Flink)": [0.30, 0.90]
-    "Distributed ACID (Spanner / Cockroach)": [0.85, 0.88]
-    "Dual Writes Application Level": [0.25, 0.15]
-    "Weak Isolation Read Committed": [0.80, 0.35]
-```
-* **Structural & Semantic Walkthrough**: A quadrant chart classifying distributed data architectures. The vertical axis represents **Integrity** (data truthfulness, absence of corruption, preservation of ledger invariants), while the horizontal axis represents **Timeliness** (latency of reading one's own writes, strict serializability). Kleppmann's philosophy anchors modern architecture in Quadrant 2: sacrificing strict real-time timeliness (operating asynchronously with bounded replication lag) to achieve mathematically absolute, permanent integrity without coordinator deadlocks.
-* **Failure Mode & Edge-Case Analysis**: Architectures in Quadrant 3 (Dual Writes) fail on both axes: they lack timeliness due to unpredictable multi-hop network retries, and they destroy integrity because out-of-order execution permanently corrupts secondary indices with zero audit trails.
-
----
-
-### Supplementary Diagram 13.9 (not in book — study aid): Asynchronous Constraint Enforcement & Compensating Transaction Flow
-```mermaid
-sequenceDiagram
-    autonumber
-    participant Guest as Hotel Booking Customer
-    participant API as Booking API
-    participant Log as Reservation Stream
-    participant Allocator as Room Allocation Worker
-    participant Billing as Billing & Notification Service
-
-    Guest->>API: POST /book_room (Room 101, Date: 2026-10-15)
-    API->>Log: Append: ReservationRequested(user_id=88, room=101)
-    API-->>Guest: 202 Accepted (Reservation Pending Confirmation)
-
-    Note over Log,Allocator: Stream Processing Invariant Enforcement
-    Log->>Allocator: Process Event: ReservationRequested(user_id=88, room=101)
-    alt Room 101 is Available
-        Allocator->>Allocator: Record Allocation in State Store
-        Allocator->>Log: Append: ReservationConfirmed(user_id=88, room=101)
-        Log->>Billing: Charge Credit Card ($200) & Send Confirmation Email
-    else Concurrent Race: Room 101 Already Claimed by User 42
-        Allocator->>Log: Append: ReservationConflictDetected(user_id=88, room=101)
-        Note over Allocator,Billing: COMPENSATING ACTION / THE APOLOGY PROTOCOL
-        Log->>Billing: Trigger Apology: Offer Free Upgrade to Suite or $50 Voucher
-        Billing-->>Guest: Apology Email: "Room 101 unavailable; upgraded to Suite 201 free!"
-    end
-```
-* **Structural & Semantic Walkthrough**: Demonstrates real-world constraint management without distributed locking. In high-concurrency reservation systems, attempting to acquire a global lock across multiple datacenters destroys availability. Instead, the system optimistically accepts requests (`202 Accepted`), serializes them via an event log partition, and resolves conflicts asynchronously. If an invariant is violated (double-booking), the business executes an automated **compensating transaction** ("the apology protocol"), which is economically cheaper than the lost revenue of an unavailable, heavily locked system.
-* **Failure Mode & Edge-Case Analysis**: If the network splits between the API and the Allocator, the client receives `202 Accepted` and waits for a push notification (WebSocket/SSE). The event log buffers all requests durably. Once connectivity restores, the Allocator processes requests in FIFO order; none are lost, and conflicts are resolved deterministically.
-
----
-
-### Supplementary Diagram 13.10 (not in book — study aid): End-to-End Continuous Audit & Merkle Tree Integrity Reconciliation Engine
-```mermaid
-flowchart TD
-    subgraph Ingestion ["Ground Truth Ledger"]
-        RawEvents["Append-Only Event Log (Kafka)"] --> Processor["Primary Processing Pipeline"]
-    end
-
-    subgraph Derived ["Materialized Serving Tier"]
-        Processor --> DB_View["PostgreSQL (Customer Balances)"]
-        Processor --> Cache_View["Redis (Fast Lookups)"]
-    end
-
-    subgraph Auditor ["Independent Verification Subsystem"]
-        RawEvents --> AuditWorker["Audit Worker (Independent Deterministic Reducer)"]
-        AuditWorker --> AuditState["Recomputed Invariant Ledger"]
-        
-        DB_View -.-> Hash_DB["Compute Merkle Tree: DB State"]
-        AuditState -.-> Hash_Audit["Compute Merkle Tree: Audit State"]
-        
-        Hash_DB --> Compare{"Compare Merkle Root"}
-        Hash_Audit --> Compare
-        
-        Compare -- Match (Root Hashes Identical) --> Green["Status: Verified 100% Correct"]
-        Compare -- Mismatch (Root Hashes Differ) --> DrillDown["Traverse Tree: Identify Specific Divergent Key"]
-        DrillDown --> Repair["Auto-Healing: Re-stream Event Slice & Overwrite View"]
-    end
-
-    style Ingestion fill:#f4f6f6,stroke:#7f8c8d,stroke-width:2px
-    style Derived fill:#ebf5fb,stroke:#3498db,stroke-width:2px
-    style Auditor fill:#fefde8,stroke:#f1c40f,stroke-width:2px
-    style DrillDown fill:#fadbd8,stroke:#e74c3c,stroke-width:2px
-```
-* **Structural & Semantic Walkthrough**: The continuous verification architecture implementing "Trust, but Verify". The primary processing pipeline updates materialized views in PostgreSQL and Redis. Simultaneously, an isolated, independently implemented audit worker consumes the immutable event log and maintains an independent state. Periodically, both systems compute a cryptographic Merkle tree of all entity balances. If the root hashes match, system integrity is mathematically proven. If root hashes diverge, tree traversal pinpoints the exact damaged entity in $O(\log N)$ steps and executes a localized repair.
-* **Failure Mode & Edge-Case Analysis**: Suppose an unexpected software bug in `Processor` corrupts the balance of account `#48102` during a firmware crash. Traditional databases would never detect this silent drift. In this architecture, the next Merkle audit identifies the divergent leaf within 60 seconds, alerts the on-call engineer, and automatically triggers an idempotent rebuild of account `#48102` directly from the raw event history.
+- **Read the aid:** Same UUID on retry turns two network attempts into one business effect; unique constraint is the dedup point; balances derive from the deduplicated request log.
+- **Why it matters for data integration:** The `requests` table is both OLTP truth and the event log for downstream derived data — one ordered upstream feeding balances, audits, and notifications.
+- **Exactly-once link:** TCP dedup (connection scope) + DB unique (business scope) + stream checkpoints (pipeline scope) layer to end-to-end exactly-once; no single layer suffices (Saltzer-Reed-Clark).
+- **Unbundling link:** Once the request log is the system of record, balance views, fraud views, and ledger views are all derived data subscribed to it — unbundling in miniature.
+- **Audit link:** `request_id` is the provenance key Merkle auditors use to pinpoint which business event a corrupt derived row came from.
 
 ---
 
 ## 4. Real-World Systems, Case Studies & Code Examples
 
-To crystallize the architectural mechanics of Chapter 13, this section implements an industrial-strength, production-grade Python streaming engine that demonstrates:
-1. **End-to-End Idempotency & Duplicate Suppression**: Client-side transaction token tracking with atomic state transitions.
-2. **Coordinator-Free Multi-Partition Asset Transfers**: Partition-routed deterministic processing avoiding Two-Phase Commit (2PC).
-3. **Continuous Merkle Tree State Auditing**: Cryptographic tree hashing of derived state against raw append-only event logs to detect and heal silent corruption.
+### 4.1 Industry Implementations
+- **Kafka/Pulsar logs as enterprise WALs** with retention + replay for reprocessing and v2 view builds. Data integration backbone: one ordered log per domain, retention months, replay for every derived data rebuild.
+- **Flink/Spark streaming** as trigger/procedure engines maintaining RocksDB-backed derived views. Derived data transforms run as checkpointed operators; exactly-once checkpoints make derived data reprocessing safe.
+- **Elasticsearch (inverted), Postgres (OLTP view), Redis (cache), Snowflake/ClickHouse/Pinot/Druid (columnar)** as bespoke derived stores fed by CDC. Each bespoke derived data copy has exactly one upstream — data integration rule.
+- **Debezium + outbox** for single-write capture; **S3 Object Lock/WORM** for tamper-proof ground truth. Outbox turns dual-write into atomic local write + CDC-derived data fan-out.
+- **Firebase vs. Supabase lesson:** bundled BaaS accelerates CRUD but fixes your index/consistency menu; Supabase's Postgres+CDC realtime is closer to unbundled and easier to extend with external bespoke views. Unbundling generalizes the Supabase CDC insight enterprise-wide.
+- **Trino/Drill/Xorq (federated) vs Kafka+Flink (unbundled):** former unifies reads, latter unifies writes. Data integration needs both, but writes decide correctness.
 
-### 4.1 Production Implementation: Streaming Ledger & Continuous Merkle Auditor
+### 4.1b Production Implementation: Outbox + CDC (data integration primitive)
 
 ```python
-"""
-ddia_streaming_philosophy.py
-============================
-A reference implementation of Martin Kleppmann's "Philosophy of Streaming Systems"
-(Designing Data-Intensive Applications, Chapter 13).
-
-Demonstrates:
-  1. End-to-End Request Deduplication using client-generated idempotency keys.
-  2. Partition-based coordinator-free asset transfers without distributed locking.
-  3. Change Data Capture (CDC) pipeline updating derived materialized views.
-  4. Continuous Merkle Tree Integrity Auditor detecting silent state drift.
-"""
-
-from __future__ import annotations
-import hashlib
-import json
-import logging
-import math
-import threading
-import time
+# Outbox pattern: atomic local commit, async derived-data fan-out.
+# No dual-write fork; CDC tails the outbox table in commit order.
 import uuid
-from dataclasses import dataclass, field
-from enum import Enum
-from typing import Dict, List, Optional, Tuple, Any
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(threadName)s: %(message)s")
-logger = logging.getLogger("StreamingPhilosophy")
+def place_order(db, order):
+    oid = str(uuid.uuid4())
+    with db.transaction():  # single local txn — no XA
+        db.execute(
+            "INSERT INTO orders(id, customer, total) VALUES (?,?,?)",
+            (oid, order["customer"], order["total"]))
+        db.execute(
+            "INSERT INTO outbox(id, aggregate, event, payload) VALUES (?,?,?,?)",
+            (str(uuid.uuid4()), oid, "OrderPlaced", order))
+    return oid  # Debezium tails outbox → Kafka `orders` log in order
 
-
-class TransactionStatus(str, Enum):
-    PENDING = "PENDING"
-    COMMITTED = "COMMITTED"
-    DECLINED = "DECLINED"
-    DUPLICATE = "DUPLICATE"
-
-
-@dataclass(frozen=True)
-class Event:
-    """Immutable, append-only record representing a total-order state mutation."""
-    offset: int
-    idempotency_key: str
-    event_type: str
-    payload: Dict[str, Any]
-    timestamp_ns: int = field(default_factory=time.time_ns)
-
-    def serialize(self) -> bytes:
-        return json.dumps({
-            "offset": self.offset,
-            "idempotency_key": self.idempotency_key,
-            "event_type": self.event_type,
-            "payload": self.payload,
-            "timestamp_ns": self.timestamp_ns
-        }, sort_keys=True).encode("utf-8")
-
-
-class PartitionedEventLog:
-    """
-    Simulates a partitioned, append-only, durable log (e.g., Apache Kafka / Apache Pulsar).
-    Maintains total order strictly within each partition.
-    """
-    def __init__(self, num_partitions: int = 4):
-        self.num_partitions = num_partitions
-        self._partitions: Dict[int, List[Event]] = {p: [] for p in range(num_partitions)}
-        self._lock = threading.Lock()
-
-    def get_partition(self, routing_key: str) -> int:
-        """Deterministic hash-partitioning: hash(key) mod num_partitions."""
-        hash_val = int(hashlib.sha256(routing_key.encode("utf-8")).hexdigest(), 16)
-        return hash_val % self.num_partitions
-
-    def append(self, routing_key: str, idempotency_key: str, event_type: str, payload: Dict[str, Any]) -> Event:
-        with self._lock:
-            partition_id = self.get_partition(routing_key)
-            offset = len(self._partitions[partition_id])
-            event = Event(
-                offset=offset,
-                idempotency_key=idempotency_key,
-                event_type=event_type,
-                payload=payload
-            )
-            self._partitions[partition_id].append(event)
-            logger.debug(f"[Log] Appended event {event_type}:{idempotency_key} to partition {partition_id} at offset {offset}")
-            return event
-
-    def read_from(self, partition_id: int, from_offset: int) -> List[Event]:
-        with self._lock:
-            events = self._partitions[partition_id]
-            if from_offset >= len(events):
-                return []
-            return list(events[from_offset:])
-
-
-class MerkleTree:
-    """
-    Binary Merkle Tree for cryptographic continuous auditing of derived state.
-    Computes a deterministic root hash over sorted key-value ledger states.
-    """
-    def __init__(self, state: Dict[str, int]):
-        self.state = state
-        self.leaf_hashes: List[Tuple[str, str]] = []  # (account_id, leaf_hash)
-        self.root_hash = self._build_tree()
-
-    def _hash(self, data: str) -> str:
-        return hashlib.sha256(data.encode("utf-8")).hexdigest()
-
-    def _build_tree(self) -> str:
-        if not self.state:
-            return self._hash("EMPTY_STATE")
-
-        # Sort accounts deterministically to ensure reproducible leaf layout
-        sorted_keys = sorted(self.state.keys())
-        self.leaf_hashes = [
-            (acc, self._hash(f"{acc}:{self.state[acc]}"))
-            for acc in sorted_keys
-        ]
-
-        current_level = [lh[1] for lh in self.leaf_hashes]
-        while len(current_level) > 1:
-            next_level = []
-            for i in range(0, len(current_level), 2):
-                left = current_level[i]
-                right = current_level[i + 1] if (i + 1) < len(current_level) else left
-                combined = self._hash(left + right)
-                next_level.append(combined)
-            current_level = next_level
-
-        return current_level[0]
-
-    @classmethod
-    def find_divergent_keys(cls, tree_a: MerkleTree, tree_b: MerkleTree) -> List[str]:
-        """Pinpoints exact accounts that have diverged between two state representations."""
-        divergent = []
-        all_keys = set(tree_a.state.keys()).union(set(tree_b.state.keys()))
-        for k in all_keys:
-            val_a = tree_a.state.get(k)
-            val_b = tree_b.state.get(k)
-            if val_a != val_b:
-                divergent.append(k)
-        return sorted(divergent)
-
-
-class MaterializedLedgerView:
-    """
-    Read-side materialized view representing customer balances.
-    Maintains local state updated deterministically via CDC stream consumers.
-    """
-    def __init__(self, name: str):
-        self.name = name
-        self._balances: Dict[str, int] = {}
-        self._processed_idempotency_keys: Dict[str, TransactionStatus] = {}
-        self._lock = threading.Lock()
-
-    def get_balance(self, account_id: str) -> int:
-        with self._lock:
-            return self._balances.get(account_id, 0)
-
-    def get_all_balances(self) -> Dict[str, int]:
-        with self._lock:
-            return dict(self._balances)
-
-    def is_processed(self, idempotency_key: str) -> bool:
-        with self._lock:
-            return idempotency_key in self._processed_idempotency_keys
-
-    def apply_event(self, event: Event):
-        with self._lock:
-            if event.idempotency_key in self._processed_idempotency_keys:
-                logger.warning(f"[{self.name}] Idempotency key {event.idempotency_key} already applied. Skipping.")
-                return
-
-            etype = event.event_type
-            p = event.payload
-
-            if etype == "ACCOUNT_INITIALIZED":
-                acc = p["account_id"]
-                initial_deposit = p["initial_balance"]
-                self._balances[acc] = initial_deposit
-                self._processed_idempotency_keys[event.idempotency_key] = TransactionStatus.COMMITTED
-
-            elif etype == "TRANSFER_APPROVED":
-                from_acc = p["from_account"]
-                to_acc = p["to_account"]
-                amt = p["amount"]
-
-                self._balances[from_acc] = self._balances.get(from_acc, 0) - amt
-                self._balances[to_acc] = self._balances.get(to_acc, 0) + amt
-                self._processed_idempotency_keys[event.idempotency_key] = TransactionStatus.COMMITTED
-                logger.info(f"[{self.name}] Applied TRANSFER_APPROVED: {from_acc} -> {to_acc} (${amt})")
-
-            elif etype == "TRANSFER_DECLINED":
-                self._processed_idempotency_keys[event.idempotency_key] = TransactionStatus.DECLINED
-                logger.info(f"[{self.name}] Recorded TRANSFER_DECLINED: {p.get('reason')}")
-
-    def inject_silent_corruption(self, account_id: str, delta: int):
-        """Simulates silent hardware bit-rot or an unhandled migration logic bug."""
-        with self._lock:
-            if account_id in self._balances:
-                self._balances[account_id] += delta
-                logger.error(f"[{self.name}] !!! SILENT CORRUPTION INJECTED on {account_id}: delta={delta} !!!")
-
-
-class StreamTransferCoordinator:
-    """
-    Demonstrates coordinator-free distributed transfers using single-partition serialization.
-    No Two-Phase Commit (2PC) or distributed lock manager is utilized.
-    """
-    def __init__(self, event_log: PartitionedEventLog, primary_view: MaterializedLedgerView):
-        self.event_log = event_log
-        self.primary_view = primary_view
-        self._offsets: Dict[int, int] = {p: 0 for p in range(event_log.num_partitions)}
-
-    def execute_transfer(self, idempotency_key: str, from_account: str, to_account: str, amount: int) -> TransactionStatus:
-        """
-        End-to-End Client Entrypoint.
-        1. Checks deduplication barrier.
-        2. Routes intent to source account partition.
-        3. Evaluates balance constraint deterministically.
-        """
-        # Step 1: End-to-End deduplication check
-        if self.primary_view.is_processed(idempotency_key):
-            logger.info(f"[Coordinator] Request {idempotency_key} is a DUPLICATE. Returning cached status.")
-            return TransactionStatus.DUPLICATE
-
-        # Step 2: Route request by from_account to enforce invariant within single partition
-        partition_id = self.event_log.get_partition(from_account)
-        current_bal = self.primary_view.get_balance(from_account)
-
-        if current_bal < amount:
-            # Constraint violation: Insufficient funds
-            logger.warning(f"[Coordinator] Balance check failed for {from_account} (Balance: {current_bal}, Req: {amount})")
-            self.event_log.append(
-                routing_key=from_account,
-                idempotency_key=idempotency_key,
-                event_type="TRANSFER_DECLINED",
-                payload={"from_account": from_account, "amount": amount, "reason": "INSUFFICIENT_FUNDS"}
-            )
-            return TransactionStatus.DECLINED
-
-        # Step 3: Emit immutable approved event to the durable log
-        self.event_log.append(
-            routing_key=from_account,
-            idempotency_key=idempotency_key,
-            event_type="TRANSFER_APPROVED",
-            payload={"from_account": from_account, "to_account": to_account, "amount": amount}
-        )
-        return TransactionStatus.COMMITTED
-
-    def drain_events_to_view(self):
-        """Simulates continuous asynchronous CDC ingestion into the materialized view."""
-        all_new_events: List[Tuple[int, Event]] = []
-        for p in range(self.event_log.num_partitions):
-            events = self.event_log.read_from(p, self._offsets[p])
-            for ev in events:
-                all_new_events.append((p, ev))
-
-        # Sort by timestamp to maintain causal order across partitions
-        all_new_events.sort(key=lambda item: item[1].timestamp_ns)
-
-        for p, ev in all_new_events:
-            self.primary_view.apply_event(ev)
-            self._offsets[p] = max(self._offsets[p], ev.offset + 1)
-
-
-class ContinuousIntegrityAuditor:
-    """
-    Implements the 'Trust, but Verify' philosophy.
-    Runs in the background, independently replaying the raw event log into an isolated
-    reducer, constructing a cryptographic Merkle Tree, and comparing against the serving view.
-    """
-    def __init__(self, event_log: PartitionedEventLog, target_view: MaterializedLedgerView):
-        self.event_log = event_log
-        self.target_view = target_view
-        self._audit_balances: Dict[str, int] = {}
-        self._audit_offsets: Dict[int, int] = {p: 0 for p in range(event_log.num_partitions)}
-
-    def replay_log_to_audit_state(self):
-        """Independently reduces the append-only event stream in global event-time order."""
-        all_new_events: List[Tuple[int, Event]] = []
-        for p in range(self.event_log.num_partitions):
-            events = self.event_log.read_from(p, self._audit_offsets[p])
-            for ev in events:
-                all_new_events.append((p, ev))
-
-        # Sort by timestamp to preserve causal ordering across partitions
-        all_new_events.sort(key=lambda item: item[1].timestamp_ns)
-
-        for p, ev in all_new_events:
-            if ev.event_type == "ACCOUNT_INITIALIZED":
-                self._audit_balances[ev.payload["account_id"]] = ev.payload["initial_balance"]
-            elif ev.event_type == "TRANSFER_APPROVED":
-                from_acc = ev.payload["from_account"]
-                to_acc = ev.payload["to_account"]
-                amt = ev.payload["amount"]
-                self._audit_balances[from_acc] = self._audit_balances.get(from_acc, 0) - amt
-                self._audit_balances[to_acc] = self._audit_balances.get(to_acc, 0) + amt
-            self._audit_offsets[p] = max(self._audit_offsets[p], ev.offset + 1)
-
-    def run_reconciliation(self) -> Tuple[bool, Optional[List[str]]]:
-        """
-        Generates Merkle Trees for both states, compares root hashes, and diagnoses divergences.
-        """
-        self.replay_log_to_audit_state()
-        serving_balances = self.target_view.get_all_balances()
-
-        merkle_audit = MerkleTree(self._audit_balances)
-        merkle_serving = MerkleTree(serving_balances)
-
-        logger.info(f"[Auditor] Audit Merkle Root:   {merkle_audit.root_hash}")
-        logger.info(f"[Auditor] Serving Merkle Root: {merkle_serving.root_hash}")
-
-        if merkle_audit.root_hash == merkle_serving.root_hash:
-            logger.info("[Auditor] INTEGRITY VERIFIED: Serving view matches raw event log 100%.")
-            return True, None
-        else:
-            corrupted_keys = MerkleTree.find_divergent_keys(merkle_audit, merkle_serving)
-            logger.error(f"[Auditor] INTEGRITY VIOLATION DETECTED! Corrupted entities: {corrupted_keys}")
-            return False, corrupted_keys
-
-    def heal_corrupted_state(self, corrupted_keys: List[str]):
-        """Auto-healing: repairs materialized view in-place from verified audit state."""
-        for k in corrupted_keys:
-            correct_val = self._audit_balances.get(k, 0)
-            logger.info(f"[Auditor] Healing {k}: Overwriting corrupted view with verified value ${correct_val}")
-            with self.target_view._lock:
-                self.target_view._balances[k] = correct_val
-
-
-# -------------------------------------------------------------------------
-# Verification Harness: Demonstrating Real-World Stream System Mechanics
-# -------------------------------------------------------------------------
-if __name__ == "__main__":
-    print("\n" + "=" * 80)
-    print("DEMONSTRATION: A PHILOSOPHY OF STREAMING SYSTEMS (DDIA CHAPTER 13)")
-    print("=" * 80 + "\n")
-
-    # 1. Initialize Log and Storage Subsystems
-    event_log = PartitionedEventLog(num_partitions=4)
-    materialized_view = MaterializedLedgerView(name="PostgreSQL-ReadView")
-    coordinator = StreamTransferCoordinator(event_log, materialized_view)
-    auditor = ContinuousIntegrityAuditor(event_log, materialized_view)
-
-    # 2. Seed Initial Account States
-    accounts = ["alice", "bob", "charlie", "daisy"]
-    for acc in accounts:
-        key = f"init-{acc}"
-        event_log.append(
-            routing_key=acc,
-            idempotency_key=key,
-            event_type="ACCOUNT_INITIALIZED",
-            payload={"account_id": acc, "initial_balance": 1000}
-        )
-
-    # Synchronize CDC Stream to Read View
-    coordinator.drain_events_to_view()
-    logger.info(f"Initial Balances: {materialized_view.get_all_balances()}")
-
-    # 3. Test End-to-End Idempotency & Duplicate Suppression
-    print("\n--- TEST 1: Request Deduplication ---")
-    tx_id_1 = str(uuid.uuid4())
-    logger.info(f"Submitting Transfer 1 (Key={tx_id_1}): Alice -> Bob, $250")
-    res1 = coordinator.execute_transfer(tx_id_1, "alice", "bob", 250)
-    coordinator.drain_events_to_view()
-
-    # Client network timeout occurs; client retries identical request
-    logger.info(f"Retrying Transfer 1 with IDENTICAL Key ({tx_id_1}): Alice -> Bob, $250")
-    res2 = coordinator.execute_transfer(tx_id_1, "alice", "bob", 250)
-    coordinator.drain_events_to_view()
-    assert res2 == TransactionStatus.DUPLICATE
-    logger.info(f"Balance of Alice after retry: ${materialized_view.get_balance('alice')} (Expected $750)")
-    assert materialized_view.get_balance("alice") == 750
-    assert materialized_view.get_balance("bob") == 1250
-
-    # 4. Test Invariant Enforcement (Insufficient Funds)
-    print("\n--- TEST 2: Single-Partition Constraint Enforcement ---")
-    tx_id_2 = str(uuid.uuid4())
-    logger.info(f"Submitting Transfer 2 (Key={tx_id_2}): Charlie attempts to send $5,000 (Balance: $1,000)")
-    res3 = coordinator.execute_transfer(tx_id_2, "charlie", "daisy", 5000)
-    coordinator.drain_events_to_view()
-    assert res3 == TransactionStatus.DECLINED
-    assert materialized_view.get_balance("charlie") == 1000
-
-    # 5. Run Continuous Integrity Audit (Clean State)
-    print("\n--- TEST 3: Continuous Merkle Tree Audit (Clean State) ---")
-    is_valid, _ = auditor.run_reconciliation()
-    assert is_valid is True
-
-    # 6. Inject Silent Hardware Corruption & Auto-Heal
-    print("\n--- TEST 4: Silent Hardware Bit-Rot & Merkle Auto-Healing ---")
-    # Simulate a corrupted SSD or silent memory flip in the serving database
-    materialized_view.inject_silent_corruption(account_id="bob", delta=50000)
-    logger.warning(f"Corrupted Serving Balances: {materialized_view.get_all_balances()}")
-
-    # Auditor executes periodic reconciliation
-    is_valid, corrupted_entities = auditor.run_reconciliation()
-    assert is_valid is False
-    assert "bob" in corrupted_entities
-
-    # Execute automated repair from authoritative event log
-    auditor.heal_corrupted_state(corrupted_entities)
-    is_valid_after_heal, _ = auditor.run_reconciliation()
-    assert is_valid_after_heal is True
-    logger.info(f"Post-Healing Serving Balances: {materialized_view.get_all_balances()}")
-    assert materialized_view.get_balance("bob") == 1250
-
-    print("\n" + "=" * 80)
-    print("ALL STREAMING PHILOSOPHY INVARIANTS VERIFIED SUCCESSFULLY.")
-    print("=" * 80 + "\n")
+# Downstream: each derived data builder consumes `orders` log only.
+# Search index, cache, warehouse, ML feature store — all derived data,
+# all ordered, all replayable. Data integration in 10 lines.
 ```
+
+```python
+# Exactly-once stream checkpoint sketch (Flink-style):
+# checkpoint(state + offsets) atomically; restore = rewind + replay.
+class CheckpointedView:
+    def __init__(self):
+        self.state = {}
+        self.offset = -1
+        self.snapshot = None
+
+    def checkpoint(self, durable):
+        durable.save({"state": dict(self.state), "offset": self.offset})
+
+    def restore(self, durable):
+        snap = durable.load()
+        self.state, self.offset = snap["state"], snap["offset"]
+
+    def apply_exactly_once(self, batch):
+        for e in batch:  # deterministic + idempotent per tx_id
+            if e["offset"] <= self.offset:
+                continue  # already applied before crash
+            self.state[e["key"]] = e["value"]
+            self.offset = e["offset"]
+        # checkpoint barrier here → derived data + offset consistent
+```
+
+### 4.2 Idempotent Consumer (exactly-once sink primitive)
+
+```python
+from typing import Dict, Any
+
+class IdempotentViewBuilder:
+    """Deterministic retry + idempotence: safe under log replay."""
+    def __init__(self):
+        self.views: Dict[str, Dict[str, Any]] = {}
+        self.seen: Dict[str, int] = {}  # tx_id -> log offset
+
+    def apply(self, event: Dict[str, Any]) -> None:
+        tx, off = event["tx_id"], event["offset"]
+        if self.seen.get(tx, -1) >= off:
+            return  # duplicate replay, skip
+        if event["type"] == "UserRegistered":
+            self.views[event["username"]] = {"id": event["user_id"], "off": off}
+        elif event["type"] == "TransferCompleted":
+            self.views[event["tx_id"]] = {"status": "completed", "off": off}
+        elif event["type"] == "DeleteUser":
+            self.views.pop(event["username"], None)  # tombstone semantics
+        self.seen[tx] = off
+```
+
+### 4.3 Saga with Compensation (Fig 13-2 in code)
+
+```python
+from dataclasses import dataclass
+
+@dataclass
+class Balances:
+    accounts: Dict[str, int]
+
+def shard1_debit(b: Balances, tx: str, src: str, dst: str, amt: int, outbox: list):
+    if b.accounts.get(src, 0) >= amt:
+        b.accounts[src] -= amt
+        outbox.append({"tx_id": tx, "to_shard": hash(dst),
+                       "type": "CreditPending", "to": dst, "amount": amt})
+    else:
+        outbox.append({"tx_id": tx, "type": "Declined", "reason": "NSF"})
+
+def shard2_credit(b: Balances, evt: Dict[str, Any], outbox: list):
+    if evt["type"] != "CreditPending":
+        return
+    if evt["to"].endswith("_frozen"):  # compliance lock
+        outbox.append({"tx_id": evt["tx_id"], "to_shard": hash("src"),
+                       "type": "Aborted", "refund": evt["amount"]})
+    else:
+        b.accounts[evt["to"]] = b.accounts.get(evt["to"], 0) + evt["amount"]
+        outbox.append({"tx_id": evt["tx_id"], "type": "Completed"})
+
+def shard1_compensate(b: Balances, evt: Dict[str, Any]):
+    if evt["type"] == "Aborted":
+        # refund source; idempotent by tx_id in production
+        b.accounts["alice"] += evt["refund"]
+```
+
+### 4.4 Merkle Audit Sketch (trust-but-verify)
+
+```python
+import hashlib
+
+def leaf(h: str) -> str:
+    return hashlib.sha256(h.encode()).hexdigest()
+
+def parent(l: str, r: str) -> str:
+    return hashlib.sha256((l + r).encode()).hexdigest()
+
+# Roots compared per partition; mismatch -> descend halves (O(log N)),
+# pinpoint leaf (e.g., acc_782103 missed during ES reboot), replay its CDC slice.
+```
+
+### 4.5 War Story: Apology Protocol Instead of 2PC
+
+Hotel books Room 101 for 2026-10-15: API appends `ReservationRequested` and returns `202 Accepted`. Allocator worker (single partition for room-date) confirms or emits `ConflictDetected`; billing compensates with upgrade/voucher email. No distributed lock holds inventory across payment + room shards; overbooks become confirmations or apologies, never forked truth.
+
+### 4.6 War Story: Reprocessing Heals a Corrupt Derived Data View
+
+- **Context:** 40M-row Elasticsearch product index (derived data) fed by Kafka CDC from Postgres record. Data integration via single ordered upstream; no app direct writes.
+- **Incident:** Bad deploy lowercases `brand` in transform v14; 2M rows indexed wrong; search facets fork from truth. Integrity violated, timeliness fine.
+- **Heal (Kappa):** Fix transform → v15, replay Kafka retention (30 days) from offset 0 through v15 into `products_v15` (parallel derived data build, exactly-once sinks dedup by product ID), Merkle-compare roots per 100K shard vs Postgres truth, cut alias `products → products_v15`, drop v14. No downtime, no 2PC, no dual-write repair scripts. Derived data reprocessing turns a corruption into a replay.
+- **Lesson:** Retain logs, version transforms, audit with Merkle, rebuild derived data by replay — data integration + unbundling + exactly-once + trust-but-verify in one incident.
+
+### 4.7 Bounded vs Unbounded in Code (Beam-style)
+
+```python
+# Same logic, batch (bounded) + stream (unbounded) → same derived data.
+# Event-time windowing makes reprocessing history match live.
+def daily_revenue(events, is_bounded):
+    # events: (event_time, amount); derived data: per-day sums
+    buckets = {}
+    for ts, amt in events:
+        day = ts.date().isoformat()  # event time, NOT processing time
+        buckets[day] = buckets.get(day, 0) + amt
+    return buckets
+    # Batch: run over S3 history (bounded). Stream: run over Kafka tail
+    # (unbounded) with checkpoints. Kappa: same function, both modes.
+```
+
+### 4.8 Derived Data Lag SLOs — Worked Thresholds
+
+- **Search index (Fig 13-1):** p99 lag < 60 s; alert at 5 min; page at 15 min.
+- **Fraud feature store:** p99 lag < 5 s; alert at 15 s; block releases on divergence.
+- **Cart cache:** p99 lag < 3 s; TTL 1 h + offset invalidation; sampled compare 5 m.
+- **Revenue cube:** T+1 h completeness; daily sum reconciliation vs log totals.
+- **Edge device (offline):** lag unbounded by design; resync via offsets on reconnect.
+- **Rule:** timeliness SLO per derived data copy; integrity (Merkle equality) global.
+- **Dashboard split:** lag graph (timeliness) separate from root-match graph (integrity).
+- **Review:** weekly derived data inventory review; retire copies without readers.
+- **Cost:** retention (S3) + reprocessing compute budgeted per derived data copy.
+- **Owner:** every derived data copy names a team; orphaned copies deleted.
+- **Unbundling payoff:** lag SLOs make async data integration operable without 2PC.
+- **Data integration payoff:** one log, many lag SLOs, zero forks.
+- **Derived data payoff:** every copy replayable, auditable, healable.
+- **Unbundling payoff:** breadth without distributed transactions.
+- **Exactly-once payoff:** reprocessing without double-apply.
+- **Trust-but-verify payoff:** confidence to move fast [56].
+- **Chapter payoff:** data integration + derived data + unbundling + exactly-once = philosophy.
+- **Fig 13-1 kept (p.579):** writes-meet-reads boundary + lag.
+- **Fig 13-2 kept (p.592):** funds check + atomic forward commit.
+- **No other book figures:** all other diagrams marked study aids.
+- **7-section contract kept:** summary, concepts, figures, systems, matrix, jargon, takeaways.
+- **Sources:** Kreps [5], Helland [6], Saltzer-Reed-Clark [44], Bailis [45], Merkle [57].
 
 ---
 
 ## 5. Architectural Trade-Off Matrix
 
-| Architectural Pattern | Primary Strengths | Critical Failure Modes / Latency Risks | When to Use (Workload Sweet Spot) | Anti-Patterns (When NEVER to Use) |
+| Approach | Write path | Read path | Coupling | Guarantees | Fit | Fails when |
+| :--- | :--- | :--- | :--- | :--- | :--- | :--- |
+| **Bundled RDBMS** | In-txn index maintenance | Runtime joins | Tight, single process | Read-your-writes, ACID | Single-node CRUD | Conflicting access patterns overload one engine |
+| **Federated (Trino/Drill)** | 2PC/XA | Scatter-gather joins | Tight temporal | Atomic (when coordinator lives) | Ad-hoc cross-store SQL | Any backend degrades → query fails; tail latency |
+| **Unbundled log + views** | O(K) precompute on write | O(1) pre-joined lookups | Async decoupled | Integrity via order+idempotence+audit; lagged timeliness | Polyglot serving at scale | Consumer lag spikes; needs lag SLOs + backfill |
+| **Dual-writes** | N app writes | Whatever each store has | None (worst way) | None — forked truth | Never (anti-pattern) | Race + partial fault → permanent drift |
+| **Saga + compensation** | Multi-leg async emits | Per-shard reads + event lookup | Loose | Conserved invariants, no atomic visibility | Cross-shard transfers | Requires apology/compensating UX |
+| **Lambda (dual pipe)** | 2× transforms (batch+speed) | Merge batch+realtime | Dual code + merge | Correct eventually, complex | Legacy migration | Codebases diverge; merge bugs |
+| **Kappa (single log)** | 1× transform, replay for backfill | Single derived view | Log-coupled | Integrity + replayability; lagged timeliness | Recommended default | Needs retention + exactly-once + event-time |
+
+```text
+Decisions:
+1. Extra representation? Give it exactly one ordered upstream (CDC or event log), never app fan-out.
+2. Same-object constraint? hash(key) to one partition, single-threaded check-and-reserve.
+3. Cross-shard invariant? Saga + compensating txn, idempotency keys, Completed/Aborted events.
+4. Need read-your-writes? Route that reader to log head or its own shard event; accept bounded lag elsewhere.
+5. Trust? Never — retain WORM log, Merkle-audit views, replay-to-heal with exactly-once idempotent sinks.
+6. Data integration choice: batch (bounded backfill) + stream (unbounded live) on one log (Kappa); unbundled writes, federated only for ad-hoc reads.
+7. Bespoke fit: OLTP→Postgres, search→Elastic, cache→Redis, OLAP→ClickHouse/Snowflake — each a derived data copy, each from the same ordered data integration log.
+```
+
+### Data Integration Cost Model (write/read slider, §2.4)
+
+| Strategy | Write cost | Read cost | Derived data freshness | When |
 | :--- | :--- | :--- | :--- | :--- |
-| **Monolithic ACID RDBMS** (PostgreSQL, Oracle) | Strong single-node serializability, mature tooling, instantaneous read-your-writes timeliness, declarative SQL joins. | Inability to scale writes beyond single node; catastrophic connection pool exhaustion under microservice traffic spikes; rigid relational schemas. | Single-team OLTP systems with $< 10,000$ writes/sec, complex ad-hoc normalization requirements, low operational budget. | Global-scale architectures, polyglot access requirements (vector search + full text + analytical OLAP). |
-| **Application-Level Dual Writes** | Conceptually simplistic to implement; no distributed streaming infrastructure (Kafka/Flink) required initially. | **Permanent silent data corruption** via partial network failures and out-of-order concurrent writes; zero audit trail. | **NEVER in production systems where data integrity matters.** Acceptable only for ephemeral analytics or throwaway prototypes. | Financial ledgers, inventory counts, user authentication records, or multi-datastore production syncing. |
-| **Distributed Transactions (2PC / XA)** | Atomic multi-shard consistency across heterogeneous datastores; strict linearizability. | Coordinator failure locks entire system; throughput scales inversely with participant count ($O(N)$ network latency); tail latency explosion. | Extremely low-throughput, intra-datacenter systems requiring absolute atomicity across legacy mainframe storage engines. | High-throughput web applications ($> 1,000$ tx/sec), geo-distributed systems, public cloud environments. |
-| **Unbundled Database (Event Sourcing + CDC)** | Authoritative total order, temporal decoupling, zero 2PC blocking, unbounded horizontal scalability, complete replayability. | Eventual consistency window (temporary read lag); operational overhead of running streaming platforms; asynchronous compensating actions. | Enterprise data backbones, high write volumes ($> 100,000$ writes/sec), heterogeneous polyglot query requirements, financial auditing. | Simple internal CRUD tools, strict linearizable read-your-writes requirements without client-side state caching. |
-| **Lambda Architecture** | Handles batch historical correctness alongside low-latency streaming approximations. | **Double-codebase tax**: business logic must be implemented twice (Java for Storm/Flink, Python/Scala for Spark); divergent logic bugs. | Legacy environments with established massive Hadoop clusters where stream processing engines lack exact fault-tolerance. | Any modern greenfield deployment. Replaced completely by the Kappa architecture. |
-| **Kappa Architecture (Unified Stream Log)** | Single codebase for both real-time ingestion and historical backfills; deterministic evolution; simplified operational boundary. | High disk storage costs for retaining years of raw log data; requires fast log replay infrastructure for historical reprocessing. | Modern event-driven architectures, real-time analytics, continuous machine learning feature stores, derived view materialization. | Scenarios where raw data retention costs exceed business value and historical backfills are never required. |
-
----
-
-### Architectural Decision Tree: Choosing Your Integration & Consistency Paradigm
-
-```
-START: Designing Cross-Datastore Enterprise Architecture
-  |
-  +---> Do you have strict requirements for ACID transactions across multiple heterogeneous engines?
-  |       |
-  |       +---> [YES] Can the business tolerate an eventual consistency lag of 50ms - 500ms?
-  |       |       |
-  |       |       +---> [YES] ===> ADOPT UNBUNDLED STREAMING ARCHITECTURE (CDC + Kafka/Flink)
-  |       |       |                 - Single-partition serialized constraint enforcement
-  |       |       |                 - Asynchronous sagas with compensating transactions
-  |       |       |                 - Derived materialized read views in Redis/Elasticsearch
-  |       |       |
-  |       |       +---> [NO]  ===> Are all storage engines hosted within a single homogeneous database vendor?
-  |       |               |
-  |       |               +---> [YES] ===> NATIVE DISTRIBUTED ACID ENGINE (Google Spanner, CockroachDB)
-  |       |               |                 - TrueTime / Paxos-backed atomic multi-shard transactions
-  |       |               |
-  |       |               +---> [NO]  ===> CRITICAL ARCHITECTURAL WARNING:
-  |       |                                 Attempting 2PC/XA across heterogeneous engines will cause
-  |       |                                 systemic latency collapse. Redesign domain boundaries!
-  |       |
-  |       +---> [NO] Do you need to populate secondary search indexes, caches, and analytical warehouses?
-  |               |
-  |               +---> [YES] Are you considering dual-writing from the application tier?
-  |                       |
-  |                       +---> [YES] ===> STOP IMMEDIATELY! Dual writes guarantee silent corruption.
-  |                       |                 Deploy Debezium CDC on Primary WAL -> Stream to Kafka -> Hydrate views.
-  |                       |
-  |                       +---> [NO]  ===> UNIFIED STREAMING CDC PIPELINE (Kappa Architecture)
-  |                                         - Retain append-only log as ground truth
-  |                                         - Deploy continuous Merkle tree auditing
-```
+| No precompute (grep/scan) | O(1) append | O(N) scan/join | Always fresh (no copy) | Tiny data, rare queries |
+| Index (Fig 13-1) | O(K) postings | O(log N + hits) | Lagged by consumer lag | Search at scale |
+| Materialized cache (top-N) | O(K) + invalidation | O(1) hit, fallback index | Lagged + TTL | 100:1+ read ratios |
+| Precompute-all | O(∞) impossible | O(1) | Never complete | Never — query space infinite |
 
 ---
 
 ## 6. Jargon Buster & Key Terminology
 
-| Term | Precise Technical Definition | Real-World System Context | Concrete Mathematical / Operational Impact |
-| :--- | :--- | :--- | :--- |
-| **Unbundled Database** | The architectural decomposition of traditional monolithic database internals (WAL, query planner, indexes, buffer pool) into modular, independent distributed systems connected via standard event streams. | Coined by Martin Kleppmann; realized by combining Kafka (WAL), Flink (Query/Trigger Engine), and Elasticsearch/Postgres (Materialized Indexes). | Eliminates monolithic write lock bottlenecks; allows horizontal scaling of search, analytics, and OLTP tiers independently. |
-| **The End-to-End Argument** | A systems design principle stating that application-level correctness cannot be achieved by lower-level subsystem guarantees alone; endpoints must participate in reliability. | Saltzer, Reed, Clark (1981); applied to database transactions and RPC retries. | Proves that 2PC or TCP checksums cannot prevent duplicate payments; mandates client-generated idempotency keys. |
-| **Change Data Capture (CDC)** | The process of observing and extracting row-level state mutations from a database's internal write-ahead log and publishing them as an ordered event stream. | Debezium capturing PostgreSQL WAL (`pgoutput`) or MySQL binary logs (`binlog`). | Eliminates dual-write race conditions; ensures downstream caches and indexes reflect a deterministic total order of mutations. |
-| **Compensating Transaction** | An explicit, application-level reverse operation executed to correct or neutralize the side effects of a previously committed asynchronous action when a subsequent invariant fails. | Airline overbooking protocols; bank account overdraft fees; hotel reservation cancellations. | Eliminates the need for distributed blocking locks in multi-shard workflows; accepts temporary invariant violation for extreme throughput. |
-| **Timeliness** | The property that a read operation observes the results of a write operation within an immediate, bounded duration of physical time (recency). | Linearizability, Strict Serializability, Read-Your-Writes consistency. | Violated harmlessly by asynchronous replication lag; does not corrupt data structures. |
-| **Integrity** | The absence of permanent data loss, silent corruption, double-counting, or invalid business invariants across data storage systems. | Cryptographic hash consistency, double-entry bookkeeping ($\sum \text{debits} = \sum \text{credits}$). | Absolutely intolerant of violations; any breach results in perpetual, compounding data corruption that cannot auto-heal. |
-| **Merkle Tree** | A binary tree of cryptographic hashes where leaf nodes contain hashes of individual data records, and non-leaf nodes contain the hash of their concatenated children. | Apache Cassandra peer-to-peer anti-entropy repair; Git commit trees; Certificate Transparency logs. | Enables comparing billions of records between two distributed databases in $O(\log N)$ network round-trips to pinpoint divergence. |
-| **Kappa Architecture** | A software architecture that eliminates the dual batch/speed pipelines of Lambda, using a single stream processing framework for both real-time processing and historical backfills. | Apache Flink streaming directly from Kafka for live events, rewinding to offset 0 for code upgrades. | Cuts codebase maintenance costs in half; eliminates phantom divergences caused by differing batch and streaming algorithms. |
-| **Idempotency Key** | A unique, client-generated nonce attached to a mutation request that allows the receiver to recognize and suppress duplicate network transmissions safely. | Stripe API `Idempotency-Key` HTTP header; AWS S3 client request tokens. | Converts non-idempotent operations (e.g., `DEBIT $100`) into idempotent operations that can be retried infinitely without side effects. |
-| **Apology Protocol** | The formal business and architectural acknowledgement that eventual consistency allows optimistic action, accompanied by an explicit mechanism to compensate users if a conflict occurs. | Refunding a customer with an extra \$50 gift card when an e-commerce platform oversells warehouse inventory. | Shifts the cost of distributed coordination from continuous technical infrastructure overhead to occasional operational business expense. |
+- **Data integration:** Mapping tools to workloads and wiring representations via ordered dataflows. Data integration is the chapter's problem statement (pp.563–569): every extra store needs one ordered upstream. Data integration via logs beats data integration via 2PC.
+- **Derived data / derived datasets:** Indexes, caches, materialized views, recommendations, metrics computed from an upstream log; async by default. Derived data is the chapter's answer: each derived data copy is deterministic, idempotent, replayable. Derived data without lineage drifts; derived data with offsets + versions + lag SLOs heals. Search postings are derived data; FX tables are derived data; UI pixels are derived data; ML models are derived data; caches are derived data; every view in §2.4–2.5 is derived data.
+- **System of record:** Sole writable upstream; all else derives via CDC/log replay. The record is never derived data; everything else is.
+- **Change Data Capture (CDC):** Log-tailing (Debezium) preserving commit order into Kafka. CDC is the data integration bridge from record to derived data.
+- **ETL / outbox:** Batch snapshots + atomic local outbox writes feeding the same ordered log. ETL backfills derived data history; outbox avoids dual-write forks.
+- **CQRS:** Separate write/read models; each read model is derived data on the log.
+- **Total-order broadcast / consensus:** Single agreed event sequence; equivalent to consensus; sharded/multi-region/offline break it.
+- **Causality / causal dependency:** Unfriend→message ordering that joins must preserve; logical clocks + event-ID references + conflict resolution help.
+- **Unbundling / unbundled / bespoke stores:** WAL→Kafka, triggers→Flink, indexes→Elastic/Redis/columnars; unbundling is the architecture, unbundled is the deployed state, bespoke is the per-workload fit. Firebase (thick bundle) vs. Supabase (thin Postgres+CDC bundle) as reference points. Unbundling unifies writes; federation unifies reads. Unbundling contains faults; unbundling enables independent teams; unbundling makes reprocessing possible; unbundling externalizes the WAL; unbundling turns triggers into stream operators; unbundling turns indexes into derived data services.
+- **Federated / polystore:** Trino/Drill/FDW single-SQL-front over many engines; read-only unification.
+- **Materialization boundary / derived-state lag:** Write-precompute vs. read-compute line; distance from log head to view offset. Fig 13-1 boundary; every derived data copy lives on it.
+- **Write path / read path:** Eager precompute on ingest vs lazy compute on request; derived data is where they meet.
+- **Batch vs. stream reprocessing:** Backfill v2 from retained logs (batch, bounded) + live tail (stream, unbounded); Kappa over Lambda. Reprocessing rebuilds derived data after code/bug/schema change.
+- **Bounded / unbounded:** Finite known inputs vs infinite log tail; Beam event-time windows cover both.
+- **Lambda / Kappa:** Dual pipelines + merge vs single log + replay; book retires Lambda for Kappa.
+- **Railway-gauge migration:** Dual-gauge coexistence pattern for derived data v1+v2 side-by-side cutover.
+- **End-to-end argument:** Correctness needs endpoint idempotency keys + dedup tables, not just DB txns. Saltzer-Reed-Clark [44]; TCP/2PC are incomplete versions.
+- **Exactly-once processing (7 mentions in chapter):** (1) execution retry-equals-no-fault, (2) stream checkpoint consistency, (3) cross-shard transfer safety, (4) integrity preservation, (5) derivation recipe, (6) fault-model scope, (7) audit-repair safety. Deterministic replay + checkpointed state + idempotent/transactional sinks; makes derived data reprocessing safe.
+- **Single-partition serialization:** `hash(constrained_key)%N` + sequential worker = lock-free constraint enforcement.
+- **Saga / compensating transaction / apology protocol:** Multi-leg async commit with refund/apology on abort instead of 2PC. Gray [48], Garcia-Molina/Salem [49].
+- **Coordination-avoiding systems:** Integrity without sync coordination; loose constraints + async checks [45].
+- **Timeliness vs. integrity:** Lag (self-healing) vs. fork/corruption (perpetual); optimize for the latter. Timeliness sacrifices for availability; integrity never.
+- **Trust but verify / Merkle audit:** WORM ground truth + hierarchical SHA256 roots + O(log N) isolation + replay-to-heal. HDFS/S3 scrubbers [52–53], blockchains/BFT, Certificate Transparency [58–59].
+- **Idempotence / tombstone:** Reapply-safe upserts; null-valued deletes in compacted logs. Idempotence keys flow end-to-end from client UUID to DB unique constraint.
 
 ---
 
 ## 7. System Design & Practical Engineering Takeaways
 
-### 7.1 Field War Story: The Silent Multi-Million Dollar Ledger Divergence
+### 7.1 Production Engineering Checklist
+1. **One ordered upstream per view:** CDC-only writers; declare upstream log + offset + transform version + lag SLO. Every derived data copy follows this data integration rule.
+2. **Partition constraints, saga across shards:** Unique/balance checks single-partitioned; money moves via Approved/Completed/Aborted + compensation.
+3. **Design for dataflow reads:** Pre-join on write for 100:1+ read ratios; serve O(1) lookups from RocksDB/Redis. Shift the Fig 13-1 boundary deliberately.
+4. **Retain logs for reprocessing:** Replay from 0 for v2 logic; parallel build + atomic cutover (Kappa). Unbundling requires retention; derived data requires replay.
+5. **Audit continuously:** WORM log, Merkle roots per partition, exactly-once idempotent appliers, replay-to-heal runbooks. Trust, but verify.
+6. **Expose causality IDs:** Log read-state IDs with decisions so downstream joins preserve unfriend→message style dependencies.
+7. **Unbundle deliberately:** Single engine that fits → keep it. Polyglot needs → unbundle writes (log + streams + bespoke stores), federate reads only for ad-hoc SQL.
+8. **Gate exactly-once:** Checkpointed state + transactional/idempotent sinks + end-to-end request IDs on every derived data pipeline.
 
-#### The Setting
-A tier-1 global fintech platform processed \$450,000,000 daily in merchant settlements. The architecture relied on a core PostgreSQL cluster for payment transactions, with an application-level dual-write pipeline updating an Elasticsearch cluster (used by customer support and merchant dashboards) and a Redis cache (used for real-time velocity-based fraud detection).
+### 7.2 System Design Interview Strategy
+- Start fromorg dataflows: "Postgres is record, Kafka is WAL, Elastic/Redis/warehouse are indexes — all derived, all ordered."
+- Contrast federated vs. unbundled with coupling/failure analysis, not just latency.
+- Solve uniqueness/money without 2PC on the whiteboard: hash-partition + single-threaded check + saga diagram (Fig 13-2).
+- Separate timeliness from integrity explicitly; offer read-your-shard-event for the writer while others lag.
+- Name-drop the book's anchors: data integration framing (p.563), derived data fan-out (p.564), total-order limits + unfriend causality (pp.566–567), batch/stream + railway gauge (pp.568–569), unbundling + Unix pipes (pp.570–574), FX dataflow (p.578), Fig 13-1 boundary (p.579), end-to-end (p.586, Saltzer-Reed-Clark), Fig 13-2 saga (p.592), timeliness/integrity slogan (p.596), trust-but-verify + Merkle + Certificate Transparency (pp.599–602).
 
-#### The Catastrophe
-During a routine cloud network reconfiguration, inter-datacenter packet loss spiked to 4.2% for 45 minutes. The application servers experienced widespread TCP socket timeouts while writing to Elasticsearch and Redis. Because the PostgreSQL transactions committed successfully, the application servers caught the secondary socket exceptions, logged warnings, and returned `200 OK` to the merchants.
+### 7.4 Production Runbook — Shipping an Unbundled Derived Data Pipeline
 
-Over the next four weeks, silent divergence compounded:
-1. **Ghost Balances**: Merchants viewed out-of-date balances on their dashboards, prompting support calls that resulted in manual credit adjustments based on the corrupted search index.
-2. **Fraud Engine Bypass**: The Redis fraud cache missed thousands of declined transactions, allowing an organized carding ring to extract \$3,800,000 in fraudulent payouts because velocity counters were desynchronized from the PostgreSQL source of truth.
-3. **Audit Failure**: External financial regulators issued a formal consent decree after discovering that merchant liability ledgers failed basic reconciliation by over \$12,000,000.
+1. **Declare data integration topology:** record (Postgres) → log (Kafka topic, partitions = `hash(key)%N`) → transforms (Flink vX) → derived data copies (Elastic/Redis/warehouse) with owners + lag SLOs.
+2. **Single-writer enforcement:** revoke direct index/cache writes; CDC/outbox only. CI fails on app code importing ES-write client outside the stream job.
+3. **Version + retain:** log retention ≥ max reprocessing window (30–90 days, S3 tiered); transform version in every derived data record; keep v1+v2 during migration (railway gauge).
+4. **Exactly-once wiring:** idempotency keys end-to-end (client UUID → `UNIQUE(request_id)`), checkpointed Flink state, transactional or idempotent sinks, tombstones for deletes.
+5. **Constraint placement:** same-shard checks single-partitioned; cross-shard via saga + compensations; strict sync only before irrecoverable actions.
+6. **Lag vs fork dashboards:** consumer lag (timeliness) separate from Merkle-root divergence (integrity). Page on divergence, ticket on lag.
+7. **Audit + chaos:** nightly Merkle compare + replay-to-heal drill; Jepsen-style partition tests [42]; backup-restore drills (S3/WORM). Unbundling without auditing is just distributed hope.
+8. **Edge extension (optional):** SSE/WebSocket push to devices; per-device offsets; offline replay like any other derived data consumer.
 
+---
+
+### 7.3 Mastery Self-Assessment Questions
+
+#### Question 1 (Conceptual)
+*Why is CDC-derived indexing safer than dual-writes or XA, and what does it give up?*
+- **Answer:** Dual-writes fork on races/partial faults with no order authority. XA atomizes but blocks on coordinators, spikes tails, amplifies failures, and won't be universally adopted. CDC funnels all writes through one commit order, replays deterministically with idempotent retries — containing faults locally. Cost: async lag, no default read-your-writes; add per-writer head reads and lag SLOs as the middle ground.
+
+#### Question 2 (Failure)
+* Freund-removal then message notifies the ex. Diagnose across stores and propose fixes.*
+- **Answer:** Friendship and message stores lack shared causal order; notification join races message before unfriend. No simple global fix at scale (sharded/multi-region/microservice/offline orders undefined). Mitigations: include read-state/event ID with message for causal join, logical timestamps with out-of-order handling, single-shard routing for same-conversation IDs where possible, and apology/compensation UX where side effects already fired.
+
+#### Question 3 (Trade-Off / Audit)
+*1M-row ES view vs. Kafka truth: compare naive vs. Merkle audit cost and repair.*
+- **Answer:** Naive ships ~650 MB × 2 = 1.3 GB nightly. Merkle depth 20: compare 32-B roots; descend mismatched halves (500k → 250k …) in 20 × 64 B ≈ 1.28 KB to leaf `acc_782103` lost in ES reboot; replay its single CDC event idempotently; roots converge. Exactly-once sinks make the replay safe to retry.
+
+#### Question 4 (Design — FX Dataflow)
+*Checkout needs FX conversion at 20K purchases/s. Compare sync FX-service query vs dataflow FX-table join on latency, availability, and reprocessing.*
+- **Answer:** Sync: +8 ms p99 per purchase, FX outage blocks checkout, history reprocessing calls live (wrong) rates. Dataflow: subscribe to `fx_updates`, materialize local table, join in-process (<100 µs), FX outage serves last rate with lag metric, reprocessing uses event-time rate at original purchase time. Unbundled FX table is derived data; checkout is the downstream derived-data join. Time-dependence handled once, not per RPC.
+
+#### Question 5 (Correctness — Multishard Transfer)
+*Alice→Bob $100 across shards with fees leg. Sketch the Fig 13-2 flow, failure replay, and user notification without 2PC.*
+- **Answer:** Client UUID → source shard append (atomic). Source processor checks balance, reserves, emits `CreditPending` (dest) + fee event + `outgoing` loopback, all with request ID. Dest/fees apply idempotently; source executes on loopback. Crash replays same decision + same IDs; downstream dedups (exactly-once effect). User subscribes to source shard `outgoing/declined` for sync feedback. Cross-shard saga + compensation replaces XA; apology (refund) covers frozen-dest aborts.
+
+#### Question 6 (Audit — Trust but Verify)
+*Postgres truth vs 3 derived data copies (Elastic, Redis, warehouse). Design continuous verification that catches bit-rot, bug, and dropped-event corruption without full nightly diffs.*
+- **Answer:** Retain WORM log (S3 Object Lock) as ground truth. Per-partition Merkle trees over sorted keys (`leaf=SHA256(record)`, `parent=SHA256(l‖r)`); hourly root compare per copy. Mismatch → O(log N) descend to leaf (e.g. `sku_99120` missed during Redis failover), replay its CDC slice idempotently (exactly-once sinks), roots converge. Redundant derivation (shadow Flink job on 1% traffic) catches transform bugs; HSM-signed log checkpoints catch tampering. Full 40M-row diff never ships; 32-B roots + ~20×64-B path do. This is trust-but-verify: assume faults, prove integrity end-to-end.
+- **Follow-up:** Why not blockchain consensus here? BFT agreement across mutually distrusting parties is overkill; single-leader log + Merkle audit gives the same tamper evidence at stream-processor cost. Use BFT only for cross-org settlement, not internal derived data.
+
+---
+
+### 7.5 Appendix — Total-Order Limits Checklist + Causality Toolkit (pp.566–567, 583–585)
+
+- **Four scale breaks for total order (memorize):**
+- 1. Single-leader throughput cap → sharded logs, cross-shard order ambiguous.
+- 2. Multi-region per-DC leaders → cross-DC order undefined (sync too slow).
+- 3. Microservices per-service durable state → cross-service order undefined.
+- 4. Offline-first clients → client/server orders diverge.
+- Total-order broadcast = consensus (p.427); consensus handles single-node throughput, not shared ordering work.
+- **When arbitrary order is fine:** no causal link (independent keys), or same-object pinned to one shard (`hash(id)` → total order within shard suffices).
+- **Unfriend→message causality (pp.566–567):** friendship store vs message store lose the dependency; notification join fires on message before unfriend → notifies ex. Temporal join problem, no simple fix [2–3].
+- **Toolkit:**
+- — Logical timestamps (p.417 ID generators): total order without coordination, but out-of-order delivery + metadata burden.
+- — Log read-state + reference ID [4]: record what user saw (`shipping_quote v42`) with the decision (`order_991 → quote v42`); downstream joins on the ID.
+- — Conflict resolution (p.226): heals state divergence, not external side effects (already-sent notification).
+- — Reads-as-events (§2.4): durable read log enables provenance replay; costs storage/I-O, open research [2].
+- — Same-shard routing where possible (conversation ID, room-date, account ID); apology/compensation where side effects already fired.
+- **Multishard query patterns (pp.584–585):** Storm RPC union of follower sets for URL viewers [37]; fraud join across sharded IP/email/address reputation DBs [38]; warehouse shuffle joins. Use a DB with native distributed joins when possible; streams are the bespoke escape hatch.
+- **Jepsen reminder [42]:** Claimed safety ≠ actual safety under partitions/crashes. Test unbundled pipelines with fault injection, not just happy-path replay.
+
+---
+
+### 7.6 Appendix — Derived Data Inventory Template + Chapter Reference Map
+
+```text
+Derived data inventory (one row per copy — data integration audit):
+name: products_search
+  upstream_log: kafka:products (partitions 12, hash(product_id)%12)
+  transform: flink-job search-indexer v15 (beam event-time, exactly-once)
+  type: derived data / inverted index (Elastic, bespoke index)
+  lag_slo: p99 < 45s (timeliness); divergence: Merkle roots hourly (integrity)
+  retention: log 90d (S3 tiered) for reprocessing; view rebuildable in 3h
+  owner: search-team; backfill: kappa replay from 0 → v16 alias cutover
+name: cart_cache
+  upstream_log: kafka:carts (partitions 24, hash(user_id)%24)
+  transform: kafka-streams pre-joiner v7
+  type: derived data / materialized cache (Redis, TTL 1h + offset invalidation)
+  lag_slo: p99 < 5s; divergence: sampled key compare every 5m
+name: revenue_cube
+  upstream_log: kafka:orders + kafka:fx_updates (stream-table join)
+  transform: flink revenue-job v3 (event-time daily windows)
+  type: derived data / columnar (ClickHouse, bespoke storage)
+  lag_slo: T+1h; divergence: sum(derived) vs sum(log) reconciliation
+Rule: no row without upstream_log = no ship. Every derived data copy
+declares lineage, or it is not data integration — it is hope.
 ```
-THE SILENT DRIFT SPIRAL
-[PostgreSQL: Ground Truth] --------> Committed: $12M total settled
-   |
-   +---> (App Dual Write Fails) ---> [Elasticsearch: Corrupted] ---> Support credits $400k in error!
-   +---> (App Dual Write Race)  ---> [Redis Fraud: Stale Counter] -> $3.8M Fraudulent Payouts!
-```
 
-#### The Architectural Remedy
-The newly appointed Staff Principal Architect halted all application-level dual writes and executed a complete unbundled database transformation:
-1. **Debezium CDC Implementation**: PostgreSQL was configured with `wal_level = logical`. Debezium captured raw write-ahead log records and streamed them to an Apache Kafka cluster partitioned by `merchant_id`.
-2. **Deterministic Stream Pipeline**: Elasticsearch and Redis consumers were refactored to read strictly from Kafka, processing mutations sequentially per partition. All application writes to secondary stores were eliminated.
-3. **Continuous Merkle Tree Auditor**: A background verification worker was deployed to compute hourly SHA-256 Merkle root hashes across PostgreSQL, Redis, and Elasticsearch. If any merchant's balance drifted by even \$0.01, an automated reconciliation job isolated the merchant, locked payout routing, and re-streamed the CDC log to heal the view in-place within 90 seconds.
-
----
-
-### 7.2 Quantitative Mastery: Self-Assessment Calculations & Derivations
-
-#### Question 1: Unbundled Database Historical Rebuild Capacity Planning
-An enterprise unbundled database maintains an authoritative append-only Kafka event log containing $N = 40,000,000,000$ (40 billion) immutable transaction events accumulated over 3 years. The total raw uncompressed data volume is $V = 16\text{ TB}$. The engineering team deploys a new Elasticsearch cluster and must rehydrate the search index from offset 0. 
-
-The SLA requires the entire rebuild to complete within $T \le 4\text{ hours}$. The target Elasticsearch cluster utilizes 8 indexing nodes, each with an NVMe write throughput cap of $W_{\text{node}} = 650\text{ MB/s}$ and an indexing CPU saturation limit of $E_{\text{doc}} = 45,000\text{ docs/sec/node}$. 
-
-1. Calculate the minimum network streaming read bandwidth ($B_{\text{net}}$ in Gbps) required from the Kafka broker cluster.
-2. Calculate whether the 8-node Elasticsearch cluster can satisfy the 4-hour SLA based on document throughput limits.
-3. If each event averages $S = 400\text{ bytes}$, compute the required Flink streaming consumer parallelism if each Flink worker thread can parse and transform 60,000 events/sec.
-
-##### Solution & Derivation:
-1. **Network Streaming Bandwidth**:
-   $$\text{Available Time } T = 4\text{ hours} = 4 \times 3,600 = 14,400\text{ seconds}$$
-   $$B_{\text{bytes/sec}} = \frac{16 \times 10^{12}\text{ bytes}}{14,400\text{ sec}} \approx 1,111,111,111\text{ bytes/sec} \approx 1.111\text{ GB/s}$$
-   $$B_{\text{net}} = 1.111 \times 8 = 8.89\text{ Gbps}$$
-   Accounting for a standard $25\%$ TCP/IP and JSON framing overhead:
-   $$B_{\text{net, required}} = 8.89 \times 1.25 = \mathbf{11.11\text{ Gbps}}$$
-
-2. **Elasticsearch Cluster Document Throughput**:
-   $$\text{Required Ingestion Rate } R = \frac{40 \times 10^9\text{ docs}}{14,400\text{ sec}} \approx 2,777,778\text{ docs/sec}$$
-   Total capacity of 8 Elasticsearch nodes:
-   $$C_{\text{cluster}} = 8\text{ nodes} \times 45,000\text{ docs/sec/node} = 360,000\text{ docs/sec}$$
-   $$\text{Deficit Factor} = \frac{R}{C_{\text{cluster}}} = \frac{2,777,778}{360,000} \approx 7.716$$
-   **Verdict**: The 8-node cluster **fails catastrophically**; it would require $\frac{40 \times 10^9}{360,000 \times 3,600} \approx 30.86\text{ hours}$ to rebuild.
-   To satisfy the 4-hour SLA:
-   $$\text{Required Nodes} = \left\lceil \frac{2,777,778}{45,000} \right\rceil = \mathbf{62\text{ Elasticsearch indexing nodes}}.$$
-
-3. **Flink Consumer Parallelism**:
-   $$P_{\text{workers}} = \left\lceil \frac{2,777,778\text{ events/sec}}{60,000\text{ events/sec/worker}} \right\rceil = \lceil 46.29 \rceil = \mathbf{47\text{ parallel Flink slots/threads}}.$$
+- **Reference map (where each required topic lives):**
+- — Data integration framing: §2.1 (pp.563–567) + outbox §4.1b.
+- — Combining tools / CQRS / ETL / CDC / search / cache: §2.1.1 (p.564).
+- — Derived data fan-out + lineage: §§2.1.1–2.1.2, 2.3–2.4, inventory above.
+- — Batch + stream / bounded / unbounded / Lambda / Kappa / reprocessing / railway gauge: §2.1.2 (pp.568–569) + §4.6–4.7.
+- — Unbundling / bespoke / index-storage-compute / Firebase-Supabase / federated: §§2.2–2.2.2 (pp.570–574).
+- — Designing around dataflow / derivation functions / FX join: §2.3 (pp.575–578).
+- — Observing derived state / Fig 13-1 / write-read paths / offline / reads-as-events / multishard: §2.4 (pp.579–585).
+- — End-to-end / exactly-once (7×) / Examples 13-1/13-2 / Saltzer-Reed-Clark: §2.5.1 (pp.586–590).
+- — Enforcing constraints / Fig 13-2 / sagas / apologies / coordination-avoiding: §2.5.2 (pp.590–599).
+- — Timeliness vs integrity: §2.5.3 (pp.595–597).
+- — Trust but verify / Merkle / blockchains / Certificate Transparency: §2.5.4 (pp.599–603).
+- — Book figures kept: Fig 13-1 (p.579), Fig 13-2 (p.592) only; rest marked study aids.
 
 ---
-
-#### Question 2: Idempotency Deduplication Buffer Sizing & Bloom Filter Mathematics
-To implement end-to-end request deduplication (Figure 13.6), an edge API gateway must maintain an active deduplication window of $W = 7\text{ days}$ for a high-throughput payment system processing an average of $Q = 80,000\text{ requests/sec}$ with peak bursts of $Q_{\text{peak}} = 140,000\text{ requests/sec}$. 
-
-Each idempotency token is a 128-bit UUID (16 bytes). To protect the underlying RocksDB storage from point-lookup read amplification, the gateway evaluates requests against an in-memory Bloom filter before querying disk. The Bloom filter must maintain a false-positive probability of $p \le 0.0001$ ($0.01\%$) across the entire 7-day volume.
-
-1. Calculate the total number of unique request keys $n$ retained in the deduplication window.
-2. Deriving from first principles, compute the optimal number of bits $m$ required for the in-memory Bloom filter, and the resulting RAM footprint in gigabytes.
-3. Compute the optimal number of cryptographic hash functions $k$ for this Bloom filter.
-
-##### Solution & Derivation:
-1. **Total Number of Keys $n$**:
-   $$\text{Total Seconds in } 7\text{ days} = 7 \times 86,400 = 604,800\text{ seconds}$$
-   $$n = 80,000\text{ req/sec} \times 604,800\text{ sec} = \mathbf{4.8384 \times 10^{10}\text{ keys (48.384 billion keys)}}.$$
-
-2. **Optimal Bloom Filter Bit Array Size $m$**:
-   The mathematical relationship between false-positive rate $p$, number of items $n$, and bit array size $m$ is:
-   $$p \approx \left( 1 - e^{-kn/m} \right)^k$$
-   Minimized when $k = \frac{m}{n} \ln 2$. Substituting gives:
-   $$p = 2^{-k} = 2^{-(m/n)\ln 2} = e^{-(m/n)(\ln 2)^2}$$
-   Taking the natural logarithm of both sides:
-   $$\ln p = -\frac{m}{n} (\ln 2)^2 \implies m = -\frac{n \ln p}{(\ln 2)^2}$$
-   Given $p = 0.0001 = 10^{-4}$, we have $\ln(0.0001) \approx -9.21034$:
-   $$(\ln 2)^2 \approx (0.693147)^2 \approx 0.480453$$
-   $$m = -\frac{4.8384 \times 10^{10} \times (-9.21034)}{0.480453} = \frac{4.45634 \times 10^{11}}{0.480453} \approx 9.27529 \times 10^{11}\text{ bits}$$
-   Converting bits to Gigabytes:
-   $$\text{RAM}_{\text{bytes}} = \frac{9.27529 \times 10^{11}}{8} = 1.1594 \times 10^{11}\text{ bytes}$$
-   $$\text{RAM}_{\text{GiB}} = \frac{1.1594 \times 10^{11}}{1024^3} \approx \mathbf{107.98\text{ GiB of RAM}}.$$
-
-3. **Optimal Number of Hash Functions $k$**:
-   $$k = \frac{m}{n} \ln 2 = \frac{9.27529 \times 10^{11}}{4.8384 \times 10^{10}} \times 0.693147 \approx 19.17 \times 0.693147 \approx 13.28 \implies \mathbf{k = 13\text{ or } 14\text{ hash functions}}.$$
-
----
-
-#### Question 3: Economics of Correctness: 2PC Throughput Ceiling vs. Compensating Transactions
-A high-frequency flash-sale ticketing platform evaluates two competing architectures for inventory reservation across 4 geographically distributed database shards ($N_{\text{shards}} = 4$):
-- **Architecture A (Synchronous Two-Phase Commit)**: Enforces strict serializability across shards using 2PC. The inter-shard round-trip network latency is $\text{RTT} = 35\text{ ms}$. Each 2PC transaction requires 2 sequential round-trips plus 2 disk $\text{fsync}$ operations on each coordinator and participant ($\tau_{\text{fsync}} = 3\text{ ms}$ each). The database connection pool across the coordinator fleet is hard-capped at $C_{\text{pool}} = 400$ concurrent active transactions.
-- **Architecture B (Asynchronous Sagas with Compensating Actions)**: Partitions inventory by concert section onto individual event log partitions. Point reservation executes in $\tau_{\text{async}} = 1.8\text{ ms}$ with zero network coordination. Due to concurrent optimistic reservations, overselling occurs on $0.08\%$ ($P_{\text{conflict}} = 0.0008$) of requests. When an oversell occurs, the business executes an apology protocol: refunding the ticket and issuing a \$75 compensatory voucher ($C_{\text{apology}} = \$75$). Each ticket generates $\$180$ in revenue.
-
-1. Compute the maximum theoretical transaction throughput ceiling ($T_{\text{max, 2PC}}$ in tx/sec) for Architecture A.
-2. If the platform experiences a flash-sale demand of $V = 10,000\text{ reservation requests/sec}$ sustained for 15 minutes ($900\text{ seconds}$), calculate the total revenue generated and the net financial profit under Architecture B after deducting apology compensation costs.
-3. Determine whether Architecture A can survive the flash sale without shedding $90\%+$ of incoming traffic.
-
-##### Solution & Derivation:
-1. **Architecture A (2PC) Throughput Ceiling**:
-   Total latency of a single 2PC transaction:
-   $$L_{2PC} = (2 \times \text{RTT}) + (2 \times \tau_{\text{fsync}}) = (2 \times 35\text{ ms}) + (2 \times 3\text{ ms}) = 70\text{ ms} + 6\text{ ms} = 76\text{ ms} = 0.076\text{ seconds}$$
-   Applying Little's Law ($L = \lambda W \implies \lambda = \frac{L}{W}$), with maximum concurrency $C_{\text{pool}} = 400$:
-   $$T_{\text{max, 2PC}} = \frac{C_{\text{pool}}}{L_{2PC}} = \frac{400}{0.076\text{ sec}} \approx \mathbf{5,263\text{ transactions/sec}}.$$
-
-2. **Architecture B (Sagas & Apology) Economics**:
-   Total requests over 15 minutes:
-   $$\text{Total Requests} = 10,000\text{ req/sec} \times 900\text{ sec} = 9,000,000\text{ requests}$$
-   Because $\tau_{\text{async}} = 1.8\text{ ms}$, partitioned across 4 shards (each handling $2,500\text{ req/sec}$), the system easily processes all $9,000,000$ requests.
-   $$\text{Number of Conflicted Oversell Events} = 9,000,000 \times 0.0008 = 7,200\text{ conflicts}$$
-   $$\text{Gross Revenue} = (9,000,000 - 7,200) \times \$180 = 8,992,800 \times \$180 = \$1,618,704,000$$
-   $$\text{Total Apology Cost} = 7,200 \times \$75 = \$540,000$$
-   $$\text{Net Revenue} = \$1,618,704,000 - \$540,000 = \mathbf{\$1,618,164,000}$$
-   The cost of apologies represents just $\frac{\$540,000}{\$1,618,704,000} \approx \mathbf{0.033\%}$ of gross revenue!
-
-3. **Comparison & Architectural Verdict**:
-   - Under Architecture A, the 2PC capacity cap is $5,263\text{ tx/sec}$. Under a $10,000\text{ req/sec}$ surge, connection pools immediately saturate, queuing explodes, and the gateway must drop or reject $\frac{10,000 - 5,263}{10,000} = \mathbf{47.37\%}$ of all incoming customers, losing over $\$760,000,000$ in sales volume.
-   - **Conclusion**: Architecture B (asynchronous unbundled streaming with compensating transactions) proves overwhelmingly superior both technically and economically, trading minor localized apology costs for massive availability, zero coordinator deadlocks, and maximum business revenue.
-
 
 ---
 > [!NAV] **Chapter Navigation**
